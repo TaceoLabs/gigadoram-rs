@@ -1,6 +1,28 @@
-[package]
-name = "gigadoram-rs"
+[workspace]
+resolver = "3"
+members = [
+    "crates/primitives",
+    "crates/data-structures",
+    "crates/core",
+    "crates/test",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.92"
+authors = ["TACEO GmbH <hello@taceo.io>"]
+homepage = "https://www.taceo.io"
+repository = "https://github.com/TaceoLabs/co-snarks"
+license = "MIT OR Apache-2.0"
+publish = false
+readme = "./README.md"
 
-[dependencies]
+[workspace.dependencies]
+ark-bn254 = "0.5"
+core = { path = "crates/core" }
+ark-ff = { git = "https://github.com/arkworks-rs/ark-ff", branch = "main" }
+mpc-core = { git = "https://github.com/TaceoLabs/co-snarks", branch = "main" }
+mpc-net = { git = "https://github.com/TaceoLabs/co-snarks", branch = "main" }
+primitives = { path = "crates/primitives" }
+structures = { package = "data-structures", path = "crates/data-structures" }
