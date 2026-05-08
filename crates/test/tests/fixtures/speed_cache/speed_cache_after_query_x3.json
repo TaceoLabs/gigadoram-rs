@@ -1,0 +1,11 @@
+{
+  "component": "SpeedCache",
+  "capacity": 4,
+  "num_stored": 2,
+  "slots": [
+    {"slot": 0, "addr": 0, "data": 30, "state": "dummy_or_removed"},
+    {"slot": 1, "addr": 5, "data": 50, "state": "live"},
+    {"slot": 2, "addr": 0, "data": 0, "state": "inactive"},
+    {"slot": 3, "addr": 0, "data": 0, "state": "inactive"}
+  ]
+}

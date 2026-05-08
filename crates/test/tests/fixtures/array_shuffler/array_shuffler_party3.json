@@ -1,0 +1,16 @@
+{
+  "component": "ArrayShuffler",
+  "party": 3,
+  "n": 8,
+  "input": [100, 101, 102, 103, 104, 105, 106, 107],
+  "after_forward_shuffle": [101, 106, 103, 100, 105, 107, 102, 104],
+  "indices_output": [3, 0, 6, 2, 7, 4, 1, 5],
+  "prev_shared_perm": {
+    "fisher_yates": [0, 0, 1, 0, 4, 0, 6, 1],
+    "mapping_original_index_to_shuffled_index": [5, 7, 0, 1, 4, 3, 6, 2]
+  },
+  "next_shared_perm": {
+    "fisher_yates": [0, 0, 1, 3, 2, 0, 3, 3],
+    "mapping_original_index_to_shuffled_index": [5, 2, 4, 7, 0, 1, 3, 6]
+  }
+}
