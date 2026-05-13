@@ -25,6 +25,10 @@ impl OptimalCht {
         todo!("build the two-column cuckoo hash table and stash list")
     }
 
+    pub fn dummy(stash_size: usize) -> Self {
+        todo!("build a dummy CHT with the given dummy index")
+    }
+
     pub fn lookup_from_2shares(
         &self,
         key: BlockShare,

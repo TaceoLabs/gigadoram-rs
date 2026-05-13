@@ -1,11 +1,15 @@
-use circuits::lowmc::GigadoramLowMc;
+use circuits::{cht_lookup::OUTPUT_INDEX_OFFSET_BITS, lowmc::GigadoramLowMc};
 use eyre::Ok;
 use mpc_core::protocols::{
-    rep3::{Rep3State, id::PartyID, network::Rep3NetworkExt},
-    rep3_ring::{self, Rep3RingShare, casts::downcast, ring::ring_impl::RingElement},
+    rep3::{Rep3State, arithmetic::promote_to_trivial_share, id::PartyID, network::Rep3NetworkExt},
+    rep3_ring::{self, Rep3BitShare, Rep3RingShare, arithmetic::{cmux, rand}, casts::downcast, ring::ring_impl::RingElement},
 };
 use mpc_net::Network;
-use primitives::{ArrayShuffler, Block, BlockShare, CircuitBlock, LocalPermutation, XShare};
+use primitives::{
+    ArrayShuffler, Block, BlockShare, CircuitBlock, LocalPermutation, XShare, YShare, reshare_3_to_2, types::input
+};
+
+use crate::OptimalCht;
 
 const LOWMC_REUSE_WIRES: &str = include_str!("../../circuits/src/lowmc/LowMC_reuse_wires.txt");
 
@@ -137,7 +141,8 @@ impl OhTable {
                 .copy_from_slice(&self.key);
             let dst_index = prf_input_size_blocks * (i + 1) - 1;
 
-            keys_and_inputs[dst_index] = downcast(xs[i].clone()).expect("XShare should fit in a block");
+            keys_and_inputs[dst_index] =
+                downcast(xs[i].clone()).expect("XShare should fit in a block");
         }
 
         let qs = self.evaluate_prf_tags(keys_and_inputs, net, state)?;
@@ -157,7 +162,7 @@ impl OhTable {
 
         let qs_in_clear = self.reveal_qs_to_builder(net, state)?;
         let qs_in_clear_compacted = vec![Block::default(); self.params.num_elements];
-        if state.id == self.params.builder {
+        let cht = if state.id == self.params.builder {
             let mut j = 0;
             let qs_in_clear = qs_in_clear.expect("builder should receive revealed qs");
             for i in 0..self.params.total_size() {
@@ -166,30 +171,26 @@ impl OhTable {
                     j += 1;
                 }
             }
-                
+
             assert_eq!(
-                j,
-                self.params.num_elements,
+                j, self.params.num_elements,
                 "number of revealed qs should match number of real elements"
             );
 
             let builder_local_perm = LocalPermutation::new(self.params.num_elements, None);
             builder_local_perm.shuffle(&mut qs_in_clear_compacted);
 
-            let cht = OptimalCht::build(
-                self.params.stash_size,
-                self.params.log_single_col_len,
-            );
-        }
+            OptimalCht::build(self.params.stash_size, self.params.log_single_col_len)
+        } else {
+            OptimalCht::dummy(self.params.stash_size)
+        };
 
-        let builder_cht = cht.table().to_vec();
-        let stash_indices_builder = cht.stash_indices().to_vec();
-        self.cht_2shares = Some(self.reshare_cht_3to2(builder_cht, state.id));
+        let cht_shares = cht.table().to_vec();
+        let cht_shares = input(self.params.builder, &cht_shares, net, state)?;
+        let cht_shares = reshare_3_to_2(&cht_shares, state);
 
-        self.xs_receiver_order
-            .clone_from_slice(&self.xs_builder_order);
-        self.ys_receiver_order
-            .clone_from_slice(&self.ys_builder_order);
+        self.xs_receiver_order.clone_from_slice(&self.xs_builder_order);
+        self.ys_receiver_order.clone_from_slice(&self.ys_builder_order);
         let mut receiver_shuffler = ArrayShuffler::new(self.params.total_size(), state);
         self.forward_receiver_order_known_to_receivers(&mut receiver_shuffler, net, state)?;
         let mut receiver_shuffle = self.receiver_shuffle_for_party(&receiver_shuffler);
@@ -214,12 +215,14 @@ impl OhTable {
         Ok(())
     }
 
-    pub fn query(
+    pub fn query<N: Network>(
         &mut self,
-        q: Vec<CircuitBlock>,
-        use_dummy: Vec<Share>,
-        y: &mut Vec<Y>,
-        found: &mut Vec<Share>,
+        q: BlockShare,
+        use_dummy: BlockShare,
+        y: &mut Vec<YShare>,
+        found: &mut Vec<XShare>,
+        net: &N,
+        state: &mut Rep3State,
     ) {
         assert!(self.query_count < self.params.num_dummies);
         assert_eq!(q.len(), 1);
@@ -228,36 +231,37 @@ impl OhTable {
             "use_dummy is either omitted for distinct queries or supplied as one share"
         );
 
-        let q_or_dummy = self.select_query_or_dummy(q[0], &use_dummy);
-        assert!(!is_zero_block(&q_or_dummy));
+        let q_or_dummy = cmux(use_dummy, rand(state), q, net, state);
 
-        let dummy_index = self.dummy_indices[self.query_count];
-        let (index_builder_order, lookup_found) = self.lookup_cht(q_or_dummy, dummy_index);
+        let q_clear = todo!("obliviously reveal q_or_dummy to builder with mpc-core");
+        assert!(!is_zero_block(&q_clear));
 
-        let receiver_shuffle = self
-            .receiver_shuffle
-            .as_mut()
-            .expect("OHTable must be built before querying");
-        let index_receiver_order = receiver_shuffle.evaluate_at(index_builder_order);
+        let dummy_index = downcast(self.dummy_indices[self.query_count].clone()).expect("dummy index should fit in a block");
+        let index_builder_order = self.lookup_cht(q_clear, dummy_index, found);
 
-        assert!(!self.touched[index_receiver_order]);
+        let index_receiver_order = if party != self.params.builder {
+            let receiver_shuffle = self
+                .receiver_shuffle
+                .as_mut()
+                .expect("OHTable must be built before querying");
+            let index_receiver_order = receiver_shuffle.evaluate_at(index_builder_order);
+
+            if party == self.params.builder.prev() {
+                net.send_next(index_receiver_order)
+                    .expect("should send index to receiver");
+            }
+            index_receiver_order
+        } else {
+            net.recv_prev()?
+        };
+
         self.touched[index_receiver_order] = true;
 
-        y.clear();
-        y.push(self.ys_receiver_order[index_receiver_order].clone());
-        found.clear();
-        found.push(lookup_found);
+        y[0] = self.ys_receiver_order[index_receiver_order].clone();
         self.query_count += 1;
     }
 
-    pub fn distinct_query(&mut self, q: Vec<CircuitBlock>) -> QueryResult {
-        let mut y = Vec::with_capacity(1);
-        let mut found = Vec::with_capacity(1);
-        self.query(q, Vec::new(), &mut y, &mut found);
-        QueryResult { y, found }
-    }
-
-    pub fn extract(&self, extract_xs: &mut Vec<X>, extract_ys: &mut Vec<Y>) {
+    pub fn extract(&self, extract_xs: &mut Vec<XShare>, extract_ys: &mut Vec<YShare>) {
         assert_eq!(self.query_count, self.params.num_dummies);
 
         extract_xs.clear();
@@ -329,18 +333,52 @@ impl OhTable {
             .collect()
     }
 
-    fn reveal_qs_to_builder<N: Network>(&self, net: &N, state: &mut Rep3State) -> eyre::Result<Option<Vec<Block>>> {
+    fn reveal_qs_to_builder<N: Network>(
+        &self,
+        net: &N,
+        state: &mut Rep3State,
+    ) -> eyre::Result<Option<Vec<Block>>> {
         if self.params.builder == state.id {
             let prev_qs = net.recv_many::<BlockShare>(self.params.builder.prev())?;
-            return Ok(Some(self.qs_builder_order[..self.params.num_elements]
-                .iter()
-                .map(|q| (q.a, q.b))
-                .zip(prev_qs)
-                .map(|((a, b), prev)| a ^ b ^ prev.a)
-                .collect::<Vec<Block>>()));
-
+            return Ok(Some(
+                self.qs_builder_order[..self.params.num_elements]
+                    .iter()
+                    .map(|q| (q.a, q.b))
+                    .zip(prev_qs)
+                    .map(|((a, b), prev)| a ^ b ^ prev.a)
+                    .collect::<Vec<Block>>(),
+            ));
         } else if self.params.builder.prev() == state.id {
-            net.send_many(self.params.builder, &self.qs_builder_order[..self.params.num_elements])?;
+            net.send_many(
+                self.params.builder,
+                &self.qs_builder_order[..self.params.num_elements],
+            )?;
+        }
+
+        Ok(None)
+    }
+
+    fn reveal_to<N: Network>(
+        values: Vec<BlockShare>,
+        party: PartyID,
+        net: &N,
+        state: &mut Rep3State,
+    ) -> eyre::Result<Option<Vec<Block>>> {
+        if party == state.id {
+            let prev_qs = net.recv_many::<BlockShare>(party.prev())?;
+            return Ok(Some(
+                values
+                    .iter()
+                    .map(|q| (q.a, q.b))
+                    .zip(prev_qs)
+                    .map(|((a, b), prev)| a ^ b ^ prev.a)
+                    .collect::<Vec<Block>>(),
+            ));
+        } else if self.params.builder.prev() == state.id {
+            net.send_many(
+                state.id.next(),
+                &values
+            )?;
         }
 
         Ok(None)
@@ -397,16 +435,7 @@ impl OhTable {
         stash_indices_receiver
     }
 
-    fn select_query_or_dummy(&self, q: CircuitBlock, use_dummy: &[Share]) -> CircuitBlock {
-        if use_dummy.is_empty() {
-            q
-        } else {
-            todo!("obliviously choose the real q or a fresh dummy block with mpc-core")
-        }
-    }
-
-    fn lookup_cht(&self, q_or_dummy: CircuitBlock, dummy_index: X) -> (usize, Share) {
-        let _ = (q_or_dummy, dummy_index);
+    fn lookup_cht(&self, q_clear: Block, dummy_index: u32, found: &mut Vec<XShare>) -> usize {
         todo!("run the optimal CHT lookup circuit over self.cht_2shares")
     }
 }
@@ -417,22 +446,10 @@ pub fn attach_index(q: u128, i: u32) -> u128 {
     (q & KEEP_UPPER_96) | i as u128
 }
 
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryResult {
     pub y: Vec<Y>,
     pub found: Vec<Share>,
-}
-
-fn zero_block() -> CircuitBlock {
-    [0u8; 16]
-}
-
-fn x_to_block_share(x: XShare) -> Block {
-    Block::new_ring(
-        RingElement(u128::from_le_bytes(x.a.0)),
-        RingElement(u128::from_le_bytes(x.b.0)),
-    )
 }
 
 fn is_zero_block(block: &CircuitBlock) -> bool {

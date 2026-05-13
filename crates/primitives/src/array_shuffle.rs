@@ -135,7 +135,7 @@ impl ArrayShuffler {
         Standard: Distribution<T>,
         N: Network,
     {
-        let mut two_shares = reshare_3_to_2(rep_array, p, p.next(), state);
+        let mut two_shares = reshare_3_to_2(rep_array, state);
         if state.id == p {
             self.next_shared_perm.shuffle(&mut two_shares);
         } else if state.id == p.next() {
@@ -158,7 +158,7 @@ impl ArrayShuffler {
         Standard: Distribution<T>,
         N: Network,
     {
-        let mut two_shares = reshare_3_to_2(rep_array, p, p.next(), state);
+        let mut two_shares = reshare_3_to_2(rep_array, state);
         if state.id == p {
             self.next_shared_perm.inverse_shuffle(&mut two_shares);
         } else if state.id == p.next() {
