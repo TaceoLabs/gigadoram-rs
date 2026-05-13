@@ -1,4 +1,4 @@
-use circuits::lowmc::GigadoramLowMc;
+use circuits::lowmc::{ROUND_KEYS, LowMc};
 use eyre::Ok;
 use mpc_core::protocols::{
     rep3::{Rep3State, id::PartyID, network::Rep3NetworkExt},
@@ -16,9 +16,6 @@ use primitives::{
 };
 
 use crate::cht;
-
-const LOWMC_REUSE_WIRES: &str = include_str!("../../circuits/src/lowmc/LowMC_reuse_wires.txt");
-
 pub type OhTableParams = OHTableParams;
 pub type ObliviousHashTable = OhTable;
 
@@ -45,7 +42,7 @@ impl OHTableParams {
             stash_size,
             builder: BUILDER_ID,
             log_single_col_len: single_col_len.trailing_zeros(),
-            key_size_blocks: GigadoramLowMc::ROUND_KEYS,
+            key_size_blocks: ROUND_KEYS,
         }
     }
 
