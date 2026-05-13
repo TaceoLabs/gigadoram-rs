@@ -17,6 +17,22 @@ pub type YShare = Rep3RingShare<Y>;
 pub type BlockShare = Rep3RingShare<Block>;
 pub type BitShare = Rep3RingShare<Bit>;
 
+pub fn bit_to_binary_mask<T: IntRing2k>(bit: &BitShare) -> Rep3RingShare<T> {
+    let all_ones = !T::zero();
+    Rep3RingShare::new_ring(
+        RingElement(if bit.a.0.convert() {
+            all_ones
+        } else {
+            T::zero()
+        }),
+        RingElement(if bit.b.0.convert() {
+            all_ones
+        } else {
+            T::zero()
+        }),
+    )
+}
+
 /// Extracts local two-party XOR shares from replicated Rep3 ring shares.
 pub fn reshare_3_to_2<T: IntRing2k>(
     rep_array: &[Rep3RingShare<T>],

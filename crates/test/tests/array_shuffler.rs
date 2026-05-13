@@ -44,13 +44,13 @@ fn array_shuffler_rep3_matches_party_fixtures() {
 
                     let mut values = promote_public_values(&fixture.input, state.id);
                     shuffler
-                        .forward_rep3(&mut values, &network, &mut state)
+                        .forward(&mut values, &network, &mut state)
                         .unwrap();
 
                     let indices_input = (0..fixture.n as u64).collect::<Vec<_>>();
                     let mut indices = promote_public_values(&indices_input, state.id);
                     shuffler
-                        .inverse_rep3(&mut indices, &network, &mut state)
+                        .inverse(&mut indices, &network, &mut state)
                         .unwrap();
 
                     (values, indices)

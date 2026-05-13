@@ -11,7 +11,7 @@ publish.workspace = true
 readme.workspace = true
 
 [dependencies]
-core.workspace = true
+circuits.workspace = true
 mpc-core.workspace = true
 mpc-net.workspace = true
 primitives.workspace = true

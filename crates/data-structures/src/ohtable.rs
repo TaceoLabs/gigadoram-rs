@@ -1,4 +1,4 @@
-use circuits::lowmc::{ROUND_KEYS, LowMc};
+use circuits::lowmc::{LowMc, ROUND_KEYS};
 use eyre::Ok;
 use mpc_core::protocols::{
     rep3::{Rep3State, id::PartyID, network::Rep3NetworkExt},
