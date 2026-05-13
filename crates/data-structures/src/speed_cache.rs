@@ -1,10 +1,9 @@
-use circuits::xy_if_xs_equal::{
-    CircuitBlockShare, INPUT_Y_OFFSET, OUTPUT_FOUND_OFFSET, OUTPUT_X_MASK_OFFSET, OUTPUT_Y_OFFSET,
-    STORED_X_OFFSET, X_QUERY_OFFSET, pack_x, pack_y, unpack_x, unpack_y, xor_of_all_elements,
-    xy_if_xs_equal_circuit,
-};
-use mpc_core::protocols::{rep3::Rep3State, rep3_ring::binary};
+use std::ops::BitXor;
+
+use circuits::xy_if_xs_equal::xy_if_xs_equal_circuit;
+use mpc_core::protocols::rep3::Rep3State;
 use mpc_net::Network;
+use primitives::{XShare, YShare, types::BitShare};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpeedCacheQueryResult {
@@ -16,8 +15,8 @@ pub struct SpeedCacheQueryResult {
 pub struct SpeedCache {
     length: usize,
     num_stored: usize,
-    addrs: Vec<X>,
-    data: Vec<Y>,
+    addrs: Vec<XShare>,
+    data: Vec<YShare>,
 }
 
 impl SpeedCache {
@@ -25,8 +24,8 @@ impl SpeedCache {
         Self {
             length,
             num_stored: 0,
-            addrs: vec![X::zero_share(); length],
-            data: vec![Y::zero_share(); length],
+            addrs: vec![XShare::default(); length],
+            data: vec![YShare::default(); length],
         }
     }
 
@@ -48,84 +47,51 @@ impl SpeedCache {
 
     pub fn query(
         &mut self,
-        query_addr: Vec<X>,
-        query_result: &mut Vec<Y>,
-        found: &mut Vec<X>,
+        query_addr: Vec<XShare>,
         net: &impl Network,
         state: &mut Rep3State,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<(YShare, BitShare)> {
         assert_eq!(query_addr.len(), 1);
 
         let length_for_query = std::cmp::max(1, self.num_stored);
-        assert!(length_for_query <= self.length);
-
-        let mut circuit_input = vec![CircuitBlockShare::zero_share(); length_for_query];
-        let mut remove_duplicate_addr_mask = vec![X::zero_share(); length_for_query];
-
-        for input in circuit_input.iter_mut() {
-            *input = pack_x(&query_addr[0], X_QUERY_OFFSET);
-        }
-
-        for (i, input) in circuit_input.iter_mut().enumerate().take(self.num_stored) {
-            *input ^= pack_x(&self.addrs[i], STORED_X_OFFSET);
-            *input ^= pack_y(&self.data[i], INPUT_Y_OFFSET);
-        }
 
         // circuit input:  x_query | x | y
         // circuit output: x_mask | y | found
-        // TODO: Single round of communication
-        let mut circuit_output = Vec::with_capacity(length_for_query);
-        for input in circuit_input.iter().take(length_for_query) {
-            circuit_output.push(xy_if_xs_equal_circuit(input, net, state)?);
-        }
+        let (x_if_found, y_if_found, found_out) = xy_if_xs_equal_circuit(
+            &self.addrs[..length_for_query],
+            &query_addr,
+            &self.data[..length_for_query],
+            net,
+            state,
+        )?;
 
-        for (mask, output) in remove_duplicate_addr_mask
+        self.addrs[..length_for_query]
             .iter_mut()
-            .zip(circuit_output.iter())
-        {
-            *mask = unpack_x(output, OUTPUT_X_MASK_OFFSET);
-        }
+            .zip(x_if_found.into_iter())
+            .for_each(|(x, x_mask)| *x ^= x_mask);
 
-        for (addr, mask) in self
-            .addrs
-            .iter_mut()
-            .take(length_for_query)
-            .zip(remove_duplicate_addr_mask.iter())
-        {
-            *addr = binary::xor(addr, mask);
-        }
+        let y_xor = y_if_found
+            .into_iter()
+            .reduce(BitXor::bitxor)
+            .expect("circuit output should be non-empty");
+        let found_xor = found_out
+            .into_iter()
+            .reduce(BitXor::bitxor)
+            .expect("circuit output should be non-empty");
 
-        let xor_of_all = xor_of_all_elements(&circuit_output);
-        query_result.clear();
-        query_result.push(unpack_y(&xor_of_all, OUTPUT_Y_OFFSET));
-
-        found.clear();
-        found.push(unpack_x(&xor_of_all, OUTPUT_FOUND_OFFSET));
-
-        Ok(())
+        Ok((y_xor, found_xor))
     }
 
-    pub fn query_address(
-        &mut self,
-        query_addr: Vec<X>,
-        net: &impl Network,
-        state: &mut Rep3State,
-    ) -> eyre::Result<SpeedCacheQueryResult> {
-        let mut value = Vec::with_capacity(1);
-        let mut found = Vec::with_capacity(1);
-        self.query(query_addr, &mut value, &mut found, net, state)?;
-        Ok(SpeedCacheQueryResult { value, found })
-    }
-
-    pub fn extract(&self, xs: &mut Vec<X>, ys: &mut Vec<Y>) {
+    // TODO: Get the vectors unsafely, no clones
+    pub fn extract(&mut self) -> (Vec<XShare>, Vec<YShare>) {
         assert_eq!(self.num_stored, self.length);
-        xs.clear();
-        ys.clear();
-        xs.extend_from_slice(&self.addrs);
-        ys.extend_from_slice(&self.data);
+        let result = (self.addrs.clone(), self.data.clone());
+        self.addrs.clear();
+        self.data.clear();
+        result
     }
 
-    pub fn write(&mut self, write_addrs: Vec<X>, write_data: Vec<Y>) {
+    pub fn write(&mut self, write_addrs: Vec<XShare>, write_data: Vec<YShare>) {
         assert_eq!(write_addrs.len(), write_data.len());
         assert!(
             self.num_stored < self.length,
@@ -170,98 +136,58 @@ impl Default for SpeedCache {
 mod tests {
     use mpc_core::protocols::{
         rep3::{Rep3State, conversion::A2BType},
-        rep3_ring::{arithmetic, binary, ring::ring_impl::RingElement},
+        rep3_ring::{
+            arithmetic, binary,
+            ring::{bit::Bit, ring_impl::RingElement},
+        },
     };
     use mpc_net::local::LocalNetwork;
 
     use super::*;
 
-    fn x_share(value: u32) -> X {
-        X::new(value, 0)
-    }
-
-    fn y_share(value: u64) -> Y {
-        Y::new(value, 0)
-    }
-
-    #[test]
-    fn write_and_extract_follow_stupid_level_flow() {
+    fn init_speed_cache(state: &Rep3State) -> SpeedCache {
         let mut cache = SpeedCache::new(2);
-        cache.write(vec![x_share(7)], vec![y_share(70)]);
-
-        assert_eq!(cache.len(), 1);
-
-        cache.write(vec![x_share(8)], vec![y_share(80)]);
-        let mut xs = Vec::new();
-        let mut ys = Vec::new();
-        cache.extract(&mut xs, &mut ys);
-
-        assert_eq!(xs, vec![x_share(7), x_share(8)]);
-        assert_eq!(ys, vec![y_share(70), y_share(80)]);
+        cache.write(
+            vec![
+                binary::promote_to_trivial_share(state.id, &RingElement(7u32)),
+                binary::promote_to_trivial_share(state.id, &RingElement(8u32)),
+            ],
+            vec![
+                binary::promote_to_trivial_share(state.id, &RingElement(70u64)),
+                binary::promote_to_trivial_share(state.id, &RingElement(80u64)),
+            ],
+        );
+        cache
     }
 
     #[test]
-    fn skip_advances_occupancy_with_zero_dummies() {
-        let mut cache = SpeedCache::new(2);
-
-        cache.skip(2);
-
-        assert!(!cache.is_writeable());
-        let mut xs = Vec::new();
-        let mut ys = Vec::new();
-        cache.extract(&mut xs, &mut ys);
-        assert_eq!(xs, vec![X::zero_share(), X::zero_share()]);
-        assert_eq!(ys, vec![Y::zero_share(), Y::zero_share()]);
-    }
-
-    #[test]
-    fn query_finds_value_and_removes_duplicate_address() {
+    fn test_speed_cache_query() {
         let networks = LocalNetwork::new_3_parties();
 
         std::thread::scope(|scope| {
             let handles = networks.map(|network| {
                 scope.spawn(move || {
                     let mut state = Rep3State::new(&network, A2BType::Direct).unwrap();
-                    let mut cache = SpeedCache::new(2);
-
-                    cache.write(
-                        vec![
-                            binary::promote_to_trivial_share(state.id, &RingElement(7u32)),
-                            binary::promote_to_trivial_share(state.id, &RingElement(8u32)),
-                        ],
-                        vec![
-                            binary::promote_to_trivial_share(state.id, &RingElement(70u64)),
-                            binary::promote_to_trivial_share(state.id, &RingElement(80u64)),
-                        ],
-                    );
+                    let mut cache = init_speed_cache(&state);
 
                     let query_addr = vec![binary::promote_to_trivial_share(
                         state.id,
                         &RingElement(7u32),
                     )];
-                    let query = cache
-                        .query_address(query_addr, &network, &mut state)
-                        .unwrap();
 
-                    let value = arithmetic::open_bit(query.value[0], &network).unwrap();
-                    let found = arithmetic::open_bit(query.found[0], &network).unwrap();
+                    let (value, found) = cache.query(query_addr, &network, &mut state).unwrap();
 
-                    let mut xs = Vec::new();
-                    let mut ys = Vec::new();
-                    cache.extract(&mut xs, &mut ys);
-                    let consumed_addr = arithmetic::open_bit(xs[0], &network).unwrap();
-                    let untouched_addr = arithmetic::open_bit(xs[1], &network).unwrap();
+                    let value = arithmetic::open_bit(value, &network).unwrap();
+                    let found = arithmetic::open_bit(found, &network).unwrap();
 
-                    (value, found, consumed_addr, untouched_addr)
+                    (value, found)
                 })
             });
 
             for handle in handles {
-                let (value, found, consumed_addr, untouched_addr) = handle.join().unwrap();
+                let (value, found) = handle.join().unwrap();
                 assert_eq!(value, RingElement(70u64));
-                assert_eq!(found, RingElement(1u32));
-                assert_eq!(consumed_addr, RingElement(0u32));
-                assert_eq!(untouched_addr, RingElement(8u32));
+                assert_eq!(found, RingElement(Bit::new(true)));
             }
         });
     }

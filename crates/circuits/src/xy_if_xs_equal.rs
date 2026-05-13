@@ -1,16 +1,21 @@
-use std::{ vec};
+use std::vec;
 
 use mpc_core::protocols::{
     rep3::Rep3State,
     rep3_ring::{
-        Rep3RingShare, arithmetic::{self, RingShare, eq}, binary::{self, and_vec}, casts::downcast, ring::{bit::Bit, int_ring::IntRing2k, ring_impl::RingElement}, yao::upcast_many
+        Rep3RingShare,
+        arithmetic::{self, RingShare, eq},
+        binary::{self, and_vec},
+        casts::downcast,
+        ring::{bit::Bit, int_ring::IntRing2k, ring_impl::RingElement},
+        yao::upcast_many,
     },
 };
 use mpc_net::Network;
-use primitives::{ XShare, YShare, types::BitShare};
+use primitives::{XShare, YShare, types::BitShare};
 use rand::distributions::{Distribution, Standard};
 
-// TODO: Takes 4 rounds, can we lower it?
+// TODO: Takes 4 rounds, can we lower
 pub fn xy_if_xs_equal_circuit(
     x: &[XShare],
     x_query: &[XShare],
@@ -19,7 +24,8 @@ pub fn xy_if_xs_equal_circuit(
     state: &mut Rep3State,
 ) -> eyre::Result<(Vec<XShare>, Vec<YShare>, Vec<BitShare>)> {
     // TODO: In single round
-    let found = x.iter()
+    let found = x
+        .iter()
         .zip(x_query.iter())
         .map(|(x_i, x_q_i)| arithmetic::eq(*x_i, *x_q_i, net, state))
         .collect::<eyre::Result<Vec<_>>>()?;
@@ -35,7 +41,6 @@ pub fn xy_if_xs_equal_circuit(
     Ok((x_if_xs_equal, y_if_xs_equal, found))
 }
 
-
 /// Computes a CMUX: If `c` is `1`, returns `x_t`, otherwise returns `x_f`.
 pub fn cmux_many<T: IntRing2k, N: Network>(
     c: &[RingShare<T>],
@@ -47,8 +52,16 @@ pub fn cmux_many<T: IntRing2k, N: Network>(
 where
     Standard: Distribution<T>,
 {
-    let xor = x_f.iter().zip(x_t.iter()).map(|(f, t)| f ^ t).collect::<Vec<_>>();
+    let xor = x_f
+        .iter()
+        .zip(x_t.iter())
+        .map(|(f, t)| f ^ t)
+        .collect::<Vec<_>>();
     let and = and_vec(c, &xor, net, state)?;
-    let result = and.iter().zip(x_f.iter()).map(|(a, f)| a ^ f).collect::<Vec<_>>();
+    let result = and
+        .iter()
+        .zip(x_f.iter())
+        .map(|(a, f)| a ^ f)
+        .collect::<Vec<_>>();
     Ok(result)
 }

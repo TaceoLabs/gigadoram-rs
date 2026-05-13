@@ -1,69 +1,47 @@
-use mpc_core::protocols::{rep3::Rep3State, rep3_ring::Rep3RingShare};
+use mpc_core::protocols::{
+    rep3::Rep3State,
+    rep3_ring::{
+        binary::{self, and_with_public, shift_r_public},
+        casts::downcast,
+        ring::ring_impl::RingElement,
+        yao::upcast_many,
+    },
+};
 use mpc_net::Network;
+use primitives::{BlockShare, XShare, types::BitShare};
 
-pub type ChtBlockShare = Rep3RingShare<u128>;
-pub type ChtIndexShare = Rep3RingShare<u32>;
-pub type ChtFoundShare = Rep3RingShare<u8>;
-
-pub const CHT_LOOKUP_INPUT_BLOCKS: usize = 4;
-pub const CHT_LOOKUP_OUTPUT_BLOCKS: usize = 1;
-pub const OUTPUT_INDEX_OFFSET_BITS: usize = 0;
-pub const OUTPUT_FOUND_OFFSET_BITS: usize = 32;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChtLookupInput {
-    pub key: ChtBlockShare,
-    pub lookup_value_0: ChtBlockShare,
-    pub lookup_value_1: ChtBlockShare,
-    pub dummy_index: ChtIndexShare,
-}
-
-impl ChtLookupInput {
-    pub fn blocks(&self) -> [ChtBlockShare; CHT_LOOKUP_INPUT_BLOCKS] {
-        [
-            self.key,
-            self.lookup_value_0,
-            self.lookup_value_1,
-            pack_dummy_index(&self.dummy_index),
-        ]
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChtLookupOutput {
-    pub index: ChtIndexShare,
-    pub found: ChtFoundShare,
-}
-
-pub fn cht_lookup_circuit(
-    input: ChtLookupInput,
-    log_single_col_len: u32,
-    builder: usize,
+pub fn lookup_circuit(
+    key: BlockShare,
+    cht_b0: BlockShare,
+    cht_b1: BlockShare,
+    dummy_index: XShare,
     net: &impl Network,
     state: &mut Rep3State,
-) -> eyre::Result<ChtLookupOutput> {
-    let _ = (input, log_single_col_len, builder, net, state);
-    todo!("evaluate the CHT lookup circuit over key, two candidate table slots, and dummy index")
-}
+) -> eyre::Result<(XShare, BitShare)> {
+    let shift = RingElement::from(32);
+    let mask = RingElement::from(0xFFFFFFFF);
 
-pub fn pack_dummy_index(dummy_index: &ChtIndexShare) -> ChtBlockShare {
-    ChtBlockShare::new(u128::from(dummy_index.a.0), u128::from(dummy_index.b.0))
-}
+    let key_tag = shift_r_public(&key, shift);
+    let cht_b0_index = and_with_public(&cht_b0, &mask);
+    let cht_b0_tag = shift_r_public(&cht_b0, shift);
+    let cht_b1_index = and_with_public(&cht_b1, &mask);
+    let cht_b1_tag = shift_r_public(&cht_b1, shift);
 
-pub fn unpack_lookup_output(block: &ChtBlockShare) -> ChtLookupOutput {
-    ChtLookupOutput {
-        index: unpack_index(block),
-        found: unpack_found(block),
-    }
-}
+    // TODO: Single round
+    let key_equals_b0 = binary::is_zero(&(key_tag ^ cht_b0_tag), net, state)?;
+    let key_equals_b1 = binary::is_zero(&(key_tag ^ cht_b1_tag), net, state)?;
+    let out_found = key_equals_b0 ^ key_equals_b1;
 
-pub fn unpack_index(block: &ChtBlockShare) -> ChtIndexShare {
-    ChtIndexShare::new(block.a.0 as u32, block.b.0 as u32)
-}
+    // TODO: Single round
+    let [key_equals_b0, key_equals_b1] = upcast_many(&[key_equals_b0, key_equals_b1], net, state)?
+        .try_into()
+        .unwrap();
+    let dummy_index = upcast_many(&[dummy_index], net, state)?[0];
 
-pub fn unpack_found(block: &ChtBlockShare) -> ChtFoundShare {
-    ChtFoundShare::new(
-        (block.a.0 >> OUTPUT_FOUND_OFFSET_BITS) as u8,
-        (block.b.0 >> OUTPUT_FOUND_OFFSET_BITS) as u8,
-    )
+    // TODO: Can we combine these?
+    let out_index = binary::cmux(&key_equals_b1, &cht_b1_index, &dummy_index, net, state)?;
+    let out_index = binary::cmux(&key_equals_b0, &cht_b0_index, &out_index, net, state)?;
+    let out_index = downcast(out_index);
+
+    Ok((out_index, out_found))
 }
