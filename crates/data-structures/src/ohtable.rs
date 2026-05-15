@@ -93,7 +93,6 @@ pub struct OhTableQueryTrace {
     pub old_query_count: usize,
     pub selected_receiver_index: usize,
     pub was_touched_before: bool,
-    pub dummy_builder_index: u32,
 }
 
 impl OhTable {
@@ -163,7 +162,7 @@ impl OhTable {
         builder_shuffler.forward(&mut self.qs_builder_order, net, state)?;
         builder_shuffler.forward(&mut self.xs_builder_order, net, state)?;
         builder_shuffler.forward(&mut self.ys_builder_order, net, state)?;
-        builder_shuffler.indices::<u32, _>(&mut indices_builder_order, net, state)?;
+        builder_shuffler.indices(&mut indices_builder_order, net, state)?;
 
         self.dummy_indices = indices_builder_order[self.params.num_elements..].to_vec();
 
@@ -294,7 +293,6 @@ impl OhTable {
             old_query_count,
             selected_receiver_index: index_receiver_order,
             was_touched_before,
-            dummy_builder_index: dummy_index.a.0 ^ dummy_index.b.0,
         });
 
         Ok((
