@@ -1,8 +1,8 @@
-use crate::{from_2_shares, permutation::LocalPermutation, reshare_3_to_2};
+use crate::{from_2_shares, permutation::LocalPermutation};
 use mpc_core::protocols::{
-    rep3::{Rep3State, id::PartyID, network::Rep3NetworkExt},
+    rep3::{Rep3State, id::PartyID},
     rep3_ring::{
-        Rep3RingShare,
+        Rep3RingShare, binary,
         ring::{int_ring::IntRing2k, ring_impl::RingElement},
     },
 };
@@ -110,15 +110,7 @@ impl ArrayShuffler {
     {
         assert_eq!(indices.len(), self.len);
         for (i, index) in indices.iter_mut().enumerate() {
-            index.a = match state.id {
-                PartyID::ID1 => RingElement(i as u32),
-                _ => RingElement(0),
-            };
-
-            index.b = match state.id {
-                PartyID::ID0 => RingElement(i as u32),
-                _ => RingElement(0),
-            };
+            *index = binary::promote_to_trivial_share(state.id, &RingElement(i as u32));
         }
         self.inverse::<u32, _>(indices, net, state)
     }
@@ -135,7 +127,7 @@ impl ArrayShuffler {
         Standard: Distribution<T>,
         N: Network,
     {
-        let mut two_shares = reshare_3_to_2(rep_array, state);
+        let mut two_shares = reshare_3_to_2_for(rep_array, p, p.next(), state);
         if state.id == p {
             self.next_shared_perm.shuffle(&mut two_shares);
         } else if state.id == p.next() {
@@ -158,7 +150,7 @@ impl ArrayShuffler {
         Standard: Distribution<T>,
         N: Network,
     {
-        let mut two_shares = reshare_3_to_2(rep_array, state);
+        let mut two_shares = reshare_3_to_2_for(rep_array, p, p.next(), state);
         if state.id == p {
             self.next_shared_perm.inverse_shuffle(&mut two_shares);
         } else if state.id == p.next() {
@@ -168,6 +160,32 @@ impl ArrayShuffler {
         rep_array.clone_from_slice(&reshared);
         Ok(())
     }
+}
+
+fn reshare_3_to_2_for<T: IntRing2k>(
+    rep_array: &[Rep3RingShare<T>],
+    to_1: PartyID,
+    to_2: PartyID,
+    state: &Rep3State,
+) -> Vec<RingElement<T>> {
+    assert_ne!(to_1, to_2);
+
+    rep_array
+        .iter()
+        .map(|share| {
+            if state.id == to_1 {
+                share.a ^ share.b
+            } else if state.id == to_2 {
+                if to_2 == to_1.prev() {
+                    share.b
+                } else {
+                    share.a
+                }
+            } else {
+                RingElement(T::zero())
+            }
+        })
+        .collect()
 }
 
 fn sample_rng1_index(state: &mut Rep3State, bound: usize) -> usize {

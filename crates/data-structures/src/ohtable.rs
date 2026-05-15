@@ -5,13 +5,14 @@ use mpc_core::protocols::{
     rep3_ring::{
         arithmetic::{self},
         binary,
-        casts::{cast_gc, downcast},
+        casts::downcast,
         ring::ring_impl::RingElement,
     },
 };
 use mpc_net::Network;
 use primitives::{
-    ArrayShuffler, Block, BlockShare, LocalPermutation, XShare, Y, YShare, reshare_3_to_2,
+    ArrayShuffler, Block, BlockShare, LocalPermutation, XShare, YShare, bit_to_binary_mask,
+    reshare_3_to_2,
     types::{BitShare, input},
 };
 
@@ -72,16 +73,16 @@ pub struct OhTable {
     pub key: Vec<BlockShare>,
     pub stash_xs: Vec<XShare>,
     pub stash_ys: Vec<YShare>,
-    qs_builder_order: Vec<BlockShare>,
-    xs_builder_order: Vec<XShare>,
-    ys_builder_order: Vec<YShare>,
-    dummy_indices: Vec<XShare>,
-    xs_receiver_order: Vec<XShare>,
-    ys_receiver_order: Vec<YShare>,
-    cht_2shares: Option<Vec<Block>>,
-    receiver_shuffle: Option<LocalPermutation>,
-    query_count: usize,
-    touched: Vec<bool>,
+    pub qs_builder_order: Vec<BlockShare>,
+    pub(crate) xs_builder_order: Vec<XShare>,
+    pub(crate) ys_builder_order: Vec<YShare>,
+    pub dummy_indices: Vec<XShare>,
+    pub xs_receiver_order: Vec<XShare>,
+    pub ys_receiver_order: Vec<YShare>,
+    pub cht_2shares: Option<Vec<Block>>,
+    pub receiver_shuffle: Option<LocalPermutation>,
+    pub query_count: usize,
+    pub touched: Vec<bool>,
 }
 
 impl OhTable {
@@ -144,7 +145,7 @@ impl OhTable {
                 .copy_from_slice(&self.key);
             let dst_index = prf_input_size_blocks * (i + 1) - 1;
 
-            keys_and_inputs[dst_index] = downcast(xs[i].clone());
+            keys_and_inputs[dst_index] = upcast_x_to_block(xs[i].clone());
         }
 
         let qs = self.evaluate_prf_tags(keys_and_inputs, net, state)?;
@@ -168,10 +169,12 @@ impl OhTable {
             let mut j = 0;
             let qs_in_clear = qs_in_clear.expect("builder should receive revealed qs");
             for i in 0..self.params.total_size() {
-                if qs_in_clear[i] != Block::default() {
-                    qs_in_clear_compacted[j] = attach_index(qs_in_clear[i], i as u32);
-                    j += 1;
+                if qs_in_clear[i] == Block::default() {
+                    continue;
                 }
+
+                qs_in_clear_compacted[j] = attach_index(qs_in_clear[i], i as u32);
+                j += 1;
             }
 
             assert_eq!(
@@ -209,14 +212,16 @@ impl OhTable {
             .clone_from_slice(&self.ys_builder_order);
         let mut receiver_shuffler = ArrayShuffler::new(self.params.total_size(), state);
         self.forward_receiver_order_known_to_receivers(&mut receiver_shuffler, net, state)?;
-        let mut receiver_shuffle = self.receiver_shuffle_for_party(&receiver_shuffler);
+        let mut receiver_shuffle = self.receiver_shuffle_for_party(&receiver_shuffler, state.id);
 
-        let stash_indices_builder = self.receive_stash_indices_from_builder(stashed_indices);
+        let stash_indices_builder =
+            self.receive_stash_indices_from_builder(stashed_indices, net, state)?;
         let mut stash_indices_receiver = vec![0; self.params.stash_size];
         for i in 0..self.params.stash_size {
             stash_indices_receiver[i] = receiver_shuffle.evaluate_at(stash_indices_builder[i]);
         }
-        let stash_indices_receiver = self.sync_stash_indices_with_builder(stash_indices_receiver);
+        let stash_indices_receiver =
+            self.sync_stash_indices_with_receivers(stash_indices_receiver, net, state)?;
 
         // Pretend that stashed indices have already been queried.
         for (stash_pos, &stash_index_receiver_order) in stash_indices_receiver.iter().enumerate() {
@@ -241,22 +246,16 @@ impl OhTable {
         assert!(self.query_count < self.params.num_dummies);
 
         // TODO: Maybe just pass dummy as a Block
-        let use_dummy = cast_gc(use_dummy, net, state)?;
+        let use_dummy = bit_to_binary_mask(&use_dummy);
 
         let q_or_dummy = binary::cmux(&use_dummy, &arithmetic::rand(state), &q, net, state)?;
 
+        // TODO: No builder communication
+        let opened_q = binary::open(&q_or_dummy, net)?;
         let q_clear = if state.id == self.params.builder {
             RingElement(0)
-        } else if state.id == self.params.builder.prev() {
-            net.send_prev(q_or_dummy)?;
-            let prev_share: BlockShare = net.recv_prev()?;
-
-            q_or_dummy.a ^ q_or_dummy.b ^ prev_share.a
         } else {
-            net.send_next(q_or_dummy)?;
-            let next_share: BlockShare = net.recv_next()?;
-
-            q_or_dummy.a ^ q_or_dummy.b ^ next_share.a
+            opened_q
         };
 
         let dummy_index = downcast(self.dummy_indices[self.query_count].clone());
@@ -338,7 +337,19 @@ impl OhTable {
         net: &N,
         state: &mut Rep3State,
     ) -> eyre::Result<Vec<BlockShare>> {
-        todo!()
+        let input_size = self.prf_key_size_blocks() + 1;
+        assert_eq!(keys_and_inputs.len(), input_size * self.params.num_elements);
+        assert_eq!(self.prf_key_size_blocks(), ROUND_KEYS);
+
+        let lowmc = LowMc::gigadoram();
+        keys_and_inputs
+            .chunks_exact(input_size)
+            .map(|chunk| {
+                let key = &chunk[..ROUND_KEYS];
+                let input = chunk[ROUND_KEYS];
+                lowmc.encrypt(key, input, net, state)
+            })
+            .collect()
     }
 
     fn reveal_qs_to_builder<N: Network>(
@@ -347,23 +358,26 @@ impl OhTable {
         state: &mut Rep3State,
     ) -> eyre::Result<Option<Vec<Block>>> {
         if self.params.builder == state.id {
-            let prev_qs = net.recv_many::<BlockShare>(self.params.builder.prev())?;
-            return Ok(Some(
-                self.qs_builder_order[..self.params.num_elements]
+            let prev_b = net.recv_from::<Vec<RingElement<Block>>>(self.params.builder.prev())?;
+            Ok(Some(
+                self.qs_builder_order
                     .iter()
-                    .map(|q| (q.a, q.b))
-                    .zip(prev_qs)
-                    .map(|((a, b), prev)| (a ^ b ^ prev.a).0)
-                    .collect::<Vec<Block>>(),
-            ));
-        } else if self.params.builder.prev() == state.id {
-            net.send_many(
+                    .zip(prev_b.iter())
+                    .map(|(own, prev_b)| (own.a ^ own.b ^ *prev_b).0)
+                    .collect(),
+            ))
+        } else if state.id == self.params.builder.prev() {
+            net.send_to(
                 self.params.builder,
-                &self.qs_builder_order[..self.params.num_elements],
+                self.qs_builder_order
+                    .iter()
+                    .map(|q| q.b)
+                    .collect::<Vec<_>>(),
             )?;
+            Ok(None)
+        } else {
+            Ok(None)
         }
-
-        Ok(None)
     }
 
     fn forward_receiver_order_known_to_receivers<N: Network>(
@@ -387,21 +401,52 @@ impl OhTable {
         Ok(())
     }
 
-    fn receiver_shuffle_for_party(&self, receiver_shuffler: &ArrayShuffler) -> LocalPermutation {
+    fn receiver_shuffle_for_party(
+        &self,
+        receiver_shuffler: &ArrayShuffler,
+        party: PartyID,
+    ) -> LocalPermutation {
         // The C++ version stores prev_shared_perm on prev_party(builder) and
         // next_shared_perm on next_party(builder). This local model keeps the
         // evaluator-side permutation used by the receiver-order index mapping.
-        receiver_shuffler.next_shared_perm.clone()
+        if party == self.params.builder.next() {
+            receiver_shuffler.next_shared_perm.clone()
+        } else {
+            receiver_shuffler.prev_shared_perm.clone()
+        }
     }
 
-    fn receive_stash_indices_from_builder(&self, stash_indices_builder: Vec<usize>) -> Vec<usize> {
+    fn receive_stash_indices_from_builder<N: Network>(
+        &self,
+        stash_indices_builder: Vec<usize>,
+        net: &N,
+        state: &Rep3State,
+    ) -> eyre::Result<Vec<usize>> {
         assert_eq!(stash_indices_builder.len(), self.params.stash_size);
-        stash_indices_builder
+        if state.id == self.params.builder {
+            net.send_to(self.params.builder.prev(), stash_indices_builder.clone())?;
+            net.send_to(self.params.builder.next(), stash_indices_builder.clone())?;
+            Ok(stash_indices_builder)
+        } else {
+            Ok(net.recv_from(self.params.builder)?)
+        }
     }
 
-    fn sync_stash_indices_with_builder(&self, stash_indices_receiver: Vec<usize>) -> Vec<usize> {
+    fn sync_stash_indices_with_receivers<N: Network>(
+        &self,
+        stash_indices_receiver: Vec<usize>,
+        net: &N,
+        state: &Rep3State,
+    ) -> eyre::Result<Vec<usize>> {
         assert_eq!(stash_indices_receiver.len(), self.params.stash_size);
-        stash_indices_receiver
+        if state.id == self.params.builder.prev() {
+            net.send_to(self.params.builder, stash_indices_receiver.clone())?;
+            Ok(stash_indices_receiver)
+        } else if state.id == self.params.builder {
+            Ok(net.recv_from(self.params.builder.prev())?)
+        } else {
+            Ok(stash_indices_receiver)
+        }
     }
 }
 
@@ -409,4 +454,11 @@ const KEEP_UPPER_96: u128 = u128::MAX << 32;
 
 pub fn attach_index(q: u128, i: u32) -> u128 {
     (q & KEEP_UPPER_96) | i as u128
+}
+
+fn upcast_x_to_block(share: XShare) -> BlockShare {
+    BlockShare::new_ring(
+        RingElement(u128::from(share.a.0)),
+        RingElement(u128::from(share.b.0)),
+    )
 }
