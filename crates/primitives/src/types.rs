@@ -73,18 +73,23 @@ pub fn bit_to_binary_mask<T: IntRing2k>(bit: &BitShare) -> Rep3RingShare<T> {
 /// Extracts local two-party XOR shares from replicated Rep3 ring shares.
 pub fn reshare_3_to_2<T: IntRing2k>(
     rep_array: &[Rep3RingShare<T>],
+    to_1: PartyID,
+    to_2: PartyID,
     state: &Rep3State,
 ) -> Vec<RingElement<T>> {
+    assert_ne!(to_1, to_2);
+    assert!(to_1.next() == to_2 || to_1.prev() == to_2);
+
     rep_array
         .iter()
         .map(|share| {
-            if state.id == PartyID::ID1 {
+            if state.id == to_1 {
                 share.a ^ share.b
-            } else if state.id == PartyID::ID2 {
-                if PartyID::ID1.next() == PartyID::ID2 {
-                    share.a
-                } else {
+            } else if state.id == to_2 {
+                if to_2 == to_1.prev() {
                     share.b
+                } else {
+                    share.a
                 }
             } else {
                 RingElement(T::zero())
