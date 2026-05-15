@@ -73,9 +73,10 @@ pub struct OhTable {
     pub key: Vec<BlockShare>,
     pub stash_xs: Vec<XShare>,
     pub stash_ys: Vec<YShare>,
+    pub builder_stash_indices: Vec<usize>,
     pub qs_builder_order: Vec<BlockShare>,
-    pub(crate) xs_builder_order: Vec<XShare>,
-    pub(crate) ys_builder_order: Vec<YShare>,
+    pub xs_builder_order: Vec<XShare>,
+    pub ys_builder_order: Vec<YShare>,
     pub dummy_indices: Vec<XShare>,
     pub xs_receiver_order: Vec<XShare>,
     pub ys_receiver_order: Vec<YShare>,
@@ -83,6 +84,15 @@ pub struct OhTable {
     pub receiver_shuffle: Option<LocalPermutation>,
     pub query_count: usize,
     pub touched: Vec<bool>,
+    pub last_query_trace: Option<OhTableQueryTrace>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OhTableQueryTrace {
+    pub old_query_count: usize,
+    pub selected_receiver_index: usize,
+    pub was_touched_before: bool,
+    pub dummy_builder_index: u32,
 }
 
 impl OhTable {
@@ -106,6 +116,7 @@ impl OhTable {
             key,
             stash_xs: vec![XShare::zero_share(); params.stash_size],
             stash_ys: vec![YShare::zero_share(); params.stash_size],
+            builder_stash_indices: vec![0; params.stash_size],
             qs_builder_order: vec![BlockShare::zero_share(); params.total_size()],
             xs_builder_order: vec![XShare::zero_share(); params.total_size()],
             ys_builder_order: vec![YShare::zero_share(); params.total_size()],
@@ -116,6 +127,7 @@ impl OhTable {
             receiver_shuffle: None,
             query_count: 0,
             touched: vec![false; params.total_size()],
+            last_query_trace: None,
         };
 
         table
@@ -216,6 +228,7 @@ impl OhTable {
 
         let stash_indices_builder =
             self.receive_stash_indices_from_builder(stashed_indices, net, state)?;
+        self.builder_stash_indices = stash_indices_builder.clone();
         let mut stash_indices_receiver = vec![0; self.params.stash_size];
         for i in 0..self.params.stash_size {
             stash_indices_receiver[i] = receiver_shuffle.evaluate_at(stash_indices_builder[i]);
@@ -258,7 +271,8 @@ impl OhTable {
             opened_q
         };
 
-        let dummy_index = downcast(self.dummy_indices[self.query_count].clone());
+        let old_query_count = self.query_count;
+        let dummy_index = downcast(self.dummy_indices[old_query_count].clone());
 
         let lookup_result = cht::lookup_from_2shares(
             self.params.log_single_col_len,
@@ -286,10 +300,17 @@ impl OhTable {
             net.recv_prev()?
         };
 
-        assert!(!self.touched[index_receiver_order]);
+        let was_touched_before = self.touched[index_receiver_order];
+        assert!(!was_touched_before);
         self.touched[index_receiver_order] = true;
 
         self.query_count += 1;
+        self.last_query_trace = Some(OhTableQueryTrace {
+            old_query_count,
+            selected_receiver_index: index_receiver_order,
+            was_touched_before,
+            dummy_builder_index: dummy_index.a.0 ^ dummy_index.b.0,
+        });
 
         Ok((
             self.ys_receiver_order[index_receiver_order].clone(),

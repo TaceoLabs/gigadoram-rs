@@ -1,15 +1,12 @@
-mod common;
-
-use common::{
-    low_u32, random_indexed_block as random_block, random_indexed_blocks as random_blocks,
-    run_parties,
-};
 use data_structures::cht::{build, h0, h1, lookup_from_2shares};
 use mpc_core::protocols::{
     rep3::{Rep3State, conversion::A2BType, id::PartyID},
     rep3_ring::{binary, ring::ring_impl::RingElement},
 };
-use primitives::Block;
+use primitives::{
+    Block, low_u32, random_indexed_block as random_block, random_indexed_blocks as random_blocks,
+    run_parties,
+};
 use rand::{RngCore, thread_rng};
 use std::collections::HashSet;
 

@@ -1,8 +1,7 @@
-#![allow(dead_code)]
-
 use mpc_net::local::LocalNetwork;
-use primitives::Block;
 use rand::{RngCore, seq::SliceRandom, thread_rng};
+
+use crate::Block;
 
 pub fn run_parties<R, F>(f: F) -> [R; 3]
 where
@@ -52,6 +51,10 @@ pub fn random_blocks(count: usize) -> Vec<Block> {
     (0..count).map(|_| random_block_with(&mut rng)).collect()
 }
 
+pub fn random_block_with(rng: &mut impl RngCore) -> Block {
+    (Block::from(rng.next_u64()) << 64) | Block::from(rng.next_u64())
+}
+
 pub fn random_indexed_block(
     log_single_col_len: u32,
     left_vertex: usize,
@@ -90,15 +93,7 @@ pub fn random_indexed_blocks(log_single_col_len: u32, count: usize) -> Vec<Block
         .collect()
 }
 
-pub fn low_u32(block: Block) -> u32 {
-    block as u32
-}
-
-fn random_block_with(rng: &mut impl RngCore) -> Block {
-    (Block::from(rng.next_u64()) << 64) | Block::from(rng.next_u64())
-}
-
-fn random_indexed_block_with(
+pub fn random_indexed_block_with(
     rng: &mut impl RngCore,
     log_single_col_len: u32,
     left_vertex: usize,
@@ -111,4 +106,8 @@ fn random_indexed_block_with(
     high = (high & !(mask << 32)) | ((right_vertex as u64) << 32);
 
     ((high as Block) << 64) | ((rng.next_u32() as Block) << 32) | builder_index as Block
+}
+
+pub fn low_u32(block: Block) -> u32 {
+    block as u32
 }

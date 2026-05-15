@@ -1,12 +1,9 @@
-#[path = "mod.rs"]
-mod common;
-
 use circuits::cht_lookup::lookup_circuit;
-use common::{public_block_share, public_x_share, run_parties};
 use mpc_core::protocols::{
     rep3::{Rep3State, conversion::A2BType},
     rep3_ring::binary,
 };
+use primitives::{public_block_share, public_x_share, run_parties};
 
 #[derive(Clone, Copy, Debug)]
 struct LookupCase {

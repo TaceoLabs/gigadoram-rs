@@ -1,12 +1,9 @@
-#[path = "mod.rs"]
-mod common;
-
 use circuits::xy_if_xs_equal::xy_if_xs_equal_circuit;
-use common::{open_binary_values, promote_public_values, run_parties};
 use mpc_core::protocols::{
     rep3::{Rep3State, conversion::A2BType},
     rep3_ring::binary,
 };
+use primitives::{open_many, promote_public_values, run_parties};
 
 #[test]
 fn test_xy_if_xs_equal_circuit() {
@@ -19,16 +16,16 @@ fn test_xy_if_xs_equal_circuit() {
 
     let outputs = run_parties(|net| {
         let mut state = Rep3State::new(&net, A2BType::Direct).unwrap();
-        let x_shares = promote_public_values(&xs, state.id);
-        let query_shares = promote_public_values(&query, state.id);
-        let y_shares = promote_public_values(&ys, state.id);
+        let x_shares = promote_public_values(state.id, &xs);
+        let query_shares = promote_public_values(state.id, &query);
+        let y_shares = promote_public_values(state.id, &ys);
 
         let (x_out, y_out, found) =
             xy_if_xs_equal_circuit(&x_shares, &query_shares, &y_shares, &net, &mut state).unwrap();
 
         (
-            open_binary_values(&x_out, &net),
-            open_binary_values(&y_out, &net),
+            open_many(&x_out, &net),
+            open_many(&y_out, &net),
             found
                 .iter()
                 .map(|share| binary::open(share, &net).unwrap().0.convert())

@@ -1,7 +1,7 @@
 use mpc_core::protocols::{
     rep3::{Rep3State, id::PartyID, network::Rep3NetworkExt},
     rep3_ring::{
-        Rep3RingShare,
+        Rep3RingShare, binary,
         ring::{bit::Bit, int_ring::IntRing2k, ring_impl::RingElement},
     },
 };
@@ -16,6 +16,49 @@ pub type XShare = Rep3RingShare<X>;
 pub type YShare = Rep3RingShare<Y>;
 pub type BlockShare = Rep3RingShare<Block>;
 pub type BitShare = Rep3RingShare<Bit>;
+
+pub fn promote_public<T: IntRing2k>(id: PartyID, value: T) -> Rep3RingShare<T> {
+    binary::promote_to_trivial_share(id, &RingElement(value))
+}
+
+pub fn promote_public_values<T: IntRing2k>(id: PartyID, values: &[T]) -> Vec<Rep3RingShare<T>> {
+    values
+        .iter()
+        .copied()
+        .map(|value| promote_public(id, value))
+        .collect()
+}
+
+pub fn public_x_share(id: PartyID, value: X) -> XShare {
+    promote_public(id, value)
+}
+
+pub fn public_y_share(id: PartyID, value: Y) -> YShare {
+    promote_public(id, value)
+}
+
+pub fn public_block_share(id: PartyID, value: Block) -> BlockShare {
+    promote_public(id, value)
+}
+
+pub fn public_x(id: PartyID, value: X) -> XShare {
+    public_x_share(id, value)
+}
+
+pub fn public_y(id: PartyID, value: Y) -> YShare {
+    public_y_share(id, value)
+}
+
+pub fn open_many<T, N>(shares: &[Rep3RingShare<T>], net: &N) -> Vec<T>
+where
+    T: IntRing2k,
+    N: Network,
+{
+    shares
+        .iter()
+        .map(|share| binary::open(share, net).unwrap().0)
+        .collect()
+}
 
 pub fn bit_to_binary_mask<T: IntRing2k>(bit: &BitShare) -> Rep3RingShare<T> {
     let all_ones = !T::zero();

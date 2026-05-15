@@ -3,8 +3,8 @@ use std::vec;
 use mpc_core::protocols::{
     rep3::Rep3State,
     rep3_ring::{
-        arithmetic::{self, RingShare},
-        binary::and_vec,
+        arithmetic::RingShare,
+        binary::{and_vec, is_zero},
         ring::int_ring::IntRing2k,
     },
 };
@@ -24,7 +24,7 @@ pub fn xy_if_xs_equal_circuit(
     let found = x
         .iter()
         .zip(x_query.iter())
-        .map(|(x_i, x_q_i)| arithmetic::eq(*x_i, *x_q_i, net, state))
+        .map(|(x_i, x_q_i)| is_zero(&(x_i ^ x_q_i), net, state))
         .collect::<eyre::Result<Vec<_>>>()?;
 
     let found_x = found

@@ -1,5 +1,5 @@
 [package]
-name = "core"
+name = "doram"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,8 @@ publish.workspace = true
 readme.workspace = true
 
 [dependencies]
+circuits.workspace = true
+eyre.workspace = true
 mpc-core.workspace = true
 mpc-net.workspace = true
 primitives.workspace = true

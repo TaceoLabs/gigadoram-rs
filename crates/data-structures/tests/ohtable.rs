@@ -1,7 +1,4 @@
-mod common;
-
 use circuits::lowmc::ROUND_KEYS;
-use common::{low_u32, random_blocks, run_parties, run_parties_may_panic};
 use data_structures::{OHTableParams, OhTable, cht};
 use mpc_core::protocols::{
     rep3::{Rep3State, conversion::A2BType, id::PartyID},
@@ -11,7 +8,10 @@ use mpc_core::protocols::{
     },
 };
 use mpc_net::Network;
-use primitives::{Block, X, Y, YShare};
+use primitives::{
+    Block, X, Y, YShare, low_u32, promote_public_values, random_blocks, run_parties,
+    run_parties_may_panic,
+};
 
 const NUM_ELEMENTS: usize = 10;
 const STASH_SIZE: usize = 2;
@@ -403,16 +403,11 @@ fn build_table<N: Network>(
     state: &mut Rep3State,
 ) -> OhTable {
     let params = OHTableParams::new(NUM_ELEMENTS, num_dummies, STASH_SIZE);
-    let xs = (0..NUM_ELEMENTS)
-        .map(|i| binary::promote_to_trivial_share(state.id, &RingElement(10 + i as X)))
-        .collect();
-    let ys = (0..NUM_ELEMENTS)
-        .map(|i| binary::promote_to_trivial_share(state.id, &RingElement(1000 + i as Y)))
-        .collect();
-    let key = clear_key
-        .iter()
-        .map(|block| binary::promote_to_trivial_share(state.id, &RingElement(*block)))
-        .collect();
+    let xs_clear = (0..NUM_ELEMENTS).map(|i| 10 + i as X).collect::<Vec<_>>();
+    let ys_clear = (0..NUM_ELEMENTS).map(|i| 1000 + i as Y).collect::<Vec<_>>();
+    let xs = promote_public_values(state.id, &xs_clear);
+    let ys = promote_public_values(state.id, &ys_clear);
+    let key = promote_public_values(state.id, clear_key);
 
     OhTable::new(params, xs, ys, key, net, state)
 }

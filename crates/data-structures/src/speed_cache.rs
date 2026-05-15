@@ -13,10 +13,10 @@ pub struct SpeedCacheQueryResult {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpeedCache {
-    length: usize,
-    num_stored: usize,
-    addrs: Vec<XShare>,
-    data: Vec<YShare>,
+    pub length: usize,
+    pub num_stored: usize,
+    pub addrs: Vec<XShare>,
+    pub data: Vec<YShare>,
 }
 
 impl SpeedCache {
@@ -47,19 +47,18 @@ impl SpeedCache {
 
     pub fn query(
         &mut self,
-        query_addr: Vec<XShare>,
+        query_addr: XShare,
         net: &impl Network,
         state: &mut Rep3State,
     ) -> eyre::Result<(YShare, BitShare)> {
-        assert_eq!(query_addr.len(), 1);
-
         let length_for_query = std::cmp::max(1, self.num_stored);
 
         // circuit input:  x_query | x | y
         // circuit output: x_mask | y | found
+        let query_addrs = vec![query_addr; length_for_query];
         let (x_if_found, y_if_found, found_out) = xy_if_xs_equal_circuit(
             &self.addrs[..length_for_query],
-            &query_addr,
+            &query_addrs,
             &self.data[..length_for_query],
             net,
             state,

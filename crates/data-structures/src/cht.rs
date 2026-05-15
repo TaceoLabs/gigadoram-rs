@@ -4,7 +4,7 @@ use mpc_core::protocols::{
     rep3_ring::ring::ring_impl::RingElement,
 };
 use mpc_net::Network;
-use primitives::{Block, XShare, from_2_shares, types::BitShare};
+use primitives::{Block, XShare, from_2_shares, low_u32, types::BitShare};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectedEdge {
     pub edge: usize,
@@ -184,10 +184,6 @@ pub fn h0(block: Block, log_single_col_len: u32) -> usize {
 pub fn h1(block: Block, log_single_col_len: u32) -> usize {
     let hash_mask = (1usize << log_single_col_len) - 1;
     (((block >> 96) as usize) & hash_mask) | (1usize << log_single_col_len)
-}
-
-fn low_u32(block: Block) -> u32 {
-    block as u32
 }
 
 fn reveal_index_to_receivers<N: Network>(

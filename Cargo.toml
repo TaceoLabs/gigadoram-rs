@@ -4,7 +4,7 @@ members = [
     "crates/circuits",
     "crates/primitives",
     "crates/data-structures",
-    "crates/core",
+    "crates/doram",
 ]
 
 [workspace.package]
@@ -21,7 +21,7 @@ readme = "./README.md"
 [workspace.dependencies]
 ark-bn254 = "0.5"
 circuits = { path = "crates/circuits" }
-core = { path = "crates/core" }
+doram = { path = "crates/doram" }
 ark-ff = { git = "https://github.com/arkworks-rs/ark-ff", branch = "main" }
 eyre = "0.6"
 itertools = "0.14"
