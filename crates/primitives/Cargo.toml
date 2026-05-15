@@ -16,3 +16,4 @@ mpc-core.workspace = true
 mpc-net.workspace = true
 num-traits.workspace = true
 rand.workspace = true
+rand_chacha.workspace = true
