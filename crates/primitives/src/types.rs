@@ -29,24 +29,18 @@ pub fn promote_public_values<T: IntRing2k>(id: PartyID, values: &[T]) -> Vec<Rep
         .collect()
 }
 
-pub fn public_x_share(id: PartyID, value: X) -> XShare {
-    promote_public(id, value)
+pub fn upcast_x_to_y(share: XShare) -> YShare {
+    YShare::new_ring(
+        RingElement(u64::from(share.a.0)),
+        RingElement(u64::from(share.b.0)),
+    )
 }
 
-pub fn public_y_share(id: PartyID, value: Y) -> YShare {
-    promote_public(id, value)
-}
-
-pub fn public_block_share(id: PartyID, value: Block) -> BlockShare {
-    promote_public(id, value)
-}
-
-pub fn public_x(id: PartyID, value: X) -> XShare {
-    public_x_share(id, value)
-}
-
-pub fn public_y(id: PartyID, value: Y) -> YShare {
-    public_y_share(id, value)
+pub fn upcast_x_to_block(share: XShare) -> BlockShare {
+    BlockShare::new_ring(
+        RingElement(u128::from(share.a.0)),
+        RingElement(u128::from(share.b.0)),
+    )
 }
 
 pub fn open_many<T, N>(shares: &[Rep3RingShare<T>], net: &N) -> Vec<T>

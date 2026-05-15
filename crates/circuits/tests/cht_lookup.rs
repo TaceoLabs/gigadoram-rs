@@ -3,7 +3,7 @@ use mpc_core::protocols::{
     rep3::{Rep3State, conversion::A2BType},
     rep3_ring::binary,
 };
-use primitives::{public_block_share, public_x_share, run_parties};
+use primitives::{promote_public, run_parties};
 
 #[derive(Clone, Copy, Debug)]
 struct LookupCase {
@@ -46,10 +46,10 @@ fn test_lookup_circuit() {
             .iter()
             .map(|case| {
                 let (index, found) = lookup_circuit(
-                    public_block_share(state.id, case.key),
-                    public_block_share(state.id, case.b0),
-                    public_block_share(state.id, case.b1),
-                    public_x_share(state.id, case.dummy_index),
+                    promote_public(state.id, case.key),
+                    promote_public(state.id, case.b0),
+                    promote_public(state.id, case.b1),
+                    promote_public(state.id, case.dummy_index),
                     &net,
                     &mut state,
                 )

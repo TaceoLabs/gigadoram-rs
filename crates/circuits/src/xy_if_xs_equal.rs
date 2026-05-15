@@ -1,18 +1,9 @@
-use std::vec;
-
-use mpc_core::protocols::{
-    rep3::Rep3State,
-    rep3_ring::{
-        arithmetic::RingShare,
-        binary::{and_vec, is_zero},
-        ring::int_ring::IntRing2k,
-    },
-};
+use mpc_core::protocols::{rep3::Rep3State, rep3_ring::casts::downcast};
 use mpc_net::Network;
-use primitives::{XShare, YShare, bit_to_binary_mask, types::BitShare};
-use rand::distributions::{Distribution, Standard};
+use primitives::{
+    XShare, YShare, bit_to_binary_mask, cmux_many_custom, is_zero_many, types::BitShare,
+};
 
-// TODO: Takes 4 rounds, can we lower
 pub fn xy_if_xs_equal_circuit(
     x: &[XShare],
     x_query: &[XShare],
@@ -20,50 +11,29 @@ pub fn xy_if_xs_equal_circuit(
     net: &impl Network,
     state: &mut Rep3State,
 ) -> eyre::Result<(Vec<XShare>, Vec<YShare>, Vec<BitShare>)> {
-    // TODO: In single round
-    let found = x
+    assert_eq!(x.len(), x_query.len());
+    assert_eq!(x.len(), y.len());
+
+    let xor = x
         .iter()
         .zip(x_query.iter())
-        .map(|(x_i, x_q_i)| is_zero(&(x_i ^ x_q_i), net, state))
-        .collect::<eyre::Result<Vec<_>>>()?;
+        .map(|(x_i, x_q_i)| x_i ^ x_q_i)
+        .collect::<Vec<_>>();
+    let found = is_zero_many(&xor, net, state)?;
 
-    let found_x = found
-        .iter()
-        .map(bit_to_binary_mask)
-        .collect::<Vec<XShare>>();
     let found_y = found
         .iter()
         .map(bit_to_binary_mask)
         .collect::<Vec<YShare>>();
 
-    // TODO: In single round
-    let x_if_xs_equal = cmux_many(&found_x, x, &vec![XShare::default(); x.len()], net, state)?;
-    let y_if_xs_equal = cmux_many(&found_y, y, &vec![YShare::default(); y.len()], net, state)?;
+    let selected = cmux_many_custom(&found_y, x, y, net, state)?;
+
+    let x_if_xs_equal = selected[..x.len()]
+        .iter()
+        .copied()
+        .map(downcast)
+        .collect::<Vec<XShare>>();
+    let y_if_xs_equal = selected[x.len()..].to_vec();
 
     Ok((x_if_xs_equal, y_if_xs_equal, found))
-}
-
-/// Computes a CMUX: If `c` is `1`, returns `x_t`, otherwise returns `x_f`.
-pub fn cmux_many<T: IntRing2k, N: Network>(
-    c: &[RingShare<T>],
-    x_t: &[RingShare<T>],
-    x_f: &[RingShare<T>],
-    net: &N,
-    state: &mut Rep3State,
-) -> eyre::Result<Vec<RingShare<T>>>
-where
-    Standard: Distribution<T>,
-{
-    let xor = x_f
-        .iter()
-        .zip(x_t.iter())
-        .map(|(f, t)| f ^ t)
-        .collect::<Vec<_>>();
-    let and = and_vec(c, &xor, net, state)?;
-    let result = and
-        .iter()
-        .zip(x_f.iter())
-        .map(|(a, f)| a ^ f)
-        .collect::<Vec<_>>();
-    Ok(result)
 }

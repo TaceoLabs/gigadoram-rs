@@ -15,77 +15,90 @@ mod params {
     include!("lowmc_params.rs");
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LowMc;
+pub fn encrypt<N: Network>(
+    expanded_key: &[BlockShare],
+    input: BlockShare,
+    net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<BlockShare> {
+    let mut outputs = encrypt_many(&[expanded_key], &[input], net, state)?;
+    Ok(outputs.remove(0))
+}
 
-impl LowMc {
-    pub fn new(_seed: u64) -> Self {
-        // Kept for existing call sites; the parameters are fixed to LowMC_reuse_wires.txt.
-        Self
-    }
-
-    pub fn gigadoram() -> Self {
-        Self::default()
-    }
-
-    pub fn encrypt<N: Network>(
-        &self,
-        expanded_key: &[BlockShare],
-        input: BlockShare,
-        net: &N,
-        state: &mut Rep3State,
-    ) -> eyre::Result<BlockShare> {
+pub fn encrypt_many<N: Network>(
+    expanded_keys: &[&[BlockShare]],
+    inputs: &[BlockShare],
+    net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<Vec<BlockShare>> {
+    assert_eq!(expanded_keys.len(), inputs.len());
+    for expanded_key in expanded_keys {
         assert_eq!(expanded_key.len(), ROUND_KEYS);
-
-        let expanded_key = expanded_key
-            .iter()
-            .map(|round_key| unpack_block(*round_key))
-            .collect::<Vec<_>>();
-        let mut state_bits = unpack_block(input);
-
-        add_round_key(&mut state_bits, &expanded_key[0]);
-
-        for round in 0..N_ROUNDS {
-            state_bits = sbox_layer(&state_bits, net, state)?;
-            state_bits = self.four_russians_matrix_mult(round, &state_bits);
-            self.xor_constants(round, &mut state_bits, state);
-            add_round_key(&mut state_bits, &expanded_key[round + 1]);
-        }
-
-        Ok(pack_block(&state_bits))
+    }
+    if inputs.is_empty() {
+        return Ok(Vec::new());
     }
 
-    fn four_russians_matrix_mult(&self, round: usize, input: &[BlockShare]) -> Vec<BlockShare> {
-        assert_eq!(input.len(), BLOCK_SIZE);
+    let expanded_keys = expanded_keys
+        .iter()
+        .map(|expanded_key| {
+            expanded_key
+                .iter()
+                .map(|round_key| unpack_block(*round_key))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut state_bits = inputs.iter().copied().map(unpack_block).collect::<Vec<_>>();
 
-        let mut output = vec![BlockShare::zero_share(); BLOCK_SIZE];
-        for window in 0..(BLOCK_SIZE / M4R_WINDOW_SIZE) {
-            let lut =
-                fill_out_lut(&input[(window * M4R_WINDOW_SIZE)..((window + 1) * M4R_WINDOW_SIZE)]);
-
-            for output_wire in 0..BLOCK_SIZE {
-                let mask = params::M4R_MASKS[round][window][output_wire] as usize;
-                let selected = lut[mask];
-                output[output_wire] = if window == 0 {
-                    selected
-                } else {
-                    binary::xor(&output[output_wire], &selected)
-                };
-            }
-        }
-        output
+    for (state_bits, expanded_key) in state_bits.iter_mut().zip(&expanded_keys) {
+        add_round_key(state_bits, &expanded_key[0]);
     }
 
-    fn xor_constants(&self, round: usize, state_bits: &mut [BlockShare], state: &Rep3State) {
-        assert_eq!(state_bits.len(), BLOCK_SIZE);
+    for round in 0..N_ROUNDS {
+        state_bits = sbox_layer_many(&state_bits, net, state)?;
+        for (state_bits, expanded_key) in state_bits.iter_mut().zip(&expanded_keys) {
+            *state_bits = four_russians_matrix_mult(round, state_bits);
+            xor_constants(round, state_bits, state);
+            add_round_key(state_bits, &expanded_key[round + 1]);
+        }
+    }
 
-        for (bit, constant) in state_bits
-            .iter_mut()
-            .zip(params::ROUND_CONSTANTS[round].iter().copied())
-        {
-            if constant {
-                *bit = binary::xor_public(bit, &RingElement(1u128), state.id);
-            }
+    Ok(state_bits
+        .iter()
+        .map(|state_bits| pack_block(state_bits))
+        .collect())
+}
+
+fn four_russians_matrix_mult(round: usize, input: &[BlockShare]) -> Vec<BlockShare> {
+    assert_eq!(input.len(), BLOCK_SIZE);
+
+    let mut output = vec![BlockShare::zero_share(); BLOCK_SIZE];
+    for window in 0..(BLOCK_SIZE / M4R_WINDOW_SIZE) {
+        let lut =
+            fill_out_lut(&input[(window * M4R_WINDOW_SIZE)..((window + 1) * M4R_WINDOW_SIZE)]);
+
+        for output_wire in 0..BLOCK_SIZE {
+            let mask = params::M4R_MASKS[round][window][output_wire] as usize;
+            let selected = lut[mask];
+            output[output_wire] = if window == 0 {
+                selected
+            } else {
+                binary::xor(&output[output_wire], &selected)
+            };
+        }
+    }
+    output
+}
+
+fn xor_constants(round: usize, state_bits: &mut [BlockShare], state: &Rep3State) {
+    assert_eq!(state_bits.len(), BLOCK_SIZE);
+
+    for (bit, constant) in state_bits
+        .iter_mut()
+        .zip(params::ROUND_CONSTANTS[round].iter().copied())
+    {
+        if constant {
+            *bit = binary::xor_public(bit, &RingElement(1u128), state.id);
         }
     }
 }
@@ -99,15 +112,47 @@ fn add_round_key(state: &mut [BlockShare], round_key: &[BlockShare]) {
     }
 }
 
-fn sbox_layer<N: Network>(
-    input: &[BlockShare],
+fn sbox_layer_many<N: Network>(
+    inputs: &[Vec<BlockShare>],
     net: &N,
     state: &mut Rep3State,
-) -> eyre::Result<Vec<BlockShare>> {
-    assert_eq!(input.len(), BLOCK_SIZE);
+) -> eyre::Result<Vec<Vec<BlockShare>>> {
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    for input in inputs {
+        assert_eq!(input.len(), BLOCK_SIZE);
+    }
 
-    let mut and_lhs = Vec::with_capacity(3 * N_SBOXES);
-    let mut and_rhs = Vec::with_capacity(3 * N_SBOXES);
+    let batch_size = inputs.len();
+    let ands_per_block = 3 * N_SBOXES;
+    let mut and_lhs = Vec::with_capacity(batch_size * ands_per_block);
+    let mut and_rhs = Vec::with_capacity(batch_size * ands_per_block);
+
+    for input in inputs {
+        collect_sbox_ands(input, &mut and_lhs, &mut and_rhs);
+    }
+
+    let ands = binary::and_vec(&and_lhs, &and_rhs, net, state)?;
+    let mut outputs = vec![vec![BlockShare::zero_share(); BLOCK_SIZE]; batch_size];
+
+    for (batch_index, input) in inputs.iter().enumerate() {
+        apply_sbox_ands(
+            input,
+            &ands[(batch_index * ands_per_block)..((batch_index + 1) * ands_per_block)],
+            &mut outputs[batch_index],
+        );
+    }
+
+    Ok(outputs)
+}
+
+fn collect_sbox_ands(
+    input: &[BlockShare],
+    and_lhs: &mut Vec<BlockShare>,
+    and_rhs: &mut Vec<BlockShare>,
+) {
+    assert_eq!(input.len(), BLOCK_SIZE);
 
     for i in 0..N_SBOXES {
         let a = input[3 * i];
@@ -121,9 +166,12 @@ fn sbox_layer<N: Network>(
         and_lhs.push(a);
         and_rhs.push(b);
     }
+}
 
-    let ands = binary::and_vec(&and_lhs, &and_rhs, net, state)?;
-    let mut output = vec![BlockShare::zero_share(); BLOCK_SIZE];
+fn apply_sbox_ands(input: &[BlockShare], ands: &[BlockShare], output: &mut [BlockShare]) {
+    assert_eq!(input.len(), BLOCK_SIZE);
+    assert_eq!(ands.len(), 3 * N_SBOXES);
+    assert_eq!(output.len(), BLOCK_SIZE);
 
     for i in 0..N_SBOXES {
         let a = input[3 * i];
@@ -140,7 +188,6 @@ fn sbox_layer<N: Network>(
     }
 
     output[(3 * N_SBOXES)..BLOCK_SIZE].copy_from_slice(&input[(3 * N_SBOXES)..BLOCK_SIZE]);
-    Ok(output)
 }
 
 fn fill_out_lut(input: &[BlockShare]) -> [BlockShare; 1 << M4R_WINDOW_SIZE] {

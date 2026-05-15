@@ -1,4 +1,4 @@
-use circuits::lowmc::{LowMc, ROUND_KEYS};
+use circuits::lowmc::{self, ROUND_KEYS};
 use eyre::{Result, ensure};
 use mpc_core::protocols::{
     rep3::{Rep3State, id::PartyID},
@@ -9,7 +9,7 @@ use mpc_core::protocols::{
     },
 };
 use mpc_net::Network;
-use primitives::{BitShare, Block, BlockShare, XShare, Y, YShare};
+use primitives::{BitShare, Block, BlockShare, XShare, Y, YShare, upcast_x_to_block};
 use structures::{OHTableParams, OhTable, SpeedCache};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,12 +122,18 @@ impl GigaDoram {
         let (mut y_accum, mut found) = self.speed_cache.query(query_x, net, state)?;
         let mut alibi_mask = self.extract_alibi_bits(&y_accum);
 
-        for level in 0..self.config.num_levels {
-            let Some(table) = self.levels[level].as_mut() else {
-                continue;
-            };
+        let live_levels = self
+            .levels
+            .iter()
+            .enumerate()
+            .filter_map(|(level, table)| table.as_ref().map(|_| level))
+            .collect::<Vec<_>>();
+        let qs = self.evaluate_prf_tags(&live_levels, query_x, net, state)?;
 
-            let q = Self::evaluate_prf_tag(&table.key, query_x, net, state)?;
+        for (&level, &q) in live_levels.iter().zip(&qs) {
+            let table = self.levels[level]
+                .as_mut()
+                .expect("live level should still exist during query");
             let use_dummy = binary::xor(&alibi_mask[level], &found);
             let (y_returned, found_returned) = table.query(q, use_dummy, net, state)?;
 
@@ -275,21 +281,25 @@ impl GigaDoram {
             .collect()
     }
 
-    fn evaluate_prf_tag<N: Network>(
-        key: &[BlockShare],
+    fn evaluate_prf_tags<N: Network>(
+        &self,
+        levels: &[usize],
         input: XShare,
         net: &N,
         state: &mut Rep3State,
-    ) -> Result<BlockShare> {
-        assert_eq!(key.len(), ROUND_KEYS);
-        LowMc::gigadoram().encrypt(key, Self::upcast_x_to_block(input), net, state)
-    }
-
-    fn upcast_x_to_block(share: XShare) -> BlockShare {
-        BlockShare::new_ring(
-            RingElement(u128::from(share.a.0)),
-            RingElement(u128::from(share.b.0)),
-        )
+    ) -> Result<Vec<BlockShare>> {
+        let keys = levels
+            .iter()
+            .map(|&level| {
+                let table = self.levels[level]
+                    .as_ref()
+                    .expect("live level should have an OHTable");
+                assert_eq!(table.key.len(), ROUND_KEYS);
+                table.key.as_slice()
+            })
+            .collect::<Vec<_>>();
+        let inputs = vec![upcast_x_to_block(input); levels.len()];
+        lowmc::encrypt_many(&keys, &inputs, net, state)
     }
 
     fn extract_alibi_bits(&self, y: &YShare) -> Vec<BitShare> {

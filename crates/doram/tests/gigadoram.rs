@@ -6,7 +6,7 @@ use mpc_core::protocols::{
     rep3_ring::binary,
 };
 use mpc_net::local::LocalNetwork;
-use primitives::{Block, X, Y, open_many, public_x, public_y, run_parties};
+use primitives::{Block, X, Y, open_many, promote_public, run_parties};
 use structures::{OhTable, cht};
 
 const NUM_LEVELS: usize = 4;
@@ -116,10 +116,10 @@ impl TestData {
 
             for op in trace {
                 let value = match *op {
-                    Op::Read(x) => doram.read(public_x(state.id, x), &net, &mut state),
+                    Op::Read(x) => doram.read(promote_public(state.id, x), &net, &mut state),
                     Op::Write(x, y) => doram.write(
-                        public_x(state.id, x),
-                        public_y(state.id, y),
+                        promote_public(state.id, x),
+                        promote_public(state.id, y),
                         &net,
                         &mut state,
                     ),
@@ -141,10 +141,10 @@ impl TestData {
 
             for op in trace {
                 let value = match *op {
-                    Op::Read(x) => doram.read(public_x(state.id, x), &net, &mut state),
+                    Op::Read(x) => doram.read(promote_public(state.id, x), &net, &mut state),
                     Op::Write(x, y) => doram.write(
-                        public_x(state.id, x),
-                        public_y(state.id, y),
+                        promote_public(state.id, x),
+                        promote_public(state.id, y),
                         &net,
                         &mut state,
                     ),
@@ -169,10 +169,10 @@ impl TestData {
                 let before = before_op(&doram, &net);
                 let old_value = *oracle.get(&op.x()).unwrap_or(&0);
                 let value = match *op {
-                    Op::Read(x) => doram.read(public_x(state.id, x), &net, &mut state),
+                    Op::Read(x) => doram.read(promote_public(state.id, x), &net, &mut state),
                     Op::Write(x, y) => doram.write(
-                        public_x(state.id, x),
-                        public_y(state.id, y),
+                        promote_public(state.id, x),
+                        promote_public(state.id, y),
                         &net,
                         &mut state,
                     ),

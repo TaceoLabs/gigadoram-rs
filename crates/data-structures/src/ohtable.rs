@@ -1,4 +1,4 @@
-use circuits::lowmc::{LowMc, ROUND_KEYS};
+use circuits::lowmc::{self, ROUND_KEYS};
 use eyre::Ok;
 use mpc_core::protocols::{
     rep3::{Rep3State, id::PartyID, network::Rep3NetworkExt},
@@ -12,8 +12,9 @@ use mpc_core::protocols::{
 use mpc_net::Network;
 use primitives::{
     ArrayShuffler, Block, BlockShare, LocalPermutation, XShare, YShare, bit_to_binary_mask,
-    reshare_3_to_2,
+    reshare_3_to_2, reveal_to_party,
     types::{BitShare, input},
+    upcast_x_to_block,
 };
 
 use crate::cht;
@@ -146,21 +147,12 @@ impl OhTable {
         assert_eq!(xs.len(), self.params.num_elements);
         assert_eq!(ys.len(), self.params.num_elements);
 
-        // compute qs
-        let prf_input_size_blocks = self.prf_key_size_blocks() + 1;
-        let mut keys_and_inputs =
-            vec![BlockShare::zero_share(); prf_input_size_blocks * self.params.num_elements];
-
-        for i in 0..self.params.num_elements {
-            let input_offset = prf_input_size_blocks * i;
-            keys_and_inputs[input_offset..input_offset + self.prf_key_size_blocks()]
-                .copy_from_slice(&self.key);
-            let dst_index = prf_input_size_blocks * (i + 1) - 1;
-
-            keys_and_inputs[dst_index] = upcast_x_to_block(xs[i].clone());
-        }
-
-        let qs = self.evaluate_prf_tags(keys_and_inputs, net, state)?;
+        let prf_inputs = xs
+            .iter()
+            .copied()
+            .map(upcast_x_to_block)
+            .collect::<Vec<_>>();
+        let qs = self.evaluate_prf_tags(&prf_inputs, net, state)?;
         self.qs_builder_order[..self.params.num_elements].copy_from_slice(&qs);
 
         let builder_shuffler = ArrayShuffler::new(self.params.total_size(), state);
@@ -263,13 +255,7 @@ impl OhTable {
 
         let q_or_dummy = binary::cmux(&use_dummy, &arithmetic::rand(state), &q, net, state)?;
 
-        // TODO: No builder communication
-        let opened_q = binary::open(&q_or_dummy, net)?;
-        let q_clear = if state.id == self.params.builder {
-            RingElement(0)
-        } else {
-            opened_q
-        };
+        let q_clear = reveal_to_receivers(&q_or_dummy, self.params.builder, net, state)?;
 
         let old_query_count = self.query_count;
         let dummy_index = downcast(self.dummy_indices[old_query_count].clone());
@@ -354,23 +340,15 @@ impl OhTable {
 
     fn evaluate_prf_tags<N: Network>(
         &self,
-        keys_and_inputs: Vec<BlockShare>,
+        inputs: &[BlockShare],
         net: &N,
         state: &mut Rep3State,
     ) -> eyre::Result<Vec<BlockShare>> {
-        let input_size = self.prf_key_size_blocks() + 1;
-        assert_eq!(keys_and_inputs.len(), input_size * self.params.num_elements);
+        assert_eq!(inputs.len(), self.params.num_elements);
         assert_eq!(self.prf_key_size_blocks(), ROUND_KEYS);
 
-        let lowmc = LowMc::gigadoram();
-        keys_and_inputs
-            .chunks_exact(input_size)
-            .map(|chunk| {
-                let key = &chunk[..ROUND_KEYS];
-                let input = chunk[ROUND_KEYS];
-                lowmc.encrypt(key, input, net, state)
-            })
-            .collect()
+        let keys = vec![self.key.as_slice(); inputs.len()];
+        lowmc::encrypt_many(&keys, inputs, net, state)
     }
 
     fn reveal_qs_to_builder<N: Network>(
@@ -477,9 +455,20 @@ pub fn attach_index(q: u128, i: u32) -> u128 {
     (q & KEEP_UPPER_96) | i as u128
 }
 
-fn upcast_x_to_block(share: XShare) -> BlockShare {
-    BlockShare::new_ring(
-        RingElement(u128::from(share.a.0)),
-        RingElement(u128::from(share.b.0)),
-    )
+fn reveal_to_receivers<N: Network>(
+    share: &BlockShare,
+    builder: PartyID,
+    net: &N,
+    state: &Rep3State,
+) -> eyre::Result<RingElement<Block>> {
+    let prev_open = reveal_to_party(share, builder.prev(), net, state)?;
+    let next_open = reveal_to_party(share, builder.next(), net, state)?;
+
+    if state.id == builder.prev() {
+        Ok(prev_open.expect("previous receiver should reconstruct the query tag"))
+    } else if state.id == builder.next() {
+        Ok(next_open.expect("next receiver should reconstruct the query tag"))
+    } else {
+        Ok(RingElement(0))
+    }
 }
