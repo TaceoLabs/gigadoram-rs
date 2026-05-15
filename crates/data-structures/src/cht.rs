@@ -46,9 +46,9 @@ pub fn build(
 
     // Algorithm: DFS through the graph of locations, with edges formed by elements.
     let mut edges = vec![Vec::<DirectedEdge>::new(); num_vertices];
-    for edge in 0..num_edges {
-        let left_vertex = h0(input_array[edge], log_single_col_len);
-        let right_vertex = h1(input_array[edge], log_single_col_len);
+    for (edge, input) in input_array.iter().copied().enumerate() {
+        let left_vertex = h0(input, log_single_col_len);
+        let right_vertex = h1(input, log_single_col_len);
         edges[left_vertex].push(DirectedEdge {
             edge,
             vertex: right_vertex,
@@ -122,20 +122,20 @@ pub fn build(
 
     let mut stash_indices = vec![0; stash_size];
     let mut num_stashed = 0;
-    for edge in 0..num_edges {
+    for (edge, input) in input_array.iter().copied().enumerate() {
         if state[edge] == StashState::Stashed {
             // The input block's low 32 bits contain the builder-order index.
-            stash_indices[num_stashed] = low_u32(input_array[edge]) as usize;
+            stash_indices[num_stashed] = low_u32(input) as usize;
             num_stashed += 1;
         } else {
             assert_ne!(state[edge], StashState::Unvisited);
             if stash_deficit > 0 {
-                stash_indices[num_stashed] = low_u32(input_array[edge]) as usize;
+                stash_indices[num_stashed] = low_u32(input) as usize;
                 num_stashed += 1;
                 stash_deficit -= 1;
             } else {
                 let value = state[edge].unwrap_regular();
-                table[value] = input_array[edge];
+                table[value] = input;
             }
         }
     }

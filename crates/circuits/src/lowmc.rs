@@ -77,13 +77,13 @@ fn four_russians_matrix_mult(round: usize, input: &[BlockShare]) -> Vec<BlockSha
         let lut =
             fill_out_lut(&input[(window * M4R_WINDOW_SIZE)..((window + 1) * M4R_WINDOW_SIZE)]);
 
-        for output_wire in 0..BLOCK_SIZE {
+        for (output_wire, output_bit) in output.iter_mut().enumerate() {
             let mask = params::M4R_MASKS[round][window][output_wire] as usize;
             let selected = lut[mask];
-            output[output_wire] = if window == 0 {
+            *output_bit = if window == 0 {
                 selected
             } else {
-                binary::xor(&output[output_wire], &selected)
+                binary::xor(output_bit, &selected)
             };
         }
     }

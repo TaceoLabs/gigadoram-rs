@@ -172,12 +172,12 @@ impl OhTable {
         let (cht, stashed_indices) = if state.id == self.params.builder {
             let mut j = 0;
             let qs_in_clear = qs_in_clear.expect("builder should receive revealed qs");
-            for i in 0..self.params.total_size() {
-                if qs_in_clear[i] == Block::default() {
+            for (i, q) in qs_in_clear.iter().copied().enumerate() {
+                if q == Block::default() {
                     continue;
                 }
 
-                qs_in_clear_compacted[j] = attach_index(qs_in_clear[i], i as u32);
+                qs_in_clear_compacted[j] = attach_index(q, i as u32);
                 j += 1;
             }
 
@@ -231,10 +231,9 @@ impl OhTable {
         // Pretend that stashed indices have already been queried.
         for (stash_pos, &stash_index_receiver_order) in stash_indices_receiver.iter().enumerate() {
             assert!(stash_index_receiver_order < self.params.total_size());
-            let stash_index_receiver_order = stash_index_receiver_order;
             self.touched[stash_index_receiver_order] = true;
-            self.stash_xs[stash_pos] = self.xs_receiver_order[stash_index_receiver_order].clone();
-            self.stash_ys[stash_pos] = self.ys_receiver_order[stash_index_receiver_order].clone();
+            self.stash_xs[stash_pos] = self.xs_receiver_order[stash_index_receiver_order];
+            self.stash_ys[stash_pos] = self.ys_receiver_order[stash_index_receiver_order];
         }
 
         self.receiver_shuffle = Some(receiver_shuffle);
@@ -258,7 +257,7 @@ impl OhTable {
         let q_clear = reveal_to_receivers(&q_or_dummy, self.params.builder, net, state)?;
 
         let old_query_count = self.query_count;
-        let dummy_index = downcast(self.dummy_indices[old_query_count].clone());
+        let dummy_index = downcast(self.dummy_indices[old_query_count]);
 
         let lookup_result = cht::lookup_from_2shares(
             self.params.log_single_col_len,
@@ -299,7 +298,7 @@ impl OhTable {
         });
 
         Ok((
-            self.ys_receiver_order[index_receiver_order].clone(),
+            self.ys_receiver_order[index_receiver_order],
             lookup_result.found,
         ))
     }
@@ -312,12 +311,12 @@ impl OhTable {
         extract_xs.reserve(self.params.num_elements - self.params.stash_size);
         extract_ys.reserve(self.params.num_elements - self.params.stash_size);
 
-        for i in 0..self.params.total_size() {
-            if self.touched[i] {
+        for (i, touched) in self.touched.iter().copied().enumerate() {
+            if touched {
                 continue;
             }
-            extract_xs.push(self.xs_receiver_order[i].clone());
-            extract_ys.push(self.ys_receiver_order[i].clone());
+            extract_xs.push(self.xs_receiver_order[i]);
+            extract_ys.push(self.ys_receiver_order[i]);
         }
 
         assert_eq!(

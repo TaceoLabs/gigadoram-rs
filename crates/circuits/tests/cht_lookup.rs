@@ -18,7 +18,7 @@ fn test_lookup_circuit() {
     let tag0 = 0xabcdu128;
     let tag1 = 0xdef0u128;
     let tag_miss = 0x1234u128;
-    let cases = vec![
+    let cases = [
         LookupCase {
             key: tag(tag0),
             b0: entry(tag0, 11),

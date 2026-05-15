@@ -131,7 +131,7 @@ impl TestData {
         net: &N,
         state: &mut Rep3State,
     ) -> (YShare, bool) {
-        let q = table.qs_builder_order[builder_index].clone();
+        let q = table.qs_builder_order[builder_index];
         let use_dummy =
             binary::promote_to_trivial_share(state.id, &RingElement(Bit::new(use_dummy)));
         let (value, found) = table.query(q, use_dummy, net, state).unwrap();
@@ -257,7 +257,7 @@ fn test_query_existing_item() {
 
         for (query_index, builder_index) in builder_indices.iter().copied().enumerate() {
             let receiver_index = data.receiver_index(builder_index);
-            let expected_y = table.ys_receiver_order[receiver_index].clone();
+            let expected_y = table.ys_receiver_order[receiver_index];
             assert_eq!(table.query_count, query_index);
             assert!(!table.touched[receiver_index]);
 
@@ -281,7 +281,7 @@ fn test_query_stashed_item() {
         let mut state = Rep3State::new(&net, A2BType::Direct).unwrap();
         let mut table = data.table(state.id);
 
-        let expected_y = table.ys_receiver_order[expected_receiver].clone();
+        let expected_y = table.ys_receiver_order[expected_receiver];
         let (value, found) = data.query(&mut table, builder_index, false, &net, &mut state);
 
         assert_eq!(value, expected_y);
@@ -299,7 +299,7 @@ fn test_dummy_query() {
     run_parties(|net| {
         let mut state = Rep3State::new(&net, A2BType::Direct).unwrap();
         let mut table = data.table(state.id);
-        let expected_y = table.ys_receiver_order[expected_receiver].clone();
+        let expected_y = table.ys_receiver_order[expected_receiver];
 
         let (value, found) = data.query(&mut table, 0, true, &net, &mut state);
 
@@ -340,7 +340,7 @@ fn test_extract() {
         for (query_index, builder_index) in builder_indices.into_iter().enumerate() {
             let (value, found) = data.query(&mut table, builder_index, false, &net, &mut state);
             let expected_receiver = data.dummy_receiver_index(query_index);
-            let expected_y = table.ys_receiver_order[expected_receiver].clone();
+            let expected_y = table.ys_receiver_order[expected_receiver];
 
             assert_eq!(value, expected_y);
             assert!(!found);
@@ -352,7 +352,7 @@ fn test_extract() {
             .zip(table.ys_receiver_order.iter())
             .enumerate()
             .filter(|(receiver_index, _)| !table.touched[*receiver_index])
-            .map(|(_, (x, y))| (x.clone(), y.clone()))
+            .map(|(_, (x, y))| (*x, *y))
             .collect::<Vec<_>>();
         let mut extract_xs = Vec::new();
         let mut extract_ys = Vec::new();
@@ -361,7 +361,7 @@ fn test_extract() {
         let extracted = extract_xs
             .iter()
             .zip(extract_ys.iter())
-            .map(|(x, y)| (x.clone(), y.clone()))
+            .map(|(x, y)| (*x, *y))
             .collect::<Vec<_>>();
 
         assert_eq!(extracted, expected);

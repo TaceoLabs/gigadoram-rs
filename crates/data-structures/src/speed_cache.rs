@@ -66,7 +66,7 @@ impl SpeedCache {
 
         self.addrs[..length_for_query]
             .iter_mut()
-            .zip(x_if_found.into_iter())
+            .zip(x_if_found)
             .for_each(|(x, x_mask)| *x ^= x_mask);
 
         let y_xor = y_if_found
