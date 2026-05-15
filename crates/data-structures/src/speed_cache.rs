@@ -6,12 +6,6 @@ use mpc_net::Network;
 use primitives::{XShare, YShare, types::BitShare};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SpeedCacheQueryResult {
-    pub value: Vec<YShare>,
-    pub found: Vec<XShare>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpeedCache {
     pub length: usize,
     pub num_stored: usize,
@@ -81,13 +75,13 @@ impl SpeedCache {
         Ok((y_xor, found_xor))
     }
 
-    // TODO: Get the vectors unsafely, no clones
     pub fn extract(&mut self) -> (Vec<XShare>, Vec<YShare>) {
         assert_eq!(self.num_stored, self.length);
-        let result = (self.addrs.clone(), self.data.clone());
-        self.addrs.clear();
-        self.data.clear();
-        result
+        self.num_stored = 0;
+        (
+            std::mem::replace(&mut self.addrs, vec![XShare::default(); self.length]),
+            std::mem::replace(&mut self.data, vec![YShare::default(); self.length]),
+        )
     }
 
     pub fn write(&mut self, write_addrs: Vec<XShare>, write_data: Vec<YShare>) {
