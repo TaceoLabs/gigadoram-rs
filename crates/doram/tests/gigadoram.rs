@@ -466,10 +466,7 @@ fn assert_ohtable_address_invariants(
     assert_eq!(element_rows.len(), table.params.num_elements);
 
     if level == doram.config.num_levels - 1 {
-        assert_eq!(
-            table.params.num_elements,
-            address_space_size(&doram.config) as usize - 1
-        );
+        assert!(table.params.num_elements < address_space_size(&doram.config) as usize);
     }
 
     for (x, _) in element_rows {

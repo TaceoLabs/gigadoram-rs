@@ -464,15 +464,16 @@ impl GigaDoram {
             "bottom cleanse received mismatched x/y lengths"
         );
         let bottom_num_elements = self.bottom_num_elements();
-        ensure!(
-            xs.len() >= bottom_num_elements,
-            "bottom cleanse needs enough extracted entries for the bottom level"
-        );
 
         let mut dummy_flags =
             dummy_check_circuit(&xs, self.config.log_address_space_size, net, state)?;
 
         if self.had_initial_bottom_level {
+            ensure!(
+                xs.len() >= bottom_num_elements,
+                "initial bottom cleanse needs enough extracted entries for the bottom level"
+            );
+
             let dummy_flags = open_many(&dummy_flags, net);
             let mut cleansed_xs = Vec::with_capacity(bottom_num_elements);
             let mut cleansed_ys = Vec::with_capacity(bottom_num_elements);
