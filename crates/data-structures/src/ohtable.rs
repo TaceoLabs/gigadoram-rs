@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use circuits::lowmc::{self, ROUND_KEYS};
-use eyre::Ok;
+use eyre::{Result, ensure};
 use mpc_core::protocols::{
     rep3::{Rep3State, id::PartyID, network::Rep3NetworkExt},
     rep3_ring::{
@@ -111,7 +111,7 @@ impl OhTable {
         net: &N,
         state: &mut Rep3State,
         timing: Option<&mut OhTableTiming>,
-    ) -> Self {
+    ) -> Result<Self> {
         params.validate();
         assert_eq!(xs.len(), params.num_elements);
         assert_eq!(ys.len(), params.num_elements);
@@ -138,10 +138,8 @@ impl OhTable {
             last_query_trace: None,
         };
 
-        table
-            .build(xs, ys, net, state, timing)
-            .expect("OHTable build should succeed");
-        table
+        table.build(xs, ys, net, state, timing)?;
+        Ok(table)
     }
 
     pub fn build<N: Network>(
@@ -297,7 +295,11 @@ impl OhTable {
         };
 
         let was_touched_before = self.touched[index_receiver_order];
-        assert!(!was_touched_before);
+        ensure!(
+            !was_touched_before,
+            "OHTable slot {index_receiver_order} touched twice (query {})",
+            self.query_count
+        );
         self.touched[index_receiver_order] = true;
 
         self.query_count += 1;

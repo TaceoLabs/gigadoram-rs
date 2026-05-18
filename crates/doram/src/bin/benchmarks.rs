@@ -21,7 +21,7 @@ use rand_chacha::ChaCha20Rng;
 #[derive(Clone, Debug, Parser)]
 #[command(about = "Run the local three-party DORAM benchmark")]
 struct BenchmarkConfig {
-    #[arg(long = "num-query-tests", alias = "num-queries")]
+    #[arg(long)]
     num_queries: usize,
     #[arg(long)]
     log_address_space: usize,
@@ -140,7 +140,7 @@ fn run_party(
             &mut state,
             Some(&mut timing),
         )?;
-        
+
         let opened = binary::open(&result, &net)?.0;
         ensure!(
             opened == expected,

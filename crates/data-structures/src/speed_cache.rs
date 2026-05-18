@@ -81,13 +81,12 @@ impl SpeedCache {
         Ok((y_xor, found_xor))
     }
 
-    // TODO: Get the vectors unsafely, no clones
     pub fn extract(&mut self) -> (Vec<XShare>, Vec<YShare>) {
         assert_eq!(self.num_stored, self.length);
-        let result = (self.addrs.clone(), self.data.clone());
-        self.addrs.clear();
-        self.data.clear();
-        result
+        let addrs = std::mem::replace(&mut self.addrs, vec![XShare::default(); self.length]);
+        let data = std::mem::replace(&mut self.data, vec![YShare::default(); self.length]);
+        self.clear();
+        (addrs, data)
     }
 
     pub fn write(&mut self, write_addrs: Vec<XShare>, write_data: Vec<YShare>) {

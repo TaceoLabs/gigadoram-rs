@@ -117,8 +117,13 @@ impl GigaDoramConfig {
             "stash must fit inside the speed cache"
         );
         assert!(
-            self.num_levels <= Y::BITS as usize,
-            "alibi bits are stored in the high bits of y"
+            self.num_levels < Y::BITS as usize,
+            "alibi bits would occupy all of y; reduce num_levels or use a larger Y type"
+        );
+        assert!(
+            self.log_address_space_size < Y::BITS as usize - self.num_levels,
+            "user data (up to log_address_space_size bits) would overlap alibi bits stored \
+             in the top num_levels bits of y"
         );
         assert_eq!(
             self.log_address_space_size,
@@ -210,7 +215,8 @@ impl GigaDoram {
         Ok(doram)
     }
 
-    // WARN: This function is only for testing purposes, it leaks that the access pattern is read
+    // Only for tests: calling this leaks that the access pattern is a read.
+    #[doc(hidden)]
     pub fn read<N: Network>(
         &mut self,
         query_x: XShare,
@@ -227,7 +233,8 @@ impl GigaDoram {
         )
     }
 
-    // WARN: This function is only for testing purposes, it leaks that the access pattern is a write
+    // Only for tests: calling this leaks that the access pattern is a write.
+    #[doc(hidden)]
     pub fn write<N: Network>(
         &mut self,
         query_x: XShare,
@@ -357,6 +364,10 @@ impl GigaDoram {
         }
 
         if rebuild_to == self.config.num_levels - 1 {
+            // When there was an initial bottom level, shuffle before cleansing so the
+            // subsequent reveal_to_all / open_many inside cleanse_bottom_level_inner is
+            // safe: no single party knows the full permutation, so the revealed dummy
+            // flags don't expose original positions.
             if self.had_initial_bottom_level {
                 let shuffler = ArrayShuffler::new(extracted_xs.len(), state);
                 shuffler.forward(&mut extracted_xs, net, state)?;
@@ -442,7 +453,7 @@ impl GigaDoram {
         let build_start = Instant::now();
         let mut ohtable_timing = OhTableTiming::default();
         let table_timing = timing.is_some().then_some(&mut ohtable_timing);
-        let table = OhTable::new(params, xs, ys, key, net, state, table_timing);
+        let table = OhTable::new(params, xs, ys, key, net, state, table_timing)?;
         if let Some(timing) = &mut timing {
             timing.time_total_build_prf += ohtable_timing.build_prf;
             timing.record_build(level, build_start.elapsed());
@@ -560,6 +571,9 @@ impl GigaDoram {
         let mut dummy_flags =
             dummy_check_circuit(&xs, self.config.log_address_space_size, net, state)?;
 
+        // Fast path: caller has already applied an oblivious pre-cleanse shuffle, so
+        // revealing dummy flags here is safe — the shuffled positions are independent of
+        // the original access pattern (no single party knows the full permutation).
         if self.had_initial_bottom_level {
             ensure!(
                 xs.len() >= bottom_num_elements,
@@ -570,7 +584,7 @@ impl GigaDoram {
             let mut cleansed_xs = Vec::with_capacity(bottom_num_elements);
             let mut cleansed_ys = Vec::with_capacity(bottom_num_elements);
 
-            for ((x, y), is_dummy) in xs.into_iter().zip(ys.into_iter()).zip(dummy_flags) {
+            for ((x, y), is_dummy) in xs.into_iter().zip(ys).zip(dummy_flags) {
                 if !is_dummy.convert() {
                     cleansed_xs.push(x);
                     cleansed_ys.push(y);

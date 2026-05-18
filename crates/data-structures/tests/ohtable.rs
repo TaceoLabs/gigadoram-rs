@@ -409,7 +409,7 @@ fn build_table<N: Network>(
     let ys = promote_public_values(state.id, &ys_clear);
     let key = promote_public_values(state.id, clear_key);
 
-    OhTable::new(params, xs, ys, key, net, state, None)
+    OhTable::new(params, xs, ys, key, net, state, None).expect("OHTable build failed in test")
 }
 
 fn real_builder_indices(qs_clear: &[Block]) -> Vec<usize> {
