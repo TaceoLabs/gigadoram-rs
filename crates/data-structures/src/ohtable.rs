@@ -248,7 +248,6 @@ impl OhTable {
     ) -> eyre::Result<(YShare, BitShare)> {
         assert!(self.query_count < self.params.num_dummies);
 
-        // TODO: Maybe just pass dummy as a Block
         let use_dummy = bit_to_binary_mask(&use_dummy);
 
         let q_or_dummy = binary::cmux(&use_dummy, &arithmetic::rand(state), &q, net, state)?;
@@ -402,9 +401,6 @@ impl OhTable {
         receiver_shuffler: &ArrayShuffler,
         party: PartyID,
     ) -> LocalPermutation {
-        // The C++ version stores prev_shared_perm on prev_party(builder) and
-        // next_shared_perm on next_party(builder). This local model keeps the
-        // evaluator-side permutation used by the receiver-order index mapping.
         if party == self.params.builder.next() {
             receiver_shuffler.next_shared_perm.clone()
         } else {
