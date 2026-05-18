@@ -4,6 +4,7 @@ members = [
     "crates/circuits",
     "crates/primitives",
     "crates/data-structures",
+    "crates/doram",
 ]
 
 [workspace.package]
@@ -26,3 +27,4 @@ num-traits = "0.2"
 primitives = { path = "crates/primitives" }
 rand = "0.8"
 rand_chacha = "0.3"
+structures = { package = "data-structures", path = "crates/data-structures" }

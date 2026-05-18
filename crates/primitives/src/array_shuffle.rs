@@ -97,15 +97,13 @@ impl ArrayShuffler {
         Ok(())
     }
 
-    pub fn indices<T, N>(
+    pub fn indices<N>(
         &self,
         indices: &mut [Rep3RingShare<u32>],
         net: &N,
         state: &mut Rep3State,
     ) -> eyre::Result<()>
     where
-        T: IntRing2k,
-        Standard: Distribution<T>,
         N: Network,
     {
         assert_eq!(indices.len(), self.len);
