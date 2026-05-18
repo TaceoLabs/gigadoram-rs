@@ -110,29 +110,6 @@ impl OhTable {
         key: Vec<BlockShare>,
         net: &N,
         state: &mut Rep3State,
-    ) -> Self {
-        Self::new_inner(params, xs, ys, key, net, state, None)
-    }
-
-    pub fn new_with_timing<N: Network>(
-        params: OHTableParams,
-        xs: Vec<XShare>,
-        ys: Vec<YShare>,
-        key: Vec<BlockShare>,
-        net: &N,
-        state: &mut Rep3State,
-        timing: &mut OhTableTiming,
-    ) -> Self {
-        Self::new_inner(params, xs, ys, key, net, state, Some(timing))
-    }
-
-    fn new_inner<N: Network>(
-        params: OHTableParams,
-        xs: Vec<XShare>,
-        ys: Vec<YShare>,
-        key: Vec<BlockShare>,
-        net: &N,
-        state: &mut Rep3State,
         timing: Option<&mut OhTableTiming>,
     ) -> Self {
         params.validate();
@@ -162,22 +139,12 @@ impl OhTable {
         };
 
         table
-            .build_inner(xs, ys, net, state, timing)
+            .build(xs, ys, net, state, timing)
             .expect("OHTable build should succeed");
         table
     }
 
     pub fn build<N: Network>(
-        &mut self,
-        xs: Vec<XShare>,
-        ys: Vec<YShare>,
-        net: &N,
-        state: &mut Rep3State,
-    ) -> eyre::Result<()> {
-        self.build_inner(xs, ys, net, state, None)
-    }
-
-    fn build_inner<N: Network>(
         &mut self,
         xs: Vec<XShare>,
         ys: Vec<YShare>,

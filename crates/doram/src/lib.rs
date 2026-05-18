@@ -177,25 +177,6 @@ impl GigaDoram {
         ys: Vec<YShare>,
         net: &N,
         state: &mut Rep3State,
-    ) -> Result<Self> {
-        Self::new_with_initial_bottom_level_inner(config, ys, net, state, None)
-    }
-
-    pub fn new_with_initial_bottom_level_timed<N: Network>(
-        config: GigaDoramConfig,
-        ys: Vec<YShare>,
-        net: &N,
-        state: &mut Rep3State,
-        timing: &mut GigaDoramTiming,
-    ) -> Result<Self> {
-        Self::new_with_initial_bottom_level_inner(config, ys, net, state, Some(timing))
-    }
-
-    fn new_with_initial_bottom_level_inner<N: Network>(
-        config: GigaDoramConfig,
-        ys: Vec<YShare>,
-        net: &N,
-        state: &mut Rep3State,
         timing: Option<&mut GigaDoramTiming>,
     ) -> Result<Self> {
         config.validate();
@@ -242,6 +223,7 @@ impl GigaDoram {
             promote_public(state.id, Bit::new(false)),
             net,
             state,
+            None,
         )
     }
 
@@ -259,6 +241,7 @@ impl GigaDoram {
             promote_public(state.id, Bit::new(true)),
             net,
             state,
+            None,
         )
     }
 
@@ -271,29 +254,6 @@ impl GigaDoram {
     }
 
     pub fn read_and_maybe_write<N: Network>(
-        &mut self,
-        query_x: XShare,
-        query_y: YShare,
-        is_write: BitShare,
-        net: &N,
-        state: &mut Rep3State,
-    ) -> Result<YShare> {
-        self.read_and_maybe_write_inner(query_x, query_y, is_write, net, state, None)
-    }
-
-    pub fn read_and_maybe_write_timed<N: Network>(
-        &mut self,
-        query_x: XShare,
-        query_y: YShare,
-        is_write: BitShare,
-        net: &N,
-        state: &mut Rep3State,
-        timing: &mut GigaDoramTiming,
-    ) -> Result<YShare> {
-        self.read_and_maybe_write_inner(query_x, query_y, is_write, net, state, Some(timing))
-    }
-
-    fn read_and_maybe_write_inner<N: Network>(
         &mut self,
         query_x: XShare,
         query_y: YShare,
@@ -480,16 +440,11 @@ impl GigaDoram {
         params.log_single_col_len = self.cht_log_single_col_len(level);
         let key = Self::generate_prf_key(state);
         let build_start = Instant::now();
-        let table = if let Some(timing) = &mut timing {
-            let mut ohtable_timing = OhTableTiming::default();
-            let table =
-                OhTable::new_with_timing(params, xs, ys, key, net, state, &mut ohtable_timing);
-            timing.time_total_build_prf += ohtable_timing.build_prf;
-            table
-        } else {
-            OhTable::new(params, xs, ys, key, net, state)
-        };
+        let mut ohtable_timing = OhTableTiming::default();
+        let table_timing = timing.is_some().then_some(&mut ohtable_timing);
+        let table = OhTable::new(params, xs, ys, key, net, state, table_timing);
         if let Some(timing) = &mut timing {
+            timing.time_total_build_prf += ohtable_timing.build_prf;
             timing.record_build(level, build_start.elapsed());
         }
         self.levels[level] = Some(table);

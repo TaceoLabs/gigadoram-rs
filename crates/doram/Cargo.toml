@@ -12,8 +12,11 @@ readme.workspace = true
 
 [dependencies]
 circuits.workspace = true
+clap.workspace = true
 eyre.workspace = true
 mpc-core.workspace = true
 mpc-net.workspace = true
 primitives.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
 structures.workspace = true
