@@ -495,7 +495,7 @@ impl GigaDoram {
         let sort_len = xs.len().next_power_of_two();
         xs.resize(sort_len, XShare::default());
         ys.resize(sort_len, YShare::default());
-        dummy_flags.resize(sort_len, BitShare::default());
+        dummy_flags.resize(sort_len, promote_public(state.id, Bit::new(true)));
         Batcher::sort_dummies_to_end(&mut dummy_flags, &mut xs, &mut ys, net, state)?;
 
         xs.truncate(bottom_num_elements);
