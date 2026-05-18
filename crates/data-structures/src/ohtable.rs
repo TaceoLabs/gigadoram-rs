@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use circuits::lowmc::{self, ROUND_KEYS};
 use eyre::Ok;
 use mpc_core::protocols::{
@@ -95,6 +97,11 @@ pub struct OhTableQueryTrace {
     pub was_touched_before: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OhTableTiming {
+    pub build_prf: Duration,
+}
+
 impl OhTable {
     pub fn new<N: Network>(
         params: OHTableParams,
@@ -103,6 +110,30 @@ impl OhTable {
         key: Vec<BlockShare>,
         net: &N,
         state: &mut Rep3State,
+    ) -> Self {
+        Self::new_inner(params, xs, ys, key, net, state, None)
+    }
+
+    pub fn new_with_timing<N: Network>(
+        params: OHTableParams,
+        xs: Vec<XShare>,
+        ys: Vec<YShare>,
+        key: Vec<BlockShare>,
+        net: &N,
+        state: &mut Rep3State,
+        timing: &mut OhTableTiming,
+    ) -> Self {
+        Self::new_inner(params, xs, ys, key, net, state, Some(timing))
+    }
+
+    fn new_inner<N: Network>(
+        params: OHTableParams,
+        xs: Vec<XShare>,
+        ys: Vec<YShare>,
+        key: Vec<BlockShare>,
+        net: &N,
+        state: &mut Rep3State,
+        timing: Option<&mut OhTableTiming>,
     ) -> Self {
         params.validate();
         assert_eq!(xs.len(), params.num_elements);
@@ -131,7 +162,7 @@ impl OhTable {
         };
 
         table
-            .build(xs, ys, net, state)
+            .build_inner(xs, ys, net, state, timing)
             .expect("OHTable build should succeed");
         table
     }
@@ -143,6 +174,17 @@ impl OhTable {
         net: &N,
         state: &mut Rep3State,
     ) -> eyre::Result<()> {
+        self.build_inner(xs, ys, net, state, None)
+    }
+
+    fn build_inner<N: Network>(
+        &mut self,
+        xs: Vec<XShare>,
+        ys: Vec<YShare>,
+        net: &N,
+        state: &mut Rep3State,
+        timing: Option<&mut OhTableTiming>,
+    ) -> eyre::Result<()> {
         assert_eq!(xs.len(), self.params.num_elements);
         assert_eq!(ys.len(), self.params.num_elements);
 
@@ -151,7 +193,11 @@ impl OhTable {
             .copied()
             .map(upcast_x_to_block)
             .collect::<Vec<_>>();
+        let prf_start = Instant::now();
         let qs = self.evaluate_prf_tags(&prf_inputs, net, state)?;
+        if let Some(timing) = timing {
+            timing.build_prf += prf_start.elapsed();
+        }
         self.qs_builder_order[..self.params.num_elements].copy_from_slice(&qs);
 
         let builder_shuffler = ArrayShuffler::new(self.params.total_size(), state);

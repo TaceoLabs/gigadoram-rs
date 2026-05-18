@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use circuits::{
     batcher::Batcher,
     dummy_check::dummy_check_circuit,
@@ -18,7 +20,7 @@ use primitives::{
     ArrayShuffler, BitShare, Block, BlockShare, X, XShare, Y, YShare, bit_to_binary_mask,
     open_many, promote_public, upcast_x_to_block,
 };
-use structures::{OHTableParams, OhTable, SpeedCache};
+use structures::{OHTableParams, OhTable, OhTableTiming, SpeedCache};
 
 pub const EMPIRICAL_CHT_STASH_SIZE: usize = 8;
 pub const PROVEN_CHT_STASH_SIZE: usize = 50;
@@ -135,6 +137,25 @@ pub struct GigaDoram {
     had_initial_bottom_level: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct GigaDoramTiming {
+    pub time_total_builds: Vec<Duration>,
+    pub time_total_build_prf: Duration,
+    pub time_total_batcher: Duration,
+    pub time_total_queries: Duration,
+    pub time_total_query_prf: Duration,
+    pub time_total_query_speed_cache: Duration,
+}
+
+impl GigaDoramTiming {
+    fn record_build(&mut self, level: usize, elapsed: Duration) {
+        if self.time_total_builds.len() <= level {
+            self.time_total_builds.resize(level + 1, Duration::ZERO);
+        }
+        self.time_total_builds[level] += elapsed;
+    }
+}
+
 impl GigaDoram {
     pub fn new(config: GigaDoramConfig) -> Self {
         config.validate();
@@ -156,6 +177,26 @@ impl GigaDoram {
         ys: Vec<YShare>,
         net: &N,
         state: &mut Rep3State,
+    ) -> Result<Self> {
+        Self::new_with_initial_bottom_level_inner(config, ys, net, state, None)
+    }
+
+    pub fn new_with_initial_bottom_level_timed<N: Network>(
+        config: GigaDoramConfig,
+        ys: Vec<YShare>,
+        net: &N,
+        state: &mut Rep3State,
+        timing: &mut GigaDoramTiming,
+    ) -> Result<Self> {
+        Self::new_with_initial_bottom_level_inner(config, ys, net, state, Some(timing))
+    }
+
+    fn new_with_initial_bottom_level_inner<N: Network>(
+        config: GigaDoramConfig,
+        ys: Vec<YShare>,
+        net: &N,
+        state: &mut Rep3State,
+        timing: Option<&mut GigaDoramTiming>,
     ) -> Result<Self> {
         config.validate();
 
@@ -182,7 +223,7 @@ impl GigaDoram {
             .map(|y| doram.clear_alibi_bits(y))
             .collect::<Vec<_>>();
 
-        doram.new_ohtable_of_level(bottom_level, xs, ys, net, state)?;
+        doram.new_ohtable_of_level_inner(bottom_level, xs, ys, net, state, timing)?;
         doram.insert_stash(bottom_level, state.id);
 
         Ok(doram)
@@ -237,10 +278,36 @@ impl GigaDoram {
         net: &N,
         state: &mut Rep3State,
     ) -> Result<YShare> {
+        self.read_and_maybe_write_inner(query_x, query_y, is_write, net, state, None)
+    }
+
+    pub fn read_and_maybe_write_timed<N: Network>(
+        &mut self,
+        query_x: XShare,
+        query_y: YShare,
+        is_write: BitShare,
+        net: &N,
+        state: &mut Rep3State,
+        timing: &mut GigaDoramTiming,
+    ) -> Result<YShare> {
+        self.read_and_maybe_write_inner(query_x, query_y, is_write, net, state, Some(timing))
+    }
+
+    fn read_and_maybe_write_inner<N: Network>(
+        &mut self,
+        query_x: XShare,
+        query_y: YShare,
+        is_write: BitShare,
+        net: &N,
+        state: &mut Rep3State,
+        mut timing: Option<&mut GigaDoramTiming>,
+    ) -> Result<YShare> {
         // If we need to rebuild before we can query
         if !self.speed_cache.is_writeable() {
-            self.rebuild(net, state)?;
+            self.rebuild_inner(net, state, timing.as_deref_mut())?;
         }
+
+        let query_start = Instant::now();
 
         // Compute PRFs for each live level
         let live_levels = self
@@ -249,10 +316,18 @@ impl GigaDoram {
             .enumerate()
             .filter_map(|(level, table)| table.as_ref().map(|_| level))
             .collect::<Vec<_>>();
+        let prf_start = Instant::now();
         let qs = self.evaluate_prf_tags(&live_levels, query_x, net, state)?;
+        if let Some(timing) = &mut timing {
+            timing.time_total_query_prf += prf_start.elapsed();
+        }
 
         // Query the SpeedCache and extract alibi bits
+        let speed_cache_start = Instant::now();
         let (mut y_accum, mut found) = self.speed_cache.query(query_x, net, state)?;
+        if let Some(timing) = &mut timing {
+            timing.time_total_query_speed_cache += speed_cache_start.elapsed();
+        }
         let mut alibi_mask = self.extract_alibi_bits(&y_accum);
 
         // Traverse each live level and query the corresponding table
@@ -274,11 +349,20 @@ impl GigaDoram {
         self.speed_cache
             .write(vec![query_x], vec![self.clear_alibi_bits(value_to_write)]);
 
+        if let Some(timing) = &mut timing {
+            timing.time_total_queries += query_start.elapsed();
+        }
+
         // Reset alibi bits for returned value as well
         Ok(self.clear_alibi_bits(y_accum))
     }
 
-    fn rebuild<N: Network>(&mut self, net: &N, state: &mut Rep3State) -> Result<()> {
+    fn rebuild_inner<N: Network>(
+        &mut self,
+        net: &N,
+        state: &mut Rep3State,
+        mut timing: Option<&mut GigaDoramTiming>,
+    ) -> Result<()> {
         // Check up to which level we need to rebuild and whether the range is inclusive
         let (rebuild_to, need_to_extract_from_rebuild_to) = self.rebuild_target();
 
@@ -319,8 +403,13 @@ impl GigaDoram {
                 shuffler.forward(&mut extracted_ys, net, state)?;
             }
 
-            (extracted_xs, extracted_ys) =
-                self.cleanse_bottom_level(extracted_xs, extracted_ys, net, state)?;
+            (extracted_xs, extracted_ys) = self.cleanse_bottom_level_inner(
+                extracted_xs,
+                extracted_ys,
+                net,
+                state,
+                timing.as_deref_mut(),
+            )?;
         } else {
             self.relabel_dummies(&mut extracted_xs, net, state)?;
         }
@@ -332,7 +421,14 @@ impl GigaDoram {
             self.delete_level(rebuild_to);
         }
 
-        self.new_ohtable_of_level(rebuild_to, extracted_xs, extracted_ys, net, state)?;
+        self.new_ohtable_of_level_inner(
+            rebuild_to,
+            extracted_xs,
+            extracted_ys,
+            net,
+            state,
+            timing,
+        )?;
         self.insert_stash(rebuild_to, state.id);
 
         Ok(())
@@ -359,13 +455,14 @@ impl GigaDoram {
         (rebuild_to, need_to_extract_from_rebuild_to)
     }
 
-    fn new_ohtable_of_level<N: Network>(
+    fn new_ohtable_of_level_inner<N: Network>(
         &mut self,
         level: usize,
         xs: Vec<XShare>,
         ys: Vec<YShare>,
         net: &N,
         state: &mut Rep3State,
+        mut timing: Option<&mut GigaDoramTiming>,
     ) -> Result<()> {
         assert!(level < self.config.num_levels);
         assert_eq!(xs.len(), ys.len());
@@ -378,9 +475,23 @@ impl GigaDoram {
             assert!(self.base_b_state_vec[level] < self.config.amp_factor());
         }
 
-        let params = OHTableParams::new(xs.len(), self.num_dummies(level), self.config.stash_size);
+        let mut params =
+            OHTableParams::new(xs.len(), self.num_dummies(level), self.config.stash_size);
+        params.log_single_col_len = self.cht_log_single_col_len(level);
         let key = Self::generate_prf_key(state);
-        let table = OhTable::new(params, xs, ys, key, net, state);
+        let build_start = Instant::now();
+        let table = if let Some(timing) = &mut timing {
+            let mut ohtable_timing = OhTableTiming::default();
+            let table =
+                OhTable::new_with_timing(params, xs, ys, key, net, state, &mut ohtable_timing);
+            timing.time_total_build_prf += ohtable_timing.build_prf;
+            table
+        } else {
+            OhTable::new(params, xs, ys, key, net, state)
+        };
+        if let Some(timing) = &mut timing {
+            timing.record_build(level, build_start.elapsed());
+        }
         self.levels[level] = Some(table);
 
         Ok(())
@@ -419,6 +530,31 @@ impl GigaDoram {
             .expect("number of dummies should fit usize")
     }
 
+    fn cht_log_single_col_len(&self, level: usize) -> u32 {
+        let base_b_num = if level == self.config.num_levels - 1 {
+            1
+        } else {
+            self.base_b_state_vec[level]
+        };
+        assert!(base_b_num > 0);
+
+        let expansion = if self.config.stash_size == PROVEN_CHT_STASH_SIZE {
+            2.0
+        } else {
+            1.2
+        };
+        let expanded_base = (expansion * base_b_num as f64) as usize;
+        assert!(expanded_base > 0);
+
+        let base_log = level
+            .checked_mul(self.config.log_amp_factor)
+            .and_then(|log| log.checked_add(self.config.log_speed_cache_size))
+            .expect("CHT column log should fit usize");
+        let expanded_log = usize::BITS as usize - expanded_base.leading_zeros() as usize;
+
+        (base_log + expanded_log) as u32
+    }
+
     fn bottom_num_elements(&self) -> usize {
         (1usize << self.config.log_address_space_size) - 1
     }
@@ -452,12 +588,13 @@ impl GigaDoram {
         Ok(())
     }
 
-    fn cleanse_bottom_level<N: Network>(
+    fn cleanse_bottom_level_inner<N: Network>(
         &self,
         mut xs: Vec<XShare>,
         mut ys: Vec<YShare>,
         net: &N,
         state: &mut Rep3State,
+        mut timing: Option<&mut GigaDoramTiming>,
     ) -> Result<(Vec<XShare>, Vec<YShare>)> {
         ensure!(
             xs.len() == ys.len(),
@@ -497,7 +634,11 @@ impl GigaDoram {
         xs.resize(sort_len, XShare::default());
         ys.resize(sort_len, YShare::default());
         dummy_flags.resize(sort_len, promote_public(state.id, Bit::new(true)));
+        let batcher_start = Instant::now();
         Batcher::sort_dummies_to_end(&mut dummy_flags, &mut xs, &mut ys, net, state)?;
+        if let Some(timing) = &mut timing {
+            timing.time_total_batcher += batcher_start.elapsed();
+        }
 
         xs.truncate(bottom_num_elements);
         ys.truncate(bottom_num_elements);
