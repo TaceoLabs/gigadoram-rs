@@ -191,6 +191,7 @@ fn write_report(config: &BenchmarkConfig, report: &PartyReport) -> Result<()> {
         .filter_map(|(level, duration)| (level != bottom_level).then_some(*duration))
         .sum::<Duration>();
     let queries_per_sec = config.num_queries as f64 / report.total_time.as_secs_f64();
+    let us = |duration: Duration| duration.as_secs_f64() * 1_000_000.0;
 
     writeln!(file, "DORAM Parameters")?;
     writeln!(file, "Number of queries: {}", config.num_queries)?;
@@ -213,49 +214,49 @@ fn write_report(config: &BenchmarkConfig, report: &PartyReport) -> Result<()> {
     writeln!(
         file,
         "Total time including builds: {} us",
-        report.total_time.as_secs_f64() * 1_000_000.0
+        us(report.total_time)
     )?;
     writeln!(
         file,
         "Time spent in queries: {} us",
-        report.timing.time_total_queries.as_secs_f64() * 1_000_000.0
+        us(report.timing.time_total_queries)
     )?;
     writeln!(
         file,
         "Time spent in query PRF eval: {} us",
-        report.timing.time_total_query_prf.as_secs_f64() * 1_000_000.0
+        us(report.timing.time_total_query_prf)
     )?;
     writeln!(
         file,
         "Time spent querying linear level: {} us",
-        report.timing.time_total_query_speed_cache.as_secs_f64() * 1_000_000.0
+        us(report.timing.time_total_query_speed_cache)
     )?;
     writeln!(
         file,
         "Time spent in build PRF eval: {} us",
-        report.timing.time_total_build_prf.as_secs_f64() * 1_000_000.0
+        us(report.timing.time_total_build_prf)
     )?;
     writeln!(
         file,
         "Time spent in batcher sorting: {} us",
-        report.timing.time_total_batcher.as_secs_f64() * 1_000_000.0
+        us(report.timing.time_total_batcher)
     )?;
     writeln!(
         file,
         "Time spent building bottom level: {} us",
-        bottom_build.as_secs_f64() * 1_000_000.0
+        us(bottom_build)
     )?;
     writeln!(
         file,
         "Time spent building other levels: {} us ",
-        other_builds.as_secs_f64() * 1_000_000.0
+        us(other_builds)
     )?;
     writeln!(file)?;
     writeln!(file, "SUMMARY")?;
     writeln!(
         file,
         "Total time including builds: {} us ",
-        report.total_time.as_secs_f64() * 1_000_000.0
+        us(report.total_time)
     )?;
     writeln!(
         file,

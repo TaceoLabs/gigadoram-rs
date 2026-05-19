@@ -97,7 +97,7 @@ pub struct OhTableQueryTrace {
     pub was_touched_before: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct OhTableTiming {
     pub build_prf: Duration,
 }
@@ -148,7 +148,7 @@ impl OhTable {
         ys: Vec<YShare>,
         net: &N,
         state: &mut Rep3State,
-        timing: Option<&mut OhTableTiming>,
+        mut timing: Option<&mut OhTableTiming>,
     ) -> eyre::Result<()> {
         assert_eq!(xs.len(), self.params.num_elements);
         assert_eq!(ys.len(), self.params.num_elements);
@@ -160,7 +160,7 @@ impl OhTable {
             .collect::<Vec<_>>();
         let prf_start = Instant::now();
         let qs = self.evaluate_prf_tags(&prf_inputs, net, state)?;
-        if let Some(timing) = timing {
+        if let Some(timing) = &mut timing {
             timing.build_prf += prf_start.elapsed();
         }
         self.qs_builder_order[..self.params.num_elements].copy_from_slice(&qs);
@@ -358,8 +358,7 @@ impl OhTable {
         assert_eq!(inputs.len(), self.params.num_elements);
         assert_eq!(self.prf_key_size_blocks(), ROUND_KEYS);
 
-        let keys = vec![self.key.as_slice(); inputs.len()];
-        lowmc::encrypt_many(&keys, inputs, net, state)
+        lowmc::encrypt_many_with_repeated_key(&self.key, inputs, net, state)
     }
 
     fn reveal_qs_to_builder<N: Network>(
