@@ -268,6 +268,14 @@ pub fn print_report(config: &DoramBenchmarkConfig, report: &PartyReport) {
         .sum::<Duration>();
     let queries_per_sec = config.num_queries as f64 / report.total_time.as_secs_f64();
     let bytes_total = report.bytes_sent + report.bytes_received;
+    let query_accounted = report.timing.time_total_query_prf
+        + report.timing.time_total_query_speed_cache
+        + report.timing.time_total_query_ohtable
+        + report.timing.time_total_query_writeback;
+    let query_other = report
+        .timing
+        .time_total_queries
+        .saturating_sub(query_accounted);
 
     tracing::info!(
         concat!(
@@ -290,7 +298,15 @@ pub fn print_report(config: &DoramBenchmarkConfig, report: &PartyReport) {
             "|  `- Query\n",
             "|     |- total: {}\n",
             "|     |- prf_eval: {}\n",
-            "|     `- speed_cache: {}\n",
+            "|     |- speed_cache: {}\n",
+            "|     |- ohtable_levels: {}\n",
+            "|     |  |- dummy_cmux: {}\n",
+            "|     |  |- tag_reveal: {}\n",
+            "|     |  |- cht_lookup: {}\n",
+            "|     |  |- receiver_index: {}\n",
+            "|     |  `- bookkeeping: {}\n",
+            "|     |- writeback: {}\n",
+            "|     `- other: {}\n",
             "`- Summary\n",
             "   |- queries_per_sec: {:.2}\n",
             "   |- bytes_sent: {}\n",
@@ -313,6 +329,19 @@ pub fn print_report(config: &DoramBenchmarkConfig, report: &PartyReport) {
         format_duration(report.timing.time_total_queries),
         format_duration(report.timing.time_total_query_prf),
         format_duration(report.timing.time_total_query_speed_cache),
+        format_duration(report.timing.time_total_query_ohtable),
+        format_duration(report.timing.time_total_query_ohtable_details.dummy_cmux),
+        format_duration(report.timing.time_total_query_ohtable_details.tag_reveal),
+        format_duration(report.timing.time_total_query_ohtable_details.cht_lookup),
+        format_duration(
+            report
+                .timing
+                .time_total_query_ohtable_details
+                .receiver_index
+        ),
+        format_duration(report.timing.time_total_query_ohtable_details.bookkeeping),
+        format_duration(report.timing.time_total_query_writeback),
+        format_duration(query_other),
         queries_per_sec,
         report.bytes_sent,
         report.bytes_received,

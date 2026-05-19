@@ -102,6 +102,25 @@ pub struct OhTableTiming {
     pub build_prf: Duration,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct OhTableQueryTiming {
+    pub dummy_cmux: Duration,
+    pub tag_reveal: Duration,
+    pub cht_lookup: Duration,
+    pub receiver_index: Duration,
+    pub bookkeeping: Duration,
+}
+
+impl OhTableQueryTiming {
+    pub fn add_assign(&mut self, other: &Self) {
+        self.dummy_cmux += other.dummy_cmux;
+        self.tag_reveal += other.tag_reveal;
+        self.cht_lookup += other.cht_lookup;
+        self.receiver_index += other.receiver_index;
+        self.bookkeeping += other.bookkeeping;
+    }
+}
+
 impl OhTable {
     pub fn new<N: Network>(
         params: OHTableParams,
@@ -257,14 +276,44 @@ impl OhTable {
         net: &N,
         state: &mut Rep3State,
     ) -> eyre::Result<(YShare, BitShare)> {
+        self.query_inner(q, use_dummy, net, state, None)
+    }
+
+    pub fn query_with_timing<N: Network>(
+        &mut self,
+        q: BlockShare,
+        use_dummy: BitShare,
+        net: &N,
+        state: &mut Rep3State,
+        timing: Option<&mut OhTableQueryTiming>,
+    ) -> eyre::Result<(YShare, BitShare)> {
+        self.query_inner(q, use_dummy, net, state, timing)
+    }
+
+    fn query_inner<N: Network>(
+        &mut self,
+        q: BlockShare,
+        use_dummy: BitShare,
+        net: &N,
+        state: &mut Rep3State,
+        mut timing: Option<&mut OhTableQueryTiming>,
+    ) -> eyre::Result<(YShare, BitShare)> {
         assert!(self.query_count < self.params.num_dummies);
 
+        let start = Instant::now();
         let use_dummy = bit_to_binary_mask(&use_dummy);
-
         let q_or_dummy = binary::cmux(&use_dummy, &arithmetic::rand(state), &q, net, state)?;
+        if let Some(timing) = &mut timing {
+            timing.dummy_cmux += start.elapsed();
+        }
 
+        let start = Instant::now();
         let q_clear = reveal_to_receivers(&q_or_dummy, self.params.builder, net, state)?;
+        if let Some(timing) = &mut timing {
+            timing.tag_reveal += start.elapsed();
+        }
 
+        let start = Instant::now();
         let old_query_count = self.query_count;
         let dummy_index = downcast(self.dummy_indices[old_query_count]);
 
@@ -277,7 +326,11 @@ impl OhTable {
             net,
             state,
         )?;
+        if let Some(timing) = &mut timing {
+            timing.cht_lookup += start.elapsed();
+        }
 
+        let start = Instant::now();
         let index_receiver_order = if state.id != self.params.builder {
             let receiver_shuffle = self
                 .receiver_shuffle
@@ -293,7 +346,11 @@ impl OhTable {
         } else {
             net.recv_prev()?
         };
+        if let Some(timing) = &mut timing {
+            timing.receiver_index += start.elapsed();
+        }
 
+        let start = Instant::now();
         let was_touched_before = self.touched[index_receiver_order];
         ensure!(
             !was_touched_before,
@@ -308,6 +365,9 @@ impl OhTable {
             selected_receiver_index: index_receiver_order,
             was_touched_before,
         });
+        if let Some(timing) = &mut timing {
+            timing.bookkeeping += start.elapsed();
+        }
 
         Ok((
             self.ys_receiver_order[index_receiver_order],

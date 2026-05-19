@@ -20,7 +20,7 @@ use primitives::{
     ArrayShuffler, BitShare, Block, BlockShare, X, XShare, Y, YShare, bit_to_binary_mask,
     open_many, promote_public, upcast_x_to_block,
 };
-use structures::{OHTableParams, OhTable, OhTableTiming, SpeedCache};
+use structures::{OHTableParams, OhTable, OhTableQueryTiming, OhTableTiming, SpeedCache};
 
 pub const EMPIRICAL_CHT_STASH_SIZE: usize = 8;
 pub const PROVEN_CHT_STASH_SIZE: usize = 50;
@@ -150,6 +150,9 @@ pub struct GigaDoramTiming {
     pub time_total_queries: Duration,
     pub time_total_query_prf: Duration,
     pub time_total_query_speed_cache: Duration,
+    pub time_total_query_ohtable: Duration,
+    pub time_total_query_ohtable_details: OhTableQueryTiming,
+    pub time_total_query_writeback: Duration,
 }
 
 impl GigaDoramTiming {
@@ -299,22 +302,36 @@ impl GigaDoram {
 
         // Traverse each live level and query the corresponding table
         for (&level, &q) in live_levels.iter().zip(&qs) {
+            let ohtable_start = Instant::now();
             let table = self.levels[level]
                 .as_mut()
                 .expect("live level should still exist during query");
             let use_dummy = binary::xor(&alibi_mask[level], &found);
-            let (y_returned, found_returned) = table.query(q, use_dummy, net, state)?;
+            let mut ohtable_timing = OhTableQueryTiming::default();
+            let table_timing = timing.is_some().then_some(&mut ohtable_timing);
+            let (y_returned, found_returned) =
+                table.query_with_timing(q, use_dummy, net, state, table_timing)?;
 
             y_accum ^= y_returned;
             found ^= found_returned;
             alibi_mask = self.extract_alibi_bits(&y_accum);
+            if let Some(timing) = &mut timing {
+                timing.time_total_query_ohtable += ohtable_start.elapsed();
+                timing
+                    .time_total_query_ohtable_details
+                    .add_assign(&ohtable_timing);
+            }
         }
 
         // Write the new value (in case of a write) or the old value (in case of a read) to the SpeedCache
+        let writeback_start = Instant::now();
         let is_write_mask = bit_to_binary_mask(&is_write);
         let value_to_write = binary::cmux(&is_write_mask, &query_y, &y_accum, net, state)?;
         self.speed_cache
             .write(vec![query_x], vec![self.clear_alibi_bits(value_to_write)]);
+        if let Some(timing) = &mut timing {
+            timing.time_total_query_writeback += writeback_start.elapsed();
+        }
 
         if let Some(timing) = &mut timing {
             timing.time_total_queries += query_start.elapsed();
