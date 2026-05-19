@@ -113,6 +113,68 @@ pub fn generate_queries(config: &DoramBenchmarkConfig) -> Vec<BenchmarkQuery> {
         .collect()
 }
 
+pub fn print_startup_config(
+    config: &DoramBenchmarkConfig,
+    doram_config: GigaDoramConfig,
+    transport: &str,
+    network: Option<(&Path, &NetworkConfig)>,
+) {
+    let real_entries = (1usize << config.log_address_space) - 1;
+    let bottom_entries = real_entries;
+
+    if let Some((network_path, network_config)) = network {
+        tracing::info!(
+            concat!(
+                "\nNetwork\n",
+                "|- config: {}\n",
+                "|- my_id: {}\n",
+                "|- bind_addr: {}\n",
+                "`- parties: {}",
+            ),
+            network_path.display(),
+            network_config.my_id,
+            network_config.bind_addr,
+            network_config.parties.len(),
+        );
+    }
+
+    tracing::info!(
+        concat!(
+            "\nStarting DORAM benchmark\n",
+            "|- mode: {}\n",
+            "|- queries: {}\n",
+            "|- seed: {}\n",
+            "|- build_bottom_level_at_startup: {}\n",
+            "|- log_address_space: {}\n",
+            "|- real_entries: {}\n",
+            "|- data_block_bits: {}\n",
+            "|- num_levels: {}\n",
+            "|- log_amp_factor: {}\n",
+            "|- amp_factor: {}\n",
+            "|- log_speed_cache_size: {}\n",
+            "|- speed_cache_size: {}\n",
+            "|- fill_time: {}\n",
+            "|- stash_size: {}\n",
+            "`- bottom_level_entries: {}",
+        ),
+        transport,
+        config.num_queries,
+        config.seed,
+        config.build_bottom_level_at_startup,
+        config.log_address_space,
+        real_entries,
+        Y::BITS,
+        doram_config.num_levels,
+        doram_config.log_amp_factor,
+        doram_config.amp_factor(),
+        doram_config.log_speed_cache_size,
+        doram_config.speed_cache_size(),
+        doram_config.fill_time(),
+        doram_config.stash_size,
+        bottom_entries,
+    );
+}
+
 pub fn run_party<N: Network>(
     config: &DoramBenchmarkConfig,
     doram_config: GigaDoramConfig,

@@ -5,7 +5,10 @@ use eyre::{Result, WrapErr, eyre};
 use mpc_core::protocols::rep3::id::PartyID;
 use primitives::run_parties;
 
-use common::{DoramBenchmarkConfig, doram_config, generate_queries, print_report, run_party};
+use common::{
+    DoramBenchmarkConfig, doram_config, generate_queries, print_report, print_startup_config,
+    run_party,
+};
 
 #[derive(Clone, Debug, Parser)]
 #[command(about = "Run the local three-party DORAM benchmark")]
@@ -19,6 +22,7 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let doram_config = doram_config(&cli.doram)?;
+    print_startup_config(&cli.doram, doram_config, "local", None);
     let queries = generate_queries(&cli.doram);
     let reports = run_parties(|net| {
         run_party(&cli.doram, doram_config, &queries, net).wrap_err("party failed")
