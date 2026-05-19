@@ -22,6 +22,7 @@ readme = "./README.md"
 circuits = { path = "crates/circuits" }
 clap = { version = "4.5", features = ["derive"] }
 eyre = "0.6"
+fancy-garbling = { git = "https://github.com/GaloisInc/swanky", rev = "5ff648457218b74da9d8323b7ca47166ff5be4b3" }
 mpc-core = { git = "https://github.com/TaceoLabs/co-snarks", branch = "main" }
 mpc-net = { git = "https://github.com/TaceoLabs/co-snarks", branch = "main", features = ["local"] }
 num-traits = "0.2"

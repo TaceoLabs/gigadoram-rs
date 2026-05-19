@@ -12,6 +12,7 @@ readme.workspace = true
 
 [dependencies]
 eyre.workspace = true
+fancy-garbling.workspace = true
 mpc-core.workspace = true
 mpc-net.workspace = true
 primitives.workspace = true

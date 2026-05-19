@@ -1,10 +1,10 @@
-use circuits::cht_lookup::lookup_circuit;
+use circuits::cht_lookup::lookup_circuit_from_2shares;
 use mpc_core::protocols::{
     rep3::{Rep3State, id::PartyID, network::Rep3NetworkExt},
     rep3_ring::ring::ring_impl::RingElement,
 };
 use mpc_net::Network;
-use primitives::{Block, XShare, from_2_shares, low_u32, types::BitShare};
+use primitives::{Block, XShare, low_u32, types::BitShare};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectedEdge {
     pub edge: usize,
@@ -166,11 +166,9 @@ pub fn lookup_from_2shares<N: Network>(
         lookup_values[2] = RingElement(table[h1(key, log_single_col_len)]);
     }
 
-    let [key_share, b0, b1] =
-        from_2_shares(lookup_values, builder.prev(), builder.next(), net, state)?
-            .try_into()
-            .unwrap();
-    let (index, found) = lookup_circuit(key_share, b0, b1, dummy_index, net, state)?;
+    let [key_share, b0, b1] = lookup_values.try_into().unwrap();
+    let (index, found) =
+        lookup_circuit_from_2shares([key_share, b0, b1], dummy_index, builder, net, state)?;
     let index = reveal_index_to_receivers(&index, builder, net, state)?;
 
     Ok(ChtLookupResult { index, found })

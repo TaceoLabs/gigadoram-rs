@@ -14,7 +14,7 @@ use mpc_core::protocols::{
 use mpc_net::Network;
 use primitives::{
     ArrayShuffler, Block, BlockShare, LocalPermutation, XShare, YShare, bit_to_binary_mask,
-    reshare_3_to_2, reveal_to_party,
+    reshare_3_to_2,
     types::{BitShare, input},
     upcast_x_to_block,
 };
@@ -528,14 +528,15 @@ fn reveal_to_receivers<N: Network>(
     net: &N,
     state: &Rep3State,
 ) -> eyre::Result<RingElement<Block>> {
-    let prev_open = reveal_to_party(share, builder.prev(), net, state)?;
-    let next_open = reveal_to_party(share, builder.next(), net, state)?;
-
-    if state.id == builder.prev() {
-        Ok(prev_open.expect("previous receiver should reconstruct the query tag"))
-    } else if state.id == builder.next() {
-        Ok(next_open.expect("next receiver should reconstruct the query tag"))
-    } else {
+    if state.id == builder {
+        net.send_to(builder.next(), share.b)?;
         Ok(RingElement(0))
+    } else if state.id == builder.next() {
+        net.send_to(builder.prev(), share.b)?;
+        let missing = net.recv_from::<RingElement<Block>>(builder)?;
+        Ok(share.a ^ share.b ^ missing)
+    } else {
+        let missing = net.recv_from::<RingElement<Block>>(builder.next())?;
+        Ok(share.a ^ share.b ^ missing)
     }
 }
