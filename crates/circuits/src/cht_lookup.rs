@@ -18,6 +18,11 @@ use primitives::{
     Block, BlockShare, XShare, bit_to_binary_mask, is_zero_many, types::BitShare, upcast_x_to_block,
 };
 
+const INDEX_BITS: usize = 32;
+const TAG_BITS: usize = 96;
+const COMPACT_INPUT_BITS: usize =
+    TAG_BITS + INDEX_BITS + TAG_BITS + INDEX_BITS + TAG_BITS + INDEX_BITS;
+
 pub fn lookup_circuit(
     key: BlockShare,
     cht_b0: BlockShare,
@@ -76,7 +81,6 @@ pub fn lookup_circuit_from_2shares<N: Network>(
         "CHT Yao lookup currently expects the builder/evaluator to be ID0"
     );
 
-    let dummy_index = upcast_x_to_block(dummy_index);
     let delta = state.rngs.generate_random_garbler_delta(state.id);
     let [x01, x2] = input_cht_lookup_2shares(lookup_values, dummy_index, delta, net, state)?;
 
@@ -84,13 +88,13 @@ pub fn lookup_circuit_from_2shares<N: Network>(
         PartyID::ID0 => {
             let mut evaluator = Rep3Evaluator::new(net);
             evaluator.receive_circuit()?;
-            lookup_yao_bundle(&mut evaluator, &x01, &x2)
+            lookup_yao_bundle_compact(&mut evaluator, &x01, &x2)
                 .map_err(|err| eyre::eyre!("CHT Yao lookup failed: {err}"))?
         }
         PartyID::ID1 | PartyID::ID2 => {
             let delta = delta.ok_or_else(|| eyre::eyre!("missing garbler delta"))?;
             let mut garbler = Rep3Garbler::new_with_delta(net, state, delta);
-            let output = lookup_yao_bundle(&mut garbler, &x01, &x2)
+            let output = lookup_yao_bundle_compact(&mut garbler, &x01, &x2)
                 .map_err(|err| eyre::eyre!("CHT Yao lookup failed: {err}"))?;
             garbler.send_circuit()?;
             output
@@ -123,13 +127,13 @@ fn lookup_circuit_yao<N: Network>(
         PartyID::ID0 => {
             let mut evaluator = Rep3Evaluator::new(net);
             evaluator.receive_circuit()?;
-            lookup_yao_bundle_from_inputs(&mut evaluator, &yao_inputs)
+            lookup_yao_bundle_from_full_inputs(&mut evaluator, &yao_inputs)
                 .map_err(|err| eyre::eyre!("CHT Yao lookup failed: {err}"))?
         }
         PartyID::ID1 | PartyID::ID2 => {
             let delta = delta.ok_or_else(|| eyre::eyre!("missing garbler delta"))?;
             let mut garbler = Rep3Garbler::new_with_delta(net, state, delta);
-            let output = lookup_yao_bundle_from_inputs(&mut garbler, &yao_inputs)
+            let output = lookup_yao_bundle_from_full_inputs(&mut garbler, &yao_inputs)
                 .map_err(|err| eyre::eyre!("CHT Yao lookup failed: {err}"))?;
             garbler.send_circuit()?;
             output
@@ -145,7 +149,7 @@ fn lookup_circuit_yao<N: Network>(
     Ok((out_index, out_found))
 }
 
-fn lookup_yao_bundle<G>(
+fn lookup_yao_bundle_compact<G>(
     g: &mut G,
     x01: &BinaryBundle<G::Item>,
     x2: &BinaryBundle<G::Item>,
@@ -159,10 +163,10 @@ where
         .zip(x2.wires())
         .map(|(lhs, rhs)| g.xor(lhs, rhs))
         .collect::<Result<Vec<_>, _>>()?;
-    lookup_yao_bundle_from_inputs(g, &BinaryBundle::new(inputs))
+    lookup_yao_bundle_from_compact_inputs(g, &BinaryBundle::new(inputs))
 }
 
-fn lookup_yao_bundle_from_inputs<G>(
+fn lookup_yao_bundle_from_full_inputs<G>(
     g: &mut G,
     inputs: &BinaryBundle<G::Item>,
 ) -> Result<BinaryBundle<G::Item>, G::Error>
@@ -177,14 +181,50 @@ where
     let cht_b1 = &wires[256..384];
     let dummy_index = &wires[384..512];
 
-    let key_equals_b0 = tags_equal(g, key, cht_b0)?;
-    let key_equals_b1 = tags_equal(g, key, cht_b1)?;
+    let key_equals_b0 = tags_equal(g, &key[INDEX_BITS..], &cht_b0[INDEX_BITS..])?;
+    let key_equals_b1 = tags_equal(g, &key[INDEX_BITS..], &cht_b1[INDEX_BITS..])?;
     let out_found = g.xor(&key_equals_b0, &key_equals_b1)?;
 
     let mut output = Vec::with_capacity(64);
-    for i in 0..32 {
+    for i in 0..INDEX_BITS {
         let b0_delta = g.xor(&cht_b0[i], &dummy_index[i])?;
         let b1_delta = g.xor(&cht_b1[i], &dummy_index[i])?;
+        let selected_b0_delta = g.and(&key_equals_b0, &b0_delta)?;
+        let selected_b1_delta = g.and(&key_equals_b1, &b1_delta)?;
+        let selected = g.xor(&dummy_index[i], &selected_b0_delta)?;
+        output.push(g.xor(&selected, &selected_b1_delta)?);
+    }
+
+    output.push(out_found);
+    output.resize(64, g.const_zero()?);
+    Ok(BinaryBundle::new(output))
+}
+
+fn lookup_yao_bundle_from_compact_inputs<G>(
+    g: &mut G,
+    inputs: &BinaryBundle<G::Item>,
+) -> Result<BinaryBundle<G::Item>, G::Error>
+where
+    G: FancyBinary + FancyBinaryConstant,
+{
+    let wires = inputs.wires();
+    debug_assert_eq!(wires.len(), COMPACT_INPUT_BITS);
+
+    let key_tag = &wires[0..TAG_BITS];
+    let b0_index = &wires[TAG_BITS..TAG_BITS + INDEX_BITS];
+    let b0_tag = &wires[TAG_BITS + INDEX_BITS..2 * TAG_BITS + INDEX_BITS];
+    let b1_index = &wires[2 * TAG_BITS + INDEX_BITS..2 * TAG_BITS + 2 * INDEX_BITS];
+    let b1_tag = &wires[2 * TAG_BITS + 2 * INDEX_BITS..3 * TAG_BITS + 2 * INDEX_BITS];
+    let dummy_index = &wires[3 * TAG_BITS + 2 * INDEX_BITS..COMPACT_INPUT_BITS];
+
+    let key_equals_b0 = tags_equal(g, key_tag, b0_tag)?;
+    let key_equals_b1 = tags_equal(g, key_tag, b1_tag)?;
+    let out_found = g.xor(&key_equals_b0, &key_equals_b1)?;
+
+    let mut output = Vec::with_capacity(64);
+    for i in 0..INDEX_BITS {
+        let b0_delta = g.xor(&b0_index[i], &dummy_index[i])?;
+        let b1_delta = g.xor(&b1_index[i], &dummy_index[i])?;
         let selected_b0_delta = g.and(&key_equals_b0, &b0_delta)?;
         let selected_b1_delta = g.and(&key_equals_b1, &b1_delta)?;
         let selected = g.xor(&dummy_index[i], &selected_b0_delta)?;
@@ -200,9 +240,12 @@ fn tags_equal<G>(g: &mut G, lhs: &[G::Item], rhs: &[G::Item]) -> Result<G::Item,
 where
     G: FancyBinary + FancyBinaryConstant,
 {
+    debug_assert_eq!(lhs.len(), TAG_BITS);
+    debug_assert_eq!(rhs.len(), TAG_BITS);
+
     let mut equal_bits = Vec::with_capacity(96);
-    for i in 32..128 {
-        let diff = g.xor(&lhs[i], &rhs[i])?;
+    for (lhs, rhs) in lhs.iter().zip(rhs) {
+        let diff = g.xor(lhs, rhs)?;
         equal_bits.push(g.negate(&diff)?);
     }
     g.and_many(&equal_bits)
@@ -210,90 +253,152 @@ where
 
 fn input_cht_lookup_2shares<N: Network>(
     lookup_values: [RingElement<Block>; 3],
-    dummy_index: BlockShare,
+    dummy_index: XShare,
     delta: Option<WireMod2>,
     net: &N,
     state: &mut Rep3State,
 ) -> eyre::Result<[BinaryBundle<WireMod2>; 2]> {
-    const NUM_INPUTS: usize = 4;
-    const NUM_BITS: usize = NUM_INPUTS * 128;
-
     match state.id {
         PartyID::ID0 => {
             let (x01, x2) = mpc_net::join(
-                || receive_bundle_from(NUM_BITS, net, PartyID::ID1),
-                || receive_bundle_from(NUM_BITS, net, PartyID::ID2),
+                || receive_bundle_from(COMPACT_INPUT_BITS, net, PartyID::ID1),
+                || receive_bundle_from(COMPACT_INPUT_BITS, net, PartyID::ID2),
             );
             Ok([x01?, x2?])
         }
         PartyID::ID1 => {
             let delta = delta.ok_or_else(|| eyre::eyre!("missing garbler delta"))?;
-            let mut x01_values = [RingElement(0); NUM_INPUTS];
-            x01_values[..3].copy_from_slice(&lookup_values);
-            x01_values[3] = dummy_index.a ^ dummy_index.b;
-
-            let x01 = encode_ring_inputs(&x01_values, delta, state);
-            send_inputs(&x01, net, PartyID::ID2)?;
-            let x2 = receive_bundle_from(NUM_BITS, net, PartyID::ID2)?;
-            Ok([x01.garbler_wires, x2])
+            let (x01, evaluator_x01) = encode_owned_cht_lookup_inputs(
+                lookup_values[0],
+                lookup_values[1],
+                lookup_values[2],
+                dummy_index.a ^ dummy_index.b,
+                delta,
+                state,
+            );
+            let x2 = sample_garbler_input_labels(COMPACT_INPUT_BITS, state);
+            send_bundle_to(&evaluator_x01, net, PartyID::ID0)?;
+            Ok([x01, x2])
         }
         PartyID::ID2 => {
             let delta = delta.ok_or_else(|| eyre::eyre!("missing garbler delta"))?;
-            let mut x2_values = [RingElement(0); NUM_INPUTS];
-            x2_values[..3].copy_from_slice(&lookup_values);
-            x2_values[3] = dummy_index.a;
-
-            let x2 = encode_ring_inputs(&x2_values, delta, state);
-            send_inputs(&x2, net, PartyID::ID1)?;
-            let x01 = receive_bundle_from(NUM_BITS, net, PartyID::ID1)?;
-            Ok([x01, x2.garbler_wires])
+            let x01 = sample_garbler_input_labels(COMPACT_INPUT_BITS, state);
+            let (x2, evaluator_x2) = encode_owned_cht_lookup_inputs(
+                lookup_values[0],
+                lookup_values[1],
+                lookup_values[2],
+                dummy_index.a,
+                delta,
+                state,
+            );
+            send_bundle_to(&evaluator_x2, net, PartyID::ID0)?;
+            Ok([x01, x2])
         }
     }
 }
 
-struct GarbledInputs {
-    garbler_wires: BinaryBundle<WireMod2>,
-    evaluator_wires: BinaryBundle<WireMod2>,
-}
-
-fn encode_ring_inputs<T: IntRing2k>(
-    values: &[RingElement<T>],
+fn encode_owned_cht_lookup_inputs(
+    key: RingElement<Block>,
+    b0: RingElement<Block>,
+    b1: RingElement<Block>,
+    dummy_index: RingElement<u32>,
     delta: WireMod2,
     state: &mut Rep3State,
-) -> GarbledInputs {
-    let mut garbler_wires = Vec::with_capacity(values.len() * T::K);
-    let mut evaluator_wires = Vec::with_capacity(values.len() * T::K);
+) -> (BinaryBundle<WireMod2>, BinaryBundle<WireMod2>) {
+    let mut garbler_wires = Vec::with_capacity(COMPACT_INPUT_BITS);
+    let mut evaluator_wires = Vec::with_capacity(COMPACT_INPUT_BITS);
 
-    for value in values {
-        let mut value = *value;
-        for _ in 0..T::K {
-            let bit = u16::from((value & RingElement(T::from(true))) == RingElement(T::from(true)));
-            let zero = WireMod2::rand(&mut state.rng, 2);
-            let encoded = zero.plus(&delta.cmul(bit));
-            garbler_wires.push(zero);
-            evaluator_wires.push(encoded);
-            value >>= 1;
-        }
-    }
+    push_owned_encoded_bits(
+        &mut garbler_wires,
+        &mut evaluator_wires,
+        key,
+        INDEX_BITS,
+        TAG_BITS,
+        delta,
+        state,
+    );
+    push_owned_encoded_bits(
+        &mut garbler_wires,
+        &mut evaluator_wires,
+        b0,
+        0,
+        INDEX_BITS,
+        delta,
+        state,
+    );
+    push_owned_encoded_bits(
+        &mut garbler_wires,
+        &mut evaluator_wires,
+        b0,
+        INDEX_BITS,
+        TAG_BITS,
+        delta,
+        state,
+    );
+    push_owned_encoded_bits(
+        &mut garbler_wires,
+        &mut evaluator_wires,
+        b1,
+        0,
+        INDEX_BITS,
+        delta,
+        state,
+    );
+    push_owned_encoded_bits(
+        &mut garbler_wires,
+        &mut evaluator_wires,
+        b1,
+        INDEX_BITS,
+        TAG_BITS,
+        delta,
+        state,
+    );
+    push_owned_encoded_bits(
+        &mut garbler_wires,
+        &mut evaluator_wires,
+        dummy_index,
+        0,
+        INDEX_BITS,
+        delta,
+        state,
+    );
 
-    GarbledInputs {
-        garbler_wires: BinaryBundle::new(garbler_wires),
-        evaluator_wires: BinaryBundle::new(evaluator_wires),
+    (
+        BinaryBundle::new(garbler_wires),
+        BinaryBundle::new(evaluator_wires),
+    )
+}
+
+fn push_owned_encoded_bits<T: IntRing2k>(
+    garbler_wires: &mut Vec<WireMod2>,
+    evaluator_wires: &mut Vec<WireMod2>,
+    value: RingElement<T>,
+    offset: usize,
+    len: usize,
+    delta: WireMod2,
+    state: &mut Rep3State,
+) {
+    let mut shifted = value >> offset;
+    for _ in 0..len {
+        let bit = u16::from((shifted & RingElement(T::from(true))) == RingElement(T::from(true)));
+        let zero = next_garbler_input_label(state);
+        let encoded = zero.plus(&delta.cmul(bit));
+        garbler_wires.push(zero);
+        evaluator_wires.push(encoded);
+        shifted >>= 1;
     }
 }
 
-fn send_inputs<N: Network>(
-    inputs: &GarbledInputs,
-    net: &N,
-    other_garbler: PartyID,
-) -> eyre::Result<()> {
-    let (send_garbler, send_evaluator) = mpc_net::join(
-        || send_bundle_to(&inputs.garbler_wires, net, other_garbler),
-        || send_bundle_to(&inputs.evaluator_wires, net, PartyID::ID0),
-    );
-    send_garbler?;
-    send_evaluator?;
-    Ok(())
+fn sample_garbler_input_labels(n_bits: usize, state: &mut Rep3State) -> BinaryBundle<WireMod2> {
+    BinaryBundle::new(
+        (0..n_bits)
+            .map(|_| next_garbler_input_label(state))
+            .collect(),
+    )
+}
+
+fn next_garbler_input_label(state: &mut Rep3State) -> WireMod2 {
+    WireMod2::from_block(state.rngs.generate_garbler_randomness(state.id), 2)
 }
 
 fn send_bundle_to<N: Network>(
@@ -301,17 +406,21 @@ fn send_bundle_to<N: Network>(
     net: &N,
     to: PartyID,
 ) -> eyre::Result<()> {
-    let blocks = bundle
-        .wires()
-        .iter()
-        .map(|wire| {
-            let block = wire.as_block();
-            let mut bytes = [0; 16];
-            bytes.copy_from_slice(block.as_ref());
-            bytes
-        })
-        .collect::<Vec<_>>();
+    let blocks = bundle.wires().iter().map(wire_to_bytes).collect::<Vec<_>>();
     net.send_many(to, &blocks)
+}
+
+fn wire_to_bytes(wire: &WireMod2) -> [u8; 16] {
+    let block = wire.as_block();
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(block.as_ref());
+    bytes
+}
+
+fn bytes_to_wire(bytes: [u8; 16]) -> WireMod2 {
+    let mut block = WireMod2::zero(2).as_block();
+    block.as_mut().copy_from_slice(&bytes);
+    WireMod2::from_block(block, 2)
 }
 
 fn receive_bundle_from<N: Network>(
@@ -322,13 +431,6 @@ fn receive_bundle_from<N: Network>(
     let blocks: Vec<[u8; 16]> = net.recv_many(from)?;
     eyre::ensure!(blocks.len() == n_bits, "invalid Yao input bundle length");
 
-    let wires = blocks
-        .into_iter()
-        .map(|bytes| {
-            let mut block = WireMod2::zero(2).as_block();
-            block.as_mut().copy_from_slice(&bytes);
-            WireMod2::from_block(block, 2)
-        })
-        .collect();
+    let wires = blocks.into_iter().map(bytes_to_wire).collect();
     Ok(BinaryBundle::new(wires))
 }

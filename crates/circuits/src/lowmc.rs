@@ -4,7 +4,6 @@ use mpc_core::protocols::{
 };
 use mpc_net::Network;
 use primitives::BlockShare;
-use rayon::prelude::*;
 
 pub const BLOCK_SIZE: usize = 128;
 pub const N_ROUNDS: usize = 9;
@@ -59,19 +58,11 @@ fn encrypt_many_inner<N: Network>(
         .chunks(LANES)
         .map(<[BlockShare]>::len)
         .collect::<Vec<_>>();
-    let parallel = chunk_lens.len() > 1;
     let input_chunks = inputs.chunks(LANES).collect::<Vec<_>>();
-    let mut state_bits = if parallel {
-        input_chunks
-            .into_par_iter()
-            .map(bit_slice_blocks)
-            .collect::<Vec<_>>()
-    } else {
-        input_chunks
-            .into_iter()
-            .map(bit_slice_blocks)
-            .collect::<Vec<_>>()
-    };
+    let mut state_bits = input_chunks
+        .into_iter()
+        .map(bit_slice_blocks)
+        .collect::<Vec<_>>();
 
     let repeated_key = expanded_keys.repeated_key();
 
@@ -98,85 +89,50 @@ fn encrypt_many_inner<N: Network>(
         }
     };
 
-    let round_keys_by_chunk = if parallel {
-        chunk_lens
-            .par_iter()
-            .enumerate()
-            .map(|(chunk_index, &len)| build_round_keys(chunk_index, len))
-            .collect::<Vec<_>>()
-    } else {
-        chunk_lens
-            .iter()
-            .enumerate()
-            .map(|(chunk_index, &len)| build_round_keys(chunk_index, len))
-            .collect::<Vec<_>>()
-    };
+    let round_keys_by_chunk = chunk_lens
+        .iter()
+        .enumerate()
+        .map(|(chunk_index, &len)| build_round_keys(chunk_index, len))
+        .collect::<Vec<_>>();
 
-    if parallel {
-        state_bits
-            .par_iter_mut()
-            .zip(round_keys_by_chunk.par_iter())
-            .for_each(|(state_bits, expanded_key)| {
-                add_round_key(state_bits, &expanded_key[0]);
-            });
-    } else {
-        for (state_bits, expanded_key) in state_bits.iter_mut().zip(&round_keys_by_chunk) {
+    state_bits
+        .iter_mut()
+        .zip(round_keys_by_chunk.iter())
+        .for_each(|(state_bits, expanded_key)| {
             add_round_key(state_bits, &expanded_key[0]);
-        }
-    }
+        });
 
     for round in 0..N_ROUNDS {
         state_bits = sbox_layer_many(&state_bits, net, state)?;
 
-        if parallel {
-            state_bits.par_iter_mut().for_each(|state_bits| {
-                *state_bits = four_russians_matrix_mult(round, state_bits);
+        state_bits.iter_mut().for_each(|state_bits| {
+            *state_bits = four_russians_matrix_mult(round, state_bits);
+        });
+
+        let party_id = state.id;
+        state_bits
+            .iter_mut()
+            .zip(chunk_lens.iter())
+            .for_each(|(state_bits, &len)| {
+                xor_constants(round, state_bits, lane_mask(len), party_id);
             });
 
-            let party_id = state.id;
-            state_bits
-                .par_iter_mut()
-                .zip(chunk_lens.par_iter())
-                .for_each(|(state_bits, &len)| {
-                    xor_constants(round, state_bits, lane_mask(len), party_id);
-                });
-
-            state_bits
-                .par_iter_mut()
-                .zip(round_keys_by_chunk.par_iter())
-                .for_each(|(state_bits, expanded_key)| {
-                    add_round_key(state_bits, &expanded_key[round + 1]);
-                });
-        } else {
-            for state_bits in &mut state_bits {
-                *state_bits = four_russians_matrix_mult(round, state_bits);
-            }
-
-            let party_id = state.id;
-            for (state_bits, &len) in state_bits.iter_mut().zip(&chunk_lens) {
-                xor_constants(round, state_bits, lane_mask(len), party_id);
-            }
-
-            for (state_bits, expanded_key) in state_bits.iter_mut().zip(&round_keys_by_chunk) {
+        state_bits
+            .iter_mut()
+            .zip(round_keys_by_chunk.iter())
+            .for_each(|(state_bits, expanded_key)| {
                 add_round_key(state_bits, &expanded_key[round + 1]);
-            }
-        }
+            });
     }
 
     let mut output = Vec::with_capacity(inputs.len());
-    if parallel {
-        let packed_chunks = state_bits
-            .par_iter()
-            .zip(chunk_lens.par_iter())
-            .map(|(state_bits, &len)| pack_bit_sliced_blocks(state_bits, len))
-            .collect::<Vec<_>>();
-        for packed_chunk in packed_chunks {
-            output.extend(packed_chunk);
-        }
-    } else {
-        for (state_bits, &len) in state_bits.iter().zip(&chunk_lens) {
-            output.extend(pack_bit_sliced_blocks(state_bits, len));
-        }
+    let packed_chunks = state_bits
+        .iter()
+        .zip(chunk_lens.iter())
+        .map(|(state_bits, &len)| pack_bit_sliced_blocks(state_bits, len))
+        .collect::<Vec<_>>();
+    for packed_chunk in packed_chunks {
+        output.extend(packed_chunk);
     }
 
     Ok(output)
