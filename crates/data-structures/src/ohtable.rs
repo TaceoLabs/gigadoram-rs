@@ -16,7 +16,7 @@ use primitives::{
     ArrayShuffler, Block, BlockShare, LocalPermutation, XShare, YShare, bit_to_binary_mask,
     reshare_3_to_2,
     types::{BitShare, input},
-    upcast_x_to_block,
+    upcast_x_to_block, upcast_y_to_block,
 };
 
 use crate::cht;
@@ -189,9 +189,33 @@ impl OhTable {
         self.ys_builder_order[..self.params.num_elements].clone_from_slice(&ys);
         let mut indices_builder_order = vec![XShare::zero_share(); self.params.total_size()];
 
-        builder_shuffler.forward(&mut self.qs_builder_order, net, state)?;
-        builder_shuffler.forward(&mut self.xs_builder_order, net, state)?;
-        builder_shuffler.forward(&mut self.ys_builder_order, net, state)?;
+        let mut xs_builder_order_block = self
+            .xs_builder_order
+            .iter()
+            .copied()
+            .map(upcast_x_to_block)
+            .collect::<Vec<_>>();
+        let mut ys_builder_order_block = self
+            .ys_builder_order
+            .iter()
+            .copied()
+            .map(upcast_y_to_block)
+            .collect::<Vec<_>>();
+        builder_shuffler.forward_many(
+            &mut [
+                &mut self.qs_builder_order,
+                &mut xs_builder_order_block,
+                &mut ys_builder_order_block,
+            ],
+            net,
+            state,
+        )?;
+        for (dst, src) in self.xs_builder_order.iter_mut().zip(xs_builder_order_block) {
+            *dst = downcast(src);
+        }
+        for (dst, src) in self.ys_builder_order.iter_mut().zip(ys_builder_order_block) {
+            *dst = downcast(src);
+        }
         builder_shuffler.indices(&mut indices_builder_order, net, state)?;
 
         self.dummy_indices = indices_builder_order[self.params.num_elements..].to_vec();
@@ -455,18 +479,39 @@ impl OhTable {
         net: &N,
         state: &mut Rep3State,
     ) -> eyre::Result<()> {
-        receiver_shuffler.forward_known_to_p_and_next(
+        let mut xs_receiver_order_block = self
+            .xs_receiver_order
+            .iter()
+            .copied()
+            .map(upcast_x_to_block)
+            .collect::<Vec<_>>();
+        let mut ys_receiver_order_block = self
+            .ys_receiver_order
+            .iter()
+            .copied()
+            .map(upcast_y_to_block)
+            .collect::<Vec<_>>();
+
+        receiver_shuffler.forward_many_known_to_p_and_next(
             self.params.builder.next(),
-            &mut self.xs_receiver_order,
+            &mut [&mut xs_receiver_order_block, &mut ys_receiver_order_block],
             net,
             state,
         )?;
-        receiver_shuffler.forward_known_to_p_and_next(
-            self.params.builder.next(),
-            &mut self.ys_receiver_order,
-            net,
-            state,
-        )?;
+        for (dst, src) in self
+            .xs_receiver_order
+            .iter_mut()
+            .zip(xs_receiver_order_block)
+        {
+            *dst = downcast(src);
+        }
+        for (dst, src) in self
+            .ys_receiver_order
+            .iter_mut()
+            .zip(ys_receiver_order_block)
+        {
+            *dst = downcast(src);
+        }
         Ok(())
     }
 

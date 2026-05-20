@@ -63,6 +63,26 @@ impl ArrayShuffler {
         Ok(())
     }
 
+    pub fn forward_many<T, N>(
+        &self,
+        rep_arrays: &mut [&mut [Rep3RingShare<T>]],
+        net: &N,
+        state: &mut Rep3State,
+    ) -> eyre::Result<()>
+    where
+        T: IntRing2k,
+        Standard: Distribution<T>,
+        N: Network,
+    {
+        for rep_array in rep_arrays.iter() {
+            assert_eq!(rep_array.len(), self.len);
+        }
+        for p in [PartyID::ID0, PartyID::ID1, PartyID::ID2] {
+            self.forward_step_many(p, rep_arrays, net, state)?;
+        }
+        Ok(())
+    }
+
     pub fn forward_known_to_p_and_next<T, N>(
         &self,
         p: PartyID,
@@ -77,6 +97,24 @@ impl ArrayShuffler {
     {
         assert_eq!(rep_array.len(), self.len);
         self.forward_step(p, rep_array, net, state)
+    }
+
+    pub fn forward_many_known_to_p_and_next<T, N>(
+        &self,
+        p: PartyID,
+        rep_arrays: &mut [&mut [Rep3RingShare<T>]],
+        net: &N,
+        state: &mut Rep3State,
+    ) -> eyre::Result<()>
+    where
+        T: IntRing2k,
+        Standard: Distribution<T>,
+        N: Network,
+    {
+        for rep_array in rep_arrays.iter() {
+            assert_eq!(rep_array.len(), self.len);
+        }
+        self.forward_step_many(p, rep_arrays, net, state)
     }
 
     pub fn inverse<T, N>(
@@ -133,6 +171,40 @@ impl ArrayShuffler {
         }
         let reshared = from_2_shares(two_shares, p, p.next(), net, state)?;
         rep_array.clone_from_slice(&reshared);
+        Ok(())
+    }
+
+    fn forward_step_many<T, N>(
+        &self,
+        p: PartyID,
+        rep_arrays: &mut [&mut [Rep3RingShare<T>]],
+        net: &N,
+        state: &mut Rep3State,
+    ) -> eyre::Result<()>
+    where
+        T: IntRing2k,
+        Standard: Distribution<T>,
+        N: Network,
+    {
+        let mut two_shares = Vec::with_capacity(self.len * rep_arrays.len());
+        for rep_array in rep_arrays.iter() {
+            two_shares.extend(reshare_3_to_2_for(rep_array, p, p.next(), state));
+        }
+
+        if state.id == p {
+            for shares in two_shares.chunks_mut(self.len) {
+                self.next_shared_perm.shuffle(shares);
+            }
+        } else if state.id == p.next() {
+            for shares in two_shares.chunks_mut(self.len) {
+                self.prev_shared_perm.shuffle(shares);
+            }
+        }
+
+        let reshared = from_2_shares(two_shares, p, p.next(), net, state)?;
+        for (rep_array, reshared) in rep_arrays.iter_mut().zip(reshared.chunks(self.len)) {
+            rep_array.clone_from_slice(reshared);
+        }
         Ok(())
     }
 

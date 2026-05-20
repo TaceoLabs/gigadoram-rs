@@ -6,12 +6,6 @@ use mpc_net::Network;
 use primitives::{XShare, YShare, types::BitShare};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SpeedCacheQueryResult {
-    pub value: Vec<YShare>,
-    pub found: Vec<XShare>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpeedCache {
     pub length: usize,
     pub num_stored: usize,
@@ -51,7 +45,11 @@ impl SpeedCache {
         net: &impl Network,
         state: &mut Rep3State,
     ) -> eyre::Result<(YShare, BitShare)> {
-        let length_for_query = std::cmp::max(1, self.num_stored);
+        if self.num_stored == 0 {
+            return Ok((YShare::default(), BitShare::default()));
+        }
+
+        let length_for_query = self.num_stored;
 
         // circuit input:  x_query | x | y
         // circuit output: x_mask | y | found
@@ -121,6 +119,8 @@ impl SpeedCache {
 
     pub fn clear(&mut self) {
         self.num_stored = 0;
+        self.addrs.fill(XShare::default());
+        self.data.fill(YShare::default());
     }
 }
 

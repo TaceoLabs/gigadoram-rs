@@ -16,3 +16,4 @@ fancy-garbling.workspace = true
 mpc-core.workspace = true
 mpc-net.workspace = true
 primitives.workspace = true
+rayon.workspace = true

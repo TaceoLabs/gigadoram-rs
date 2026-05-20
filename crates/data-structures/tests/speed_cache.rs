@@ -53,3 +53,38 @@ fn test_speed_cache_query() {
         );
     }
 }
+
+#[test]
+fn test_speed_cache_empty_and_clear_do_not_match_stale_entries() {
+    let results = run_parties(|net| {
+        let mut state = Rep3State::new(&net, A2BType::Direct).unwrap();
+        let mut cache = SpeedCache::new(2);
+
+        let zero_addr = promote_public(state.id, 0u32);
+        let (empty_value, empty_found) = cache.query(zero_addr, &net, &mut state).unwrap();
+
+        cache.write(vec![zero_addr], vec![promote_public(state.id, 123u64)]);
+        cache.clear();
+
+        let (cleared_value, cleared_found) = cache.query(zero_addr, &net, &mut state).unwrap();
+
+        (
+            arithmetic::open_bit(empty_value, &net).unwrap(),
+            arithmetic::open_bit(empty_found, &net).unwrap(),
+            arithmetic::open_bit(cleared_value, &net).unwrap(),
+            arithmetic::open_bit(cleared_found, &net).unwrap(),
+        )
+    });
+
+    for opened in results {
+        assert_eq!(
+            opened,
+            (
+                RingElement(0u64),
+                RingElement(Bit::new(false)),
+                RingElement(0u64),
+                RingElement(Bit::new(false)),
+            )
+        );
+    }
+}

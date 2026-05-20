@@ -6,4 +6,4 @@ pub use cht::*;
 pub use ohtable::{
     OHTableParams, ObliviousHashTable, OhTable, OhTableParams, OhTableQueryTiming, OhTableTiming,
 };
-pub use speed_cache::{SpeedCache, SpeedCacheQueryResult};
+pub use speed_cache::SpeedCache;

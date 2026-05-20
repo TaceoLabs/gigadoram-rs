@@ -29,6 +29,7 @@ num-traits = "0.2"
 primitives = { path = "crates/primitives" }
 rand = "0.8"
 rand_chacha = "0.3"
+rayon = "1.11"
 rustls = "0.23.35"
 serde = { version = "1", features = ["derive"] }
 structures = { package = "data-structures", path = "crates/data-structures" }

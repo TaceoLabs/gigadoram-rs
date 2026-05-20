@@ -43,6 +43,13 @@ pub fn upcast_x_to_block(share: XShare) -> BlockShare {
     )
 }
 
+pub fn upcast_y_to_block(share: YShare) -> BlockShare {
+    BlockShare::new_ring(
+        RingElement(u128::from(share.a.0)),
+        RingElement(u128::from(share.b.0)),
+    )
+}
+
 pub fn open_many<T, N>(shares: &[Rep3RingShare<T>], net: &N) -> Vec<T>
 where
     T: IntRing2k,
