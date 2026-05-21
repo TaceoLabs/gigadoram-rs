@@ -1,6 +1,6 @@
 mod common;
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, mem::size_of, path::PathBuf};
 
 use circuits::{
     batcher::{apply_compare_swap_dummy_pair_deltas, compare_swap_dummy_pair_deltas},
@@ -33,6 +33,7 @@ struct Cli {
 }
 
 const TCP_STRIPES: usize = 20;
+const STRIPED_SMALL_SEND_THRESHOLD: usize = 64 * 1024;
 
 fn main() -> Result<()> {
     common::install_tracing();
@@ -71,6 +72,14 @@ impl Network for StripedTcpNetwork {
     }
 
     fn send(&self, to: usize, data: &[u8]) -> Result<()> {
+        if data.len() < STRIPED_SMALL_SEND_THRESHOLD {
+            let mut framed = Vec::with_capacity(size_of::<u64>() + data.len());
+            framed.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            framed.extend_from_slice(data);
+            return self.nets[0].send(to, &framed);
+        }
+
+        self.nets[0].send(to, &(data.len() as u64).to_le_bytes())?;
         let chunk_size = data.len().div_ceil(TCP_STRIPES);
         std::thread::scope(|scope| {
             let handles = self
@@ -92,6 +101,23 @@ impl Network for StripedTcpNetwork {
     }
 
     fn recv(&self, from: usize) -> Result<Vec<u8>> {
+        let header = self.nets[0].recv(from)?;
+        if header.len() < size_of::<u64>() {
+            eyre::bail!("invalid striped TCP frame header");
+        }
+
+        let len = u64::from_le_bytes(header[..size_of::<u64>()].try_into().unwrap()) as usize;
+        if len < STRIPED_SMALL_SEND_THRESHOLD {
+            let data = header[size_of::<u64>()..].to_vec();
+            if data.len() != len {
+                eyre::bail!("invalid small striped TCP frame length");
+            }
+            return Ok(data);
+        }
+
+        if header.len() != size_of::<u64>() {
+            eyre::bail!("invalid large striped TCP frame header");
+        }
         let chunks = std::thread::scope(|scope| {
             let handles = self
                 .nets
@@ -107,6 +133,9 @@ impl Network for StripedTcpNetwork {
         let mut data = Vec::with_capacity(chunks.iter().map(Vec::len).sum());
         for chunk in chunks {
             data.extend(chunk);
+        }
+        if data.len() != len {
+            eyre::bail!("invalid large striped TCP frame length");
         }
         Ok(data)
     }

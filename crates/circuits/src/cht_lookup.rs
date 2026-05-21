@@ -4,9 +4,7 @@ use mpc_core::protocols::{
         Rep3State,
         id::PartyID,
         network::Rep3NetworkExt,
-        yao::{
-            streaming_evaluator::StreamingRep3Evaluator, streaming_garbler::StreamingRep3Garbler,
-        },
+        yao::{evaluator::Rep3Evaluator, garbler::Rep3Garbler},
     },
     rep3_ring::{casts::downcast, conversion::y2b, ring::ring_impl::RingElement},
 };
@@ -48,22 +46,19 @@ fn lookup_garbled_circuit<N: Network>(
         PartyID::ID0 => {
             let x01 = receive_input_bundle(net, PartyID::ID1)?;
             let x2 = receive_input_bundle(net, PartyID::ID2)?;
-            let mut evaluator = StreamingRep3Evaluator::new(net);
+            let mut evaluator = Rep3Evaluator::new(net);
+            evaluator.receive_circuit()?;
             let output = evaluate_lookup_circuit(&mut evaluator, &x01, &x2)
                 .map_err(|err| eyre::eyre!("CHT lookup garbled evaluation failed: {err:?}"))?;
-            evaluator.receive_hash()?;
             y2b(output, net, state)
         }
         PartyID::ID1 | PartyID::ID2 => {
-            let mut garbler = StreamingRep3Garbler::new_with_delta(
-                net,
-                state,
-                delta.expect("delta should be present"),
-            );
+            let mut garbler =
+                Rep3Garbler::new_with_delta(net, state, delta.expect("delta should be present"));
             let [x01, x2] = garble_lookup_inputs(&packed_inputs, net, state.id, &mut garbler)?;
             let output = evaluate_lookup_circuit(&mut garbler, &x01, &x2)
                 .map_err(|err| eyre::eyre!("CHT lookup garbling failed: {err:?}"))?;
-            garbler.send_hash()?;
+            garbler.send_circuit()?;
             y2b(output, net, state)
         }
     }
@@ -73,7 +68,7 @@ fn garble_lookup_inputs<N: Network>(
     inputs: &[BlockShare; 3],
     net: &N,
     id: PartyID,
-    garbler: &mut StreamingRep3Garbler<N>,
+    garbler: &mut Rep3Garbler<N>,
 ) -> eyre::Result<[BinaryBundle<WireMod2>; 2]> {
     let mut x01 = Vec::with_capacity(LOOKUP_INPUT_BITS);
     let mut x2 = Vec::with_capacity(LOOKUP_INPUT_BITS);
@@ -107,7 +102,7 @@ fn garble_lookup_inputs<N: Network>(
 fn encode_input<N: Network>(
     value: u128,
     send_to_evaluator: bool,
-    garbler: &mut StreamingRep3Garbler<N>,
+    garbler: &mut Rep3Garbler<N>,
     garbler_wires: &mut Vec<WireMod2>,
     evaluator_inputs: &mut Vec<[u8; 16]>,
 ) {
