@@ -1,5 +1,5 @@
 use mpc_core::protocols::{
-    rep3::Rep3State,
+    rep3::{Rep3State, id::PartyID},
     rep3_ring::{binary, ring::ring_impl::RingElement},
 };
 use mpc_net::Network;
@@ -58,8 +58,9 @@ fn encrypt_many_inner<N: Network>(
         .chunks(LANES)
         .map(<[BlockShare]>::len)
         .collect::<Vec<_>>();
-    let mut state_bits = inputs
-        .chunks(LANES)
+    let input_chunks = inputs.chunks(LANES).collect::<Vec<_>>();
+    let mut state_bits = input_chunks
+        .into_iter()
         .map(bit_slice_blocks)
         .collect::<Vec<_>>();
 
@@ -68,53 +69,70 @@ fn encrypt_many_inner<N: Network>(
     let full_repeated_round_keys =
         repeated_key.map(|expanded_key| bit_slice_repeated_round_keys(expanded_key, LANES));
 
+    let build_round_keys = |chunk_index: usize, len: usize| {
+        if let (Some(expanded_key), Some(full_round_keys)) =
+            (repeated_key, full_repeated_round_keys.as_ref())
+        {
+            if len == LANES {
+                full_round_keys.clone()
+            } else {
+                bit_slice_repeated_round_keys(expanded_key, len)
+            }
+        } else {
+            bit_slice_round_keys(
+                expanded_keys
+                    .per_input()
+                    .expect("per-input keys are required"),
+                chunk_index * LANES,
+                len,
+            )
+        }
+    };
+
     let round_keys_by_chunk = chunk_lens
         .iter()
         .enumerate()
-        .map(|(chunk_index, &len)| {
-            if let (Some(expanded_key), Some(full_round_keys)) =
-                (repeated_key, full_repeated_round_keys.as_ref())
-            {
-                if len == LANES {
-                    full_round_keys.clone()
-                } else {
-                    bit_slice_repeated_round_keys(expanded_key, len)
-                }
-            } else {
-                bit_slice_round_keys(
-                    expanded_keys
-                        .per_input()
-                        .expect("per-input keys are required"),
-                    chunk_index * LANES,
-                    len,
-                )
-            }
-        })
+        .map(|(chunk_index, &len)| build_round_keys(chunk_index, len))
         .collect::<Vec<_>>();
 
-    for (state_bits, expanded_key) in state_bits.iter_mut().zip(&round_keys_by_chunk) {
-        add_round_key(state_bits, &expanded_key[0]);
-    }
+    state_bits
+        .iter_mut()
+        .zip(round_keys_by_chunk.iter())
+        .for_each(|(state_bits, expanded_key)| {
+            add_round_key(state_bits, &expanded_key[0]);
+        });
 
     for round in 0..N_ROUNDS {
         state_bits = sbox_layer_many(&state_bits, net, state)?;
 
-        for state_bits in state_bits.iter_mut() {
+        state_bits.iter_mut().for_each(|state_bits| {
             *state_bits = four_russians_matrix_mult(round, state_bits);
-        }
+        });
 
-        for (state_bits, &len) in state_bits.iter_mut().zip(&chunk_lens) {
-            xor_constants(round, state_bits, lane_mask(len), state);
-        }
+        let party_id = state.id;
+        state_bits
+            .iter_mut()
+            .zip(chunk_lens.iter())
+            .for_each(|(state_bits, &len)| {
+                xor_constants(round, state_bits, lane_mask(len), party_id);
+            });
 
-        for (state_bits, expanded_key) in state_bits.iter_mut().zip(&round_keys_by_chunk) {
-            add_round_key(state_bits, &expanded_key[round + 1]);
-        }
+        state_bits
+            .iter_mut()
+            .zip(round_keys_by_chunk.iter())
+            .for_each(|(state_bits, expanded_key)| {
+                add_round_key(state_bits, &expanded_key[round + 1]);
+            });
     }
 
     let mut output = Vec::with_capacity(inputs.len());
-    for (state_bits, &len) in state_bits.iter().zip(&chunk_lens) {
-        output.extend(pack_bit_sliced_blocks(state_bits, len));
+    let packed_chunks = state_bits
+        .iter()
+        .zip(chunk_lens.iter())
+        .map(|(state_bits, &len)| pack_bit_sliced_blocks(state_bits, len))
+        .collect::<Vec<_>>();
+    for packed_chunk in packed_chunks {
+        output.extend(packed_chunk);
     }
 
     Ok(output)
@@ -172,7 +190,7 @@ fn xor_constants(
     round: usize,
     state_bits: &mut [BlockShare],
     active_mask: u128,
-    state: &Rep3State,
+    party_id: PartyID,
 ) {
     assert_eq!(state_bits.len(), BLOCK_SIZE);
 
@@ -181,7 +199,7 @@ fn xor_constants(
         .zip(params::ROUND_CONSTANTS[round].iter().copied())
     {
         if constant {
-            *bit = binary::xor_public(bit, &RingElement(active_mask), state.id);
+            *bit = binary::xor_public(bit, &RingElement(active_mask), party_id);
         }
     }
 }

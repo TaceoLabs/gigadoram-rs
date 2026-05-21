@@ -43,6 +43,13 @@ pub fn upcast_x_to_block(share: XShare) -> BlockShare {
     )
 }
 
+pub fn upcast_y_to_block(share: YShare) -> BlockShare {
+    BlockShare::new_ring(
+        RingElement(u128::from(share.a.0)),
+        RingElement(u128::from(share.b.0)),
+    )
+}
+
 pub fn open_many<T, N>(shares: &[Rep3RingShare<T>], net: &N) -> Vec<T>
 where
     T: IntRing2k,
@@ -109,17 +116,26 @@ where
     assert_ne!(from_1, from_2);
     assert!(from_1.next() == from_2 || from_1.prev() == from_2);
 
-    let rep_array = if from_2 == from_1.prev() {
-        let mut rep_array = input(from_1, &local_shares, net, state)?;
-        input_xor(&mut rep_array, from_2, &local_shares, net, state)?;
-        rep_array
-    } else {
-        let mut rep_array = input(from_2, &local_shares, net, state)?;
-        input_xor(&mut rep_array, from_1, &local_shares, net, state)?;
-        rep_array
-    };
+    let local_components = local_shares
+        .into_iter()
+        .map(|local_share| {
+            let (mut zero_share, other_zero_share) =
+                state.rngs.rand.random_elements::<RingElement<T>>();
+            zero_share ^= other_zero_share;
+            if state.id == from_1 || state.id == from_2 {
+                zero_share ^ local_share
+            } else {
+                zero_share
+            }
+        })
+        .collect::<Vec<_>>();
 
-    Ok(rep_array)
+    let next_components = net.reshare_many(&local_components)?;
+    Ok(local_components
+        .into_iter()
+        .zip(next_components)
+        .map(|(local, next)| Rep3RingShare::new_ring(local, next))
+        .collect())
 }
 
 pub fn input<T, N>(
@@ -163,46 +179,4 @@ where
     }
 
     Ok(rep_array)
-}
-
-fn input_xor<T, N>(
-    rep_array: &mut [Rep3RingShare<T>],
-    party_inputting: PartyID,
-    secrets: &[RingElement<T>],
-    net: &N,
-    state: &mut Rep3State,
-) -> eyre::Result<()>
-where
-    T: IntRing2k,
-    Standard: Distribution<T>,
-    N: Network,
-{
-    assert_eq!(rep_array.len(), secrets.len());
-
-    if state.id == party_inputting {
-        let mut to_next = Vec::with_capacity(secrets.len());
-        for (share, secret) in rep_array.iter_mut().zip(secrets) {
-            let pad = state.rngs.rand.random_element_rng2::<RingElement<T>>();
-            let masked = *secret ^ pad;
-            share.b ^= pad;
-            share.a ^= masked;
-            to_next.push(masked);
-        }
-        net.send_many(party_inputting.next(), &to_next)?;
-    } else if state.id == party_inputting.prev() {
-        for share in rep_array {
-            let pad = state.rngs.rand.random_element_rng1::<RingElement<T>>();
-            share.a ^= pad;
-        }
-    } else {
-        let from_prev = net.recv_many::<RingElement<T>>(party_inputting)?;
-        if from_prev.len() != rep_array.len() {
-            eyre::bail!("invalid number of elements received while xor-inputting two shares");
-        }
-        for (share, received) in rep_array.iter_mut().zip(from_prev) {
-            share.b ^= received;
-        }
-    }
-
-    Ok(())
 }

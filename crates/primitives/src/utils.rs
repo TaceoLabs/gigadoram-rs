@@ -8,9 +8,10 @@ use mpc_core::protocols::{
     },
 };
 use mpc_net::{Network, local::LocalNetwork};
-use num_traits::One;
+use num_traits::AsPrimitive;
 use rand::distributions::{Distribution, Standard};
 use rand::{RngCore, seq::SliceRandom, thread_rng};
+use std::any::TypeId;
 
 use crate::{Block, XShare, YShare, upcast_x_to_y};
 
@@ -150,34 +151,99 @@ pub fn is_zero_many<T, N>(
     state: &mut Rep3State,
 ) -> eyre::Result<Vec<RingShare<Bit>>>
 where
-    T: IntRing2k,
+    T: IntRing2k + 'static,
     Standard: Distribution<T>,
     N: Network,
 {
-    let mut values = inputs.iter().map(|x| !x).collect::<Vec<_>>();
+    let values = inputs.iter().map(|x| !x).collect::<Vec<_>>();
 
-    let mut len = T::K;
-    debug_assert!(len.is_power_of_two());
-    while len > 1 {
-        len >>= 1;
-        let mask = (RingElement::one() << len) - RingElement::one();
-        let lhs = values.iter().map(|x| *x & mask).collect::<Vec<_>>();
-        let rhs = values
-            .iter()
-            .map(|x| {
-                let y = x >> len;
-                y & mask
-            })
-            .collect::<Vec<_>>();
-        values = and_vec(&lhs, &rhs, net, state)?;
+    if TypeId::of::<T>() == TypeId::of::<u128>() {
+        let values =
+            unsafe { std::mem::transmute::<Vec<RingShare<T>>, Vec<RingShare<u128>>>(values) };
+
+        let values = fold_zero_stage_many::<u128, u64, _>(values, 64, net, state)?;
+        let values = fold_zero_stage_many::<u64, u32, _>(values, 32, net, state)?;
+        let values = fold_zero_stage_many::<u32, u16, _>(values, 16, net, state)?;
+        let values = fold_zero_stage_many::<u16, u8, _>(values, 8, net, state)?;
+        let values = fold_zero_stage_many::<u8, u8, _>(values, 4, net, state)?;
+        let values = fold_zero_stage_many::<u8, u8, _>(values, 2, net, state)?;
+        let values = fold_zero_stage_many::<u8, u8, _>(values, 1, net, state)?;
+        Ok(values.into_iter().map(|value| value.get_bit(0)).collect())
+    } else if TypeId::of::<T>() == TypeId::of::<u64>() {
+        let values =
+            unsafe { std::mem::transmute::<Vec<RingShare<T>>, Vec<RingShare<u64>>>(values) };
+
+        let values = fold_zero_stage_many::<u64, u32, _>(values, 32, net, state)?;
+        let values = fold_zero_stage_many::<u32, u16, _>(values, 16, net, state)?;
+        let values = fold_zero_stage_many::<u16, u8, _>(values, 8, net, state)?;
+        let values = fold_zero_stage_many::<u8, u8, _>(values, 4, net, state)?;
+        let values = fold_zero_stage_many::<u8, u8, _>(values, 2, net, state)?;
+        let values = fold_zero_stage_many::<u8, u8, _>(values, 1, net, state)?;
+        Ok(values.into_iter().map(|value| value.get_bit(0)).collect())
+    } else if TypeId::of::<T>() == TypeId::of::<u32>() {
+        let values =
+            unsafe { std::mem::transmute::<Vec<RingShare<T>>, Vec<RingShare<u32>>>(values) };
+
+        let values = fold_zero_stage_many::<u32, u16, _>(values, 16, net, state)?;
+        let values = fold_zero_stage_many::<u16, u8, _>(values, 8, net, state)?;
+        let values = fold_zero_stage_many::<u8, u8, _>(values, 4, net, state)?;
+        let values = fold_zero_stage_many::<u8, u8, _>(values, 2, net, state)?;
+        let values = fold_zero_stage_many::<u8, u8, _>(values, 1, net, state)?;
+        Ok(values.into_iter().map(|value| value.get_bit(0)).collect())
+    } else if TypeId::of::<T>() == TypeId::of::<u16>() {
+        let values =
+            unsafe { std::mem::transmute::<Vec<RingShare<T>>, Vec<RingShare<u16>>>(values) };
+
+        let values = fold_zero_stage_many::<u16, u8, _>(values, 8, net, state)?;
+        let values = fold_zero_stage_many::<u8, u8, _>(values, 4, net, state)?;
+        let values = fold_zero_stage_many::<u8, u8, _>(values, 2, net, state)?;
+        let values = fold_zero_stage_many::<u8, u8, _>(values, 1, net, state)?;
+        Ok(values.into_iter().map(|value| value.get_bit(0)).collect())
+    } else if TypeId::of::<T>() == TypeId::of::<u8>() {
+        let values =
+            unsafe { std::mem::transmute::<Vec<RingShare<T>>, Vec<RingShare<u8>>>(values) };
+
+        let values = fold_zero_stage_many::<u8, u8, _>(values, 4, net, state)?;
+        let values = fold_zero_stage_many::<u8, u8, _>(values, 2, net, state)?;
+        let values = fold_zero_stage_many::<u8, u8, _>(values, 1, net, state)?;
+        Ok(values.into_iter().map(|value| value.get_bit(0)).collect())
+    } else {
+        panic!("is_zero_many is not implemented for this ring type");
     }
+}
 
-    Ok(values
+fn fold_zero_stage_many<T, U, N>(
+    values: Vec<RingShare<T>>,
+    shift: usize,
+    net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<Vec<RingShare<U>>>
+where
+    T: IntRing2k,
+    U: IntRing2k + 'static,
+    T: AsPrimitive<U>,
+    Standard: Distribution<U>,
+    N: Network,
+{
+    let local = values
         .into_iter()
-        .map(|x| RingShare {
-            a: RingElement(Bit::new((x.a & RingElement::one()) == RingElement::one())),
-            b: RingElement(Bit::new((x.b & RingElement::one()) == RingElement::one())),
+        .map(|value| {
+            let (mut mask, mask_b) = state.rngs.rand.random_elements::<RingElement<U>>();
+            mask ^= mask_b;
+
+            let high_a = value.a >> shift;
+            let high_b = value.b >> shift;
+            mask ^= RingElement((value.a & high_a).0.as_());
+            mask ^= RingElement((value.b & high_a).0.as_());
+            mask ^= RingElement((value.a & high_b).0.as_());
+            mask
         })
+        .collect::<Vec<_>>();
+    let next = net.reshare_many(&local)?;
+    Ok(local
+        .into_iter()
+        .zip(next)
+        .map(|(a, b)| RingShare::new_ring(a, b))
         .collect())
 }
 
