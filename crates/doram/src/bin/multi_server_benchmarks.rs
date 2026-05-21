@@ -2,12 +2,19 @@ mod common;
 
 use std::{collections::BTreeMap, path::PathBuf};
 
-use circuits::lowmc;
+use circuits::{
+    batcher::{apply_compare_swap_dummy_pair_deltas, compare_swap_dummy_pair_deltas},
+    dummy_check::dummy_check_circuit,
+    lowmc,
+    network::CircuitNetwork,
+    replace_if_dummy::replace_if_dummy_circuit,
+    xy_if_xs_equal::xy_if_xs_equal_circuit,
+};
 use clap::Parser;
 use eyre::Result;
 use mpc_core::{MpcState, protocols::rep3::Rep3State};
 use mpc_net::{ConnectionStats, Network, tcp::TcpNetwork};
-use primitives::BlockShare;
+use primitives::{BlockShare, XShare, YShare, types::BitShare};
 use structures::OhTablePrfNetwork;
 
 use common::{
@@ -117,6 +124,189 @@ impl Network for StripedTcpNetwork {
     }
 }
 
+impl CircuitNetwork for StripedTcpNetwork {
+    fn evaluate_dummy_check(
+        &self,
+        xs: &[XShare],
+        log_n: usize,
+        state: &mut Rep3State,
+    ) -> Result<Vec<BitShare>> {
+        if xs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let chunks = self.chunks(xs);
+        let mut states = self.fork_states(state, chunks.len())?;
+        let parts = std::thread::scope(|scope| {
+            let handles = chunks
+                .into_iter()
+                .zip(self.nets.iter())
+                .zip(states.iter_mut())
+                .map(|((chunk, net), state)| {
+                    scope.spawn(move || dummy_check_circuit(chunk, log_n, net, state))
+                })
+                .collect::<Vec<_>>();
+
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("parallel dummy_check thread panicked"))
+                .collect::<Result<Vec<_>>>()
+        })?;
+
+        Ok(parts.into_iter().flatten().collect())
+    }
+
+    fn evaluate_replace_if_dummy(
+        &self,
+        xs: &[XShare],
+        replacements: &[XShare],
+        log_n: usize,
+        state: &mut Rep3State,
+    ) -> Result<Vec<XShare>> {
+        assert_eq!(xs.len(), replacements.len());
+        if xs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ranges = self.ranges(xs.len());
+        let mut states = self.fork_states(state, ranges.len())?;
+        let parts = std::thread::scope(|scope| {
+            let handles = ranges
+                .into_iter()
+                .zip(self.nets.iter())
+                .zip(states.iter_mut())
+                .map(|((range, net), state)| {
+                    scope.spawn(move || {
+                        replace_if_dummy_circuit(
+                            &xs[range.clone()],
+                            &replacements[range],
+                            log_n,
+                            net,
+                            state,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .expect("parallel replace_if_dummy thread panicked")
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+
+        Ok(parts.into_iter().flatten().collect())
+    }
+
+    fn evaluate_xy_if_xs_equal(
+        &self,
+        x: &[XShare],
+        x_query: &[XShare],
+        y: &[YShare],
+        state: &mut Rep3State,
+    ) -> Result<(Vec<XShare>, Vec<YShare>, Vec<BitShare>)> {
+        assert_eq!(x.len(), x_query.len());
+        assert_eq!(x.len(), y.len());
+        if x.is_empty() {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+
+        let ranges = self.ranges(x.len());
+        let mut states = self.fork_states(state, ranges.len())?;
+        let parts = std::thread::scope(|scope| {
+            let handles = ranges
+                .into_iter()
+                .zip(self.nets.iter())
+                .zip(states.iter_mut())
+                .map(|((range, net), state)| {
+                    scope.spawn(move || {
+                        xy_if_xs_equal_circuit(
+                            &x[range.clone()],
+                            &x_query[range.clone()],
+                            &y[range],
+                            net,
+                            state,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .expect("parallel xy_if_xs_equal thread panicked")
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+
+        let mut xs = Vec::with_capacity(x.len());
+        let mut ys = Vec::with_capacity(y.len());
+        let mut found = Vec::with_capacity(x.len());
+        for (x_part, y_part, found_part) in parts {
+            xs.extend(x_part);
+            ys.extend(y_part);
+            found.extend(found_part);
+        }
+        Ok((xs, ys, found))
+    }
+
+    fn compare_swap_dummy_pairs(
+        &self,
+        pairs: &[(usize, usize)],
+        dummy_flags: &mut [BitShare],
+        xs: &mut [XShare],
+        ys: &mut [YShare],
+        state: &mut Rep3State,
+    ) -> Result<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+
+        let chunks = self.chunks(pairs);
+        let mut states = self.fork_states(state, chunks.len())?;
+        let dummy_flags_in = &*dummy_flags;
+        let xs_in = &*xs;
+        let ys_in = &*ys;
+        let parts = std::thread::scope(|scope| {
+            let handles = chunks
+                .into_iter()
+                .zip(self.nets.iter())
+                .zip(states.iter_mut())
+                .map(|((chunk, net), state)| {
+                    scope.spawn(move || {
+                        compare_swap_dummy_pair_deltas(
+                            chunk,
+                            dummy_flags_in,
+                            xs_in,
+                            ys_in,
+                            net,
+                            state,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .expect("parallel compare_swap thread panicked")
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+
+        let selected_row_deltas = parts.into_iter().flatten().collect::<Vec<_>>();
+        apply_compare_swap_dummy_pair_deltas(pairs, &selected_row_deltas, dummy_flags, xs, ys);
+        Ok(())
+    }
+}
+
 impl OhTablePrfNetwork for StripedTcpNetwork {
     fn evaluate_repeated_lowmc(
         &self,
@@ -153,5 +343,24 @@ impl OhTablePrfNetwork for StripedTcpNetwork {
         })?;
 
         Ok(parts.into_iter().flatten().collect())
+    }
+}
+
+impl StripedTcpNetwork {
+    fn ranges(&self, len: usize) -> Vec<std::ops::Range<usize>> {
+        let chunk_size = len.div_ceil(TCP_STRIPES).max(1);
+        (0..len)
+            .step_by(chunk_size)
+            .map(|start| start..(start + chunk_size).min(len))
+            .collect()
+    }
+
+    fn chunks<'a, T>(&self, values: &'a [T]) -> Vec<&'a [T]> {
+        let chunk_size = values.len().div_ceil(TCP_STRIPES).max(1);
+        values.chunks(chunk_size).collect()
+    }
+
+    fn fork_states(&self, state: &mut Rep3State, count: usize) -> Result<Vec<Rep3State>> {
+        (0..count).map(|_| state.fork(0)).collect()
     }
 }

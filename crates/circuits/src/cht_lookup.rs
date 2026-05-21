@@ -1,23 +1,25 @@
-use fancy_garbling::{BinaryBundle, FancyBinary};
+use fancy_garbling::{BinaryBundle, FancyBinary, WireLabel, WireMod2};
 use mpc_core::protocols::{
     rep3::{
         Rep3State,
         id::PartyID,
-        yao::{evaluator::Rep3Evaluator, garbler::Rep3Garbler},
+        network::Rep3NetworkExt,
+        yao::{
+            streaming_evaluator::StreamingRep3Evaluator, streaming_garbler::StreamingRep3Garbler,
+        },
     },
-    rep3_ring::{
-        casts::downcast, conversion::y2b, ring::ring_impl::RingElement,
-        yao::joint_input_binary_xored_many,
-    },
+    rep3_ring::{casts::downcast, conversion::y2b, ring::ring_impl::RingElement},
 };
 use mpc_net::Network;
 use primitives::{BlockShare, XShare, types::BitShare};
+use scuttlebutt::Block;
 
 const KEY_TAG_BITS: usize = 96;
 const INDEX_BITS: usize = 32;
 const FOUND_BITS: usize = 1;
 const OUTPUT_BITS: usize = INDEX_BITS + FOUND_BITS;
 const INDEX_MASK: u128 = u32::MAX as u128;
+const LOOKUP_INPUT_BITS: usize = 3 * (KEY_TAG_BITS + INDEX_BITS);
 
 pub fn lookup_circuit(
     key: BlockShare,
@@ -40,30 +42,107 @@ fn lookup_garbled_circuit<N: Network>(
     state: &mut Rep3State,
 ) -> eyre::Result<BlockShare> {
     let delta = state.rngs.generate_random_garbler_delta(state.id);
-    let [x01, x2] = joint_input_binary_xored_many(
-        &pack_lookup_inputs(key, cht_b0, cht_b1, dummy_index),
-        delta,
-        net,
-        state,
-    )?;
+    let packed_inputs = pack_lookup_inputs(key, cht_b0, cht_b1, dummy_index);
 
     match state.id {
         PartyID::ID0 => {
-            let mut evaluator = Rep3Evaluator::new(net);
-            evaluator.receive_circuit()?;
+            let x01 = receive_input_bundle(net, PartyID::ID1)?;
+            let x2 = receive_input_bundle(net, PartyID::ID2)?;
+            let mut evaluator = StreamingRep3Evaluator::new(net);
             let output = evaluate_lookup_circuit(&mut evaluator, &x01, &x2)
                 .map_err(|err| eyre::eyre!("CHT lookup garbled evaluation failed: {err:?}"))?;
+            evaluator.receive_hash()?;
             y2b(output, net, state)
         }
         PartyID::ID1 | PartyID::ID2 => {
-            let mut garbler =
-                Rep3Garbler::new_with_delta(net, state, delta.expect("delta should be present"));
+            let mut garbler = StreamingRep3Garbler::new_with_delta(
+                net,
+                state,
+                delta.expect("delta should be present"),
+            );
+            let [x01, x2] = garble_lookup_inputs(&packed_inputs, net, state.id, &mut garbler)?;
             let output = evaluate_lookup_circuit(&mut garbler, &x01, &x2)
                 .map_err(|err| eyre::eyre!("CHT lookup garbling failed: {err:?}"))?;
-            garbler.send_circuit()?;
+            garbler.send_hash()?;
             y2b(output, net, state)
         }
     }
+}
+
+fn garble_lookup_inputs<N: Network>(
+    inputs: &[BlockShare; 3],
+    net: &N,
+    id: PartyID,
+    garbler: &mut StreamingRep3Garbler<N>,
+) -> eyre::Result<[BinaryBundle<WireMod2>; 2]> {
+    let mut x01 = Vec::with_capacity(LOOKUP_INPUT_BITS);
+    let mut x2 = Vec::with_capacity(LOOKUP_INPUT_BITS);
+    let mut evaluator_inputs = Vec::with_capacity(LOOKUP_INPUT_BITS);
+
+    for input in inputs {
+        let owns_input = id == PartyID::ID1;
+        encode_input(
+            if owns_input { input.a.0 ^ input.b.0 } else { 0 },
+            owns_input,
+            garbler,
+            &mut x01,
+            &mut evaluator_inputs,
+        );
+    }
+    for input in inputs {
+        let owns_input = id == PartyID::ID2;
+        encode_input(
+            if owns_input { input.a.0 } else { 0 },
+            owns_input,
+            garbler,
+            &mut x2,
+            &mut evaluator_inputs,
+        );
+    }
+
+    net.send_many(PartyID::ID0, &evaluator_inputs)?;
+    Ok([BinaryBundle::new(x01), BinaryBundle::new(x2)])
+}
+
+fn encode_input<N: Network>(
+    value: u128,
+    send_to_evaluator: bool,
+    garbler: &mut StreamingRep3Garbler<N>,
+    garbler_wires: &mut Vec<WireMod2>,
+    evaluator_inputs: &mut Vec<[u8; 16]>,
+) {
+    for bit in 0..128 {
+        let (zero, evaluator) = garbler.encode_wire(((value >> bit) & 1) as u16);
+        garbler_wires.push(zero);
+        if send_to_evaluator {
+            evaluator_inputs.push(wire_to_bytes(&evaluator));
+        }
+    }
+}
+
+fn receive_input_bundle<N: Network>(
+    net: &N,
+    from: PartyID,
+) -> eyre::Result<BinaryBundle<WireMod2>> {
+    let labels: Vec<[u8; 16]> = net.recv_many(from)?;
+    if labels.len() != LOOKUP_INPUT_BITS {
+        eyre::bail!("invalid CHT lookup input label count");
+    }
+    Ok(BinaryBundle::new(
+        labels.into_iter().map(bytes_to_wire).collect(),
+    ))
+}
+
+fn wire_to_bytes(wire: &WireMod2) -> [u8; 16] {
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(wire.as_block().as_ref());
+    bytes
+}
+
+fn bytes_to_wire(bytes: [u8; 16]) -> WireMod2 {
+    let mut block = Block::default();
+    block.as_mut().copy_from_slice(&bytes);
+    WireMod2::from_block(block, 2)
 }
 
 fn pack_lookup_inputs(

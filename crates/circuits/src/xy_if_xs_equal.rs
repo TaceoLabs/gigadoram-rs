@@ -4,11 +4,23 @@ use primitives::{
     XShare, YShare, bit_to_binary_mask, cmux_many_custom, is_zero_many, types::BitShare,
 };
 
-pub fn xy_if_xs_equal_circuit(
+use crate::network::CircuitNetwork;
+
+pub fn xy_if_xs_equal_circuit<N: CircuitNetwork>(
     x: &[XShare],
     x_query: &[XShare],
     y: &[YShare],
-    net: &impl Network,
+    net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<(Vec<XShare>, Vec<YShare>, Vec<BitShare>)> {
+    net.evaluate_xy_if_xs_equal(x, x_query, y, state)
+}
+
+pub(crate) fn xy_if_xs_equal_circuit_serial<N: Network>(
+    x: &[XShare],
+    x_query: &[XShare],
+    y: &[YShare],
+    net: &N,
     state: &mut Rep3State,
 ) -> eyre::Result<(Vec<XShare>, Vec<YShare>, Vec<BitShare>)> {
     assert_eq!(x.len(), x_query.len());

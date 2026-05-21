@@ -2,6 +2,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+use circuits::network::CircuitNetwork;
 use clap::Parser;
 use eyre::{Result, WrapErr, ensure, eyre};
 use mpc_core::protocols::rep3::id::PartyID;
@@ -127,6 +128,7 @@ impl Network for FixedLatencyNetwork {
 }
 
 impl OhTablePrfNetwork for FixedLatencyNetwork {}
+impl CircuitNetwork for FixedLatencyNetwork {}
 
 fn wait_fixed_latency(duration: Duration) {
     if duration.is_zero() {
