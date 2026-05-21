@@ -6,6 +6,7 @@ use clap::Parser;
 use eyre::{Result, WrapErr, ensure, eyre};
 use mpc_core::protocols::rep3::id::PartyID;
 use mpc_net::{ConnectionStats, Network, local::LocalNetwork};
+use structures::OhTablePrfNetwork;
 
 use common::{
     DoramBenchmarkConfig, doram_config, generate_queries, print_report, print_startup_config,
@@ -124,6 +125,8 @@ impl Network for FixedLatencyNetwork {
         self.inner.get_connection_stats()
     }
 }
+
+impl OhTablePrfNetwork for FixedLatencyNetwork {}
 
 fn wait_fixed_latency(duration: Duration) {
     if duration.is_zero() {

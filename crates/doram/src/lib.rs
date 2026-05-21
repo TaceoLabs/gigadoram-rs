@@ -15,12 +15,13 @@ use mpc_core::protocols::{
         ring::{bit::Bit, ring_impl::RingElement},
     },
 };
-use mpc_net::Network;
 use primitives::{
     ArrayShuffler, BitShare, Block, BlockShare, X, XShare, Y, YShare, bit_to_binary_mask,
     open_many, promote_public, upcast_x_to_block,
 };
-use structures::{OHTableParams, OhTable, OhTableQueryTiming, OhTableTiming, SpeedCache};
+use structures::{
+    OHTableParams, OhTable, OhTablePrfNetwork, OhTableQueryTiming, OhTableTiming, SpeedCache,
+};
 
 pub const EMPIRICAL_CHT_STASH_SIZE: usize = 8;
 pub const PROVEN_CHT_STASH_SIZE: usize = 50;
@@ -180,7 +181,7 @@ impl GigaDoram {
         }
     }
 
-    pub fn new_with_initial_bottom_level<N: Network>(
+    pub fn new_with_initial_bottom_level<N: OhTablePrfNetwork>(
         config: GigaDoramConfig,
         ys: Vec<YShare>,
         net: &N,
@@ -220,7 +221,7 @@ impl GigaDoram {
 
     // Only for tests: calling this leaks that the access pattern is a read.
     #[doc(hidden)]
-    pub fn read<N: Network>(
+    pub fn read<N: OhTablePrfNetwork>(
         &mut self,
         query_x: XShare,
         net: &N,
@@ -238,7 +239,7 @@ impl GigaDoram {
 
     // Only for tests: calling this leaks that the access pattern is a write.
     #[doc(hidden)]
-    pub fn write<N: Network>(
+    pub fn write<N: OhTablePrfNetwork>(
         &mut self,
         query_x: XShare,
         query_y: YShare,
@@ -263,7 +264,7 @@ impl GigaDoram {
         self.speed_cache.len()
     }
 
-    pub fn read_and_maybe_write<N: Network>(
+    pub fn read_and_maybe_write<N: OhTablePrfNetwork>(
         &mut self,
         query_x: XShare,
         query_y: YShare,
@@ -341,7 +342,7 @@ impl GigaDoram {
         Ok(self.clear_alibi_bits(y_accum))
     }
 
-    fn rebuild_inner<N: Network>(
+    fn rebuild_inner<N: OhTablePrfNetwork>(
         &mut self,
         net: &N,
         state: &mut Rep3State,
@@ -443,7 +444,7 @@ impl GigaDoram {
         (rebuild_to, need_to_extract_from_rebuild_to)
     }
 
-    fn new_ohtable_of_level_inner<N: Network>(
+    fn new_ohtable_of_level_inner<N: OhTablePrfNetwork>(
         &mut self,
         level: usize,
         xs: Vec<XShare>,
@@ -548,7 +549,7 @@ impl GigaDoram {
         label as X
     }
 
-    fn relabel_dummies<N: Network>(
+    fn relabel_dummies<N: OhTablePrfNetwork>(
         &self,
         xs: &mut [XShare],
         net: &N,
@@ -571,7 +572,7 @@ impl GigaDoram {
         Ok(())
     }
 
-    fn cleanse_bottom_level_inner<N: Network>(
+    fn cleanse_bottom_level_inner<N: OhTablePrfNetwork>(
         &self,
         mut xs: Vec<XShare>,
         mut ys: Vec<YShare>,
@@ -639,7 +640,7 @@ impl GigaDoram {
             .collect()
     }
 
-    fn evaluate_prf_tags<N: Network>(
+    fn evaluate_prf_tags<N: OhTablePrfNetwork>(
         &self,
         levels: &[usize],
         input: XShare,

@@ -11,11 +11,12 @@ use mpc_core::protocols::{
     rep3::{Rep3State, conversion::A2BType, id::PartyID},
     rep3_ring::{binary, ring::bit::Bit},
 };
-use mpc_net::{Network, tcp::NetworkConfig};
+use mpc_net::tcp::NetworkConfig;
 use primitives::{X, Y, promote_public};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use serde::Deserialize;
+use structures::OhTablePrfNetwork;
 
 #[derive(Clone, Debug, Args)]
 pub struct DoramBenchmarkConfig {
@@ -175,7 +176,7 @@ pub fn print_startup_config(
     );
 }
 
-pub fn run_party<N: Network>(
+pub fn run_party<N: OhTablePrfNetwork>(
     config: &DoramBenchmarkConfig,
     doram_config: GigaDoramConfig,
     queries: &[BenchmarkQuery],

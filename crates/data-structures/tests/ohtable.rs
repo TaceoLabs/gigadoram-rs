@@ -1,5 +1,5 @@
 use circuits::lowmc::ROUND_KEYS;
-use data_structures::{OHTableParams, OhTable, cht};
+use data_structures::{OHTableParams, OhTable, OhTablePrfNetwork, cht};
 use mpc_core::protocols::{
     rep3::{Rep3State, conversion::A2BType, id::PartyID},
     rep3_ring::{
@@ -396,7 +396,7 @@ fn setup(num_dummies: usize) -> TestData {
     }
 }
 
-fn build_table<N: Network>(
+fn build_table<N: Network + OhTablePrfNetwork>(
     num_dummies: usize,
     clear_key: &[Block],
     net: &N,
