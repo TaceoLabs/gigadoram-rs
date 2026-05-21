@@ -2,18 +2,7 @@ use mpc_core::protocols::{rep3::Rep3State, rep3_ring::binary};
 use mpc_net::Network;
 use primitives::{BitShare, X, XShare, is_zero_many};
 
-use crate::network::CircuitNetwork;
-
-pub fn dummy_check_circuit<N: CircuitNetwork>(
-    xs: &[XShare],
-    log_n: usize,
-    net: &N,
-    state: &mut Rep3State,
-) -> eyre::Result<Vec<BitShare>> {
-    net.evaluate_dummy_check(xs, log_n, state)
-}
-
-pub(crate) fn dummy_check_circuit_serial<N: Network>(
+pub fn dummy_check_circuit<N: Network>(
     xs: &[XShare],
     log_n: usize,
     net: &N,

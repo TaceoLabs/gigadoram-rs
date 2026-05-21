@@ -1,7 +1,8 @@
 use std::ops::BitXor;
 
-use circuits::{network::CircuitNetwork, xy_if_xs_equal::xy_if_xs_equal_circuit};
+use circuits::xy_if_xs_equal::xy_if_xs_equal_circuit;
 use mpc_core::protocols::rep3::Rep3State;
+use mpc_net::Network;
 use primitives::{XShare, YShare, types::BitShare};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,7 +42,7 @@ impl SpeedCache {
     pub fn query(
         &mut self,
         query_addr: XShare,
-        net: &impl CircuitNetwork,
+        net: &impl Network,
         state: &mut Rep3State,
     ) -> eyre::Result<(YShare, BitShare)> {
         if self.num_stored == 0 {

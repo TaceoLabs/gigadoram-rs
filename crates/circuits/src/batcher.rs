@@ -9,12 +9,10 @@ use mpc_core::protocols::{
 use mpc_net::Network;
 use primitives::{BitShare, Block, BlockShare, X, XShare, Y, YShare, bit_to_binary_mask};
 
-use crate::network::CircuitNetwork;
-
 pub struct Batcher;
 
 impl Batcher {
-    pub fn sort_dummies_to_end<N: CircuitNetwork>(
+    pub fn sort_dummies_to_end<N: Network>(
         dummy_flags: &mut [BitShare],
         xs: &mut [XShare],
         ys: &mut [YShare],
@@ -28,7 +26,7 @@ impl Batcher {
         Self::sort(dummy_flags, xs, ys, net, state)
     }
 
-    pub fn sort<N: CircuitNetwork>(
+    pub fn sort<N: Network>(
         dummy_flags: &mut [BitShare],
         xs: &mut [XShare],
         ys: &mut [YShare],
@@ -43,7 +41,7 @@ impl Batcher {
     }
 
     // Sort consecutive chunks of length `chunk_size`, as in the C++ batcher.
-    fn sort_internal<N: CircuitNetwork>(
+    fn sort_internal<N: Network>(
         dummy_flags: &mut [BitShare],
         xs: &mut [XShare],
         ys: &mut [YShare],
@@ -63,7 +61,7 @@ impl Batcher {
         Self::butterfly(dummy_flags, xs, ys, chunk_size, net, state)
     }
 
-    fn butterfly<N: CircuitNetwork>(
+    fn butterfly<N: Network>(
         dummy_flags: &mut [BitShare],
         xs: &mut [XShare],
         ys: &mut [YShare],
@@ -79,7 +77,7 @@ impl Batcher {
         Self::butterfly_body(dummy_flags, xs, ys, chunk_size / 2, net, state)
     }
 
-    fn butterfly_head<N: CircuitNetwork>(
+    fn butterfly_head<N: Network>(
         dummy_flags: &mut [BitShare],
         xs: &mut [XShare],
         ys: &mut [YShare],
@@ -90,7 +88,7 @@ impl Batcher {
         Self::swap_pairs(dummy_flags, xs, ys, chunk_size, true, net, state)
     }
 
-    fn butterfly_body<N: CircuitNetwork>(
+    fn butterfly_body<N: Network>(
         dummy_flags: &mut [BitShare],
         xs: &mut [XShare],
         ys: &mut [YShare],
@@ -106,7 +104,7 @@ impl Batcher {
         Self::butterfly_body(dummy_flags, xs, ys, chunk_size / 2, net, state)
     }
 
-    fn swap_pairs<N: CircuitNetwork>(
+    fn swap_pairs<N: Network>(
         dummy_flags: &mut [BitShare],
         xs: &mut [XShare],
         ys: &mut [YShare],
@@ -142,76 +140,53 @@ impl Batcher {
             chunk_start += chunk_size;
         }
 
-        net.compare_swap_dummy_pairs(&pairs, dummy_flags, xs, ys, state)
+        Self::compare_swap_dummy_pairs(&pairs, dummy_flags, xs, ys, net, state)
     }
 
     fn least_power_of_2_greater_than_or_equal_to(len: usize) -> usize {
         assert!(len > 0, "batcher sort does not support empty arrays");
         len.next_power_of_two()
     }
-}
+    fn compare_swap_dummy_pairs<N: Network>(
+        pairs: &[(usize, usize)],
+        dummy_flags: &mut [BitShare],
+        xs: &mut [XShare],
+        ys: &mut [YShare],
+        net: &N,
+        state: &mut Rep3State,
+    ) -> Result<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
 
-pub(crate) fn compare_swap_dummy_pairs_serial<N: Network>(
-    pairs: &[(usize, usize)],
-    dummy_flags: &mut [BitShare],
-    xs: &mut [XShare],
-    ys: &mut [YShare],
-    net: &N,
-    state: &mut Rep3State,
-) -> Result<()> {
-    let selected_row_deltas =
-        compare_swap_dummy_pair_deltas(pairs, dummy_flags, xs, ys, net, state)?;
-    apply_compare_swap_dummy_pair_deltas(pairs, &selected_row_deltas, dummy_flags, xs, ys);
-    Ok(())
-}
+        let row_masks = pairs
+            .iter()
+            .map(|&(left, _)| bit_to_binary_mask(&dummy_flags[left]))
+            .collect::<Vec<BlockShare>>();
+        let row_deltas = pairs
+            .iter()
+            .map(|&(left, right)| {
+                pack_row(
+                    binary::xor(&dummy_flags[left], &dummy_flags[right]),
+                    xs[left] ^ xs[right],
+                    ys[left] ^ ys[right],
+                )
+            })
+            .collect::<Vec<_>>();
 
-pub fn compare_swap_dummy_pair_deltas<N: Network>(
-    pairs: &[(usize, usize)],
-    dummy_flags: &[BitShare],
-    xs: &[XShare],
-    ys: &[YShare],
-    net: &N,
-    state: &mut Rep3State,
-) -> Result<Vec<BlockShare>> {
-    if pairs.is_empty() {
-        return Ok(Vec::new());
-    }
+        let selected_row_deltas = binary::and_vec(&row_masks, &row_deltas, net, state)?;
 
-    let row_masks = pairs
-        .iter()
-        .map(|&(left, _)| bit_to_binary_mask(&dummy_flags[left]))
-        .collect::<Vec<BlockShare>>();
-    let row_deltas = pairs
-        .iter()
-        .map(|&(left, right)| {
-            pack_row(
-                binary::xor(&dummy_flags[left], &dummy_flags[right]),
-                xs[left] ^ xs[right],
-                ys[left] ^ ys[right],
-            )
-        })
-        .collect::<Vec<_>>();
+        for (index, &(left, right)) in pairs.iter().enumerate() {
+            let (flag_delta, x_delta, y_delta) = unpack_row(selected_row_deltas[index]);
+            xs[left] ^= x_delta;
+            xs[right] ^= x_delta;
+            ys[left] ^= y_delta;
+            ys[right] ^= y_delta;
+            dummy_flags[left] ^= flag_delta;
+            dummy_flags[right] ^= flag_delta;
+        }
 
-    binary::and_vec(&row_masks, &row_deltas, net, state)
-}
-
-pub fn apply_compare_swap_dummy_pair_deltas(
-    pairs: &[(usize, usize)],
-    selected_row_deltas: &[BlockShare],
-    dummy_flags: &mut [BitShare],
-    xs: &mut [XShare],
-    ys: &mut [YShare],
-) {
-    debug_assert_eq!(pairs.len(), selected_row_deltas.len());
-
-    for (index, &(left, right)) in pairs.iter().enumerate() {
-        let (flag_delta, x_delta, y_delta) = unpack_row(selected_row_deltas[index]);
-        xs[left] ^= x_delta;
-        xs[right] ^= x_delta;
-        ys[left] ^= y_delta;
-        ys[right] ^= y_delta;
-        dummy_flags[left] ^= flag_delta;
-        dummy_flags[right] ^= flag_delta;
+        Ok(())
     }
 }
 

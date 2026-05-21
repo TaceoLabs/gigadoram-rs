@@ -1,9 +1,6 @@
 use std::time::{Duration, Instant};
 
-use circuits::{
-    lowmc::{self, ROUND_KEYS},
-    network::CircuitNetwork,
-};
+use circuits::lowmc::{self, ROUND_KEYS};
 use eyre::{Result, ensure};
 use mpc_core::protocols::{
     rep3::{Rep3State, id::PartyID, network::Rep3NetworkExt},
@@ -28,7 +25,7 @@ pub type ObliviousHashTable = OhTable;
 
 pub const BUILDER_ID: PartyID = PartyID::ID0;
 
-pub trait OhTablePrfNetwork: CircuitNetwork + Sized {
+pub trait OhTablePrfNetwork: Network + Sized {
     fn evaluate_repeated_lowmc(
         &self,
         expanded_key: &[BlockShare],
