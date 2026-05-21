@@ -1,6 +1,6 @@
 use crate::{from_2_shares, permutation::LocalPermutation};
 use mpc_core::protocols::{
-    rep3::{Rep3State, id::PartyID},
+    rep3::{Rep3State, id::PartyID, network::Rep3NetworkExt},
     rep3_ring::{
         Rep3RingShare, binary,
         ring::{int_ring::IntRing2k, ring_impl::RingElement},
@@ -79,6 +79,73 @@ impl ArrayShuffler {
         self.forward_step(p, rep_array, net, state)
     }
 
+    pub fn forward_known_to_p_and_next_many<T, N>(
+        &self,
+        p: PartyID,
+        rep_arrays: &mut [&mut [Rep3RingShare<T>]],
+        net: &N,
+        state: &mut Rep3State,
+    ) -> eyre::Result<()>
+    where
+        T: IntRing2k,
+        Standard: Distribution<T>,
+        N: Network,
+    {
+        for rep_array in rep_arrays.iter() {
+            assert_eq!(rep_array.len(), self.len);
+        }
+
+        let total_len = rep_arrays.iter().map(|rep_array| rep_array.len()).sum();
+        let mut local_components = Vec::with_capacity(total_len);
+        for rep_array in rep_arrays.iter_mut() {
+            let mut two_shares = reshare_3_to_2_for(rep_array, p, p.next(), state);
+            self.shuffle_forward_step(p, &mut two_shares, state);
+            append_from_2_share_components(&mut local_components, two_shares, p, p.next(), state);
+        }
+
+        let next_components = net.reshare_many(&local_components)?;
+        let mut offset = 0;
+        for rep_array in rep_arrays.iter_mut() {
+            write_reshared_components(rep_array, &local_components, &next_components, &mut offset);
+        }
+        debug_assert_eq!(offset, local_components.len());
+        Ok(())
+    }
+
+    pub fn forward_many_and_inverse_many<T, N>(
+        &self,
+        forward_arrays: &mut [&mut [Rep3RingShare<T>]],
+        inverse_arrays: &mut [&mut [Rep3RingShare<T>]],
+        net: &N,
+        state: &mut Rep3State,
+    ) -> eyre::Result<()>
+    where
+        T: IntRing2k,
+        Standard: Distribution<T>,
+        N: Network,
+    {
+        for rep_array in forward_arrays.iter().chain(inverse_arrays.iter()) {
+            assert_eq!(rep_array.len(), self.len);
+        }
+
+        for (forward_p, inverse_p) in [
+            (PartyID::ID0, PartyID::ID2),
+            (PartyID::ID1, PartyID::ID1),
+            (PartyID::ID2, PartyID::ID0),
+        ] {
+            self.forward_inverse_step_many(
+                forward_p,
+                inverse_p,
+                forward_arrays,
+                inverse_arrays,
+                net,
+                state,
+            )?;
+        }
+
+        Ok(())
+    }
+
     pub fn inverse<T, N>(
         &self,
         rep_array: &mut [Rep3RingShare<T>],
@@ -136,6 +203,63 @@ impl ArrayShuffler {
         Ok(())
     }
 
+    fn forward_inverse_step_many<T, N>(
+        &self,
+        forward_p: PartyID,
+        inverse_p: PartyID,
+        forward_arrays: &mut [&mut [Rep3RingShare<T>]],
+        inverse_arrays: &mut [&mut [Rep3RingShare<T>]],
+        net: &N,
+        state: &mut Rep3State,
+    ) -> eyre::Result<()>
+    where
+        T: IntRing2k,
+        Standard: Distribution<T>,
+        N: Network,
+    {
+        let total_len = forward_arrays
+            .iter()
+            .chain(inverse_arrays.iter())
+            .map(|rep_array| rep_array.len())
+            .sum();
+        let mut local_components = Vec::with_capacity(total_len);
+
+        for rep_array in forward_arrays.iter_mut() {
+            let mut two_shares = reshare_3_to_2_for(rep_array, forward_p, forward_p.next(), state);
+            self.shuffle_forward_step(forward_p, &mut two_shares, state);
+            append_from_2_share_components(
+                &mut local_components,
+                two_shares,
+                forward_p,
+                forward_p.next(),
+                state,
+            );
+        }
+
+        for rep_array in inverse_arrays.iter_mut() {
+            let mut two_shares = reshare_3_to_2_for(rep_array, inverse_p, inverse_p.next(), state);
+            self.shuffle_inverse_step(inverse_p, &mut two_shares, state);
+            append_from_2_share_components(
+                &mut local_components,
+                two_shares,
+                inverse_p,
+                inverse_p.next(),
+                state,
+            );
+        }
+
+        let next_components = net.reshare_many(&local_components)?;
+        let mut offset = 0;
+        for rep_array in forward_arrays.iter_mut() {
+            write_reshared_components(rep_array, &local_components, &next_components, &mut offset);
+        }
+        for rep_array in inverse_arrays.iter_mut() {
+            write_reshared_components(rep_array, &local_components, &next_components, &mut offset);
+        }
+        debug_assert_eq!(offset, local_components.len());
+        Ok(())
+    }
+
     fn inverse_step<T, N>(
         &self,
         p: PartyID,
@@ -157,6 +281,69 @@ impl ArrayShuffler {
         let reshared = from_2_shares(two_shares, p, p.next(), net, state)?;
         rep_array.clone_from_slice(&reshared);
         Ok(())
+    }
+
+    fn shuffle_forward_step<T: IntRing2k>(
+        &self,
+        p: PartyID,
+        two_shares: &mut [RingElement<T>],
+        state: &Rep3State,
+    ) {
+        if state.id == p {
+            self.next_shared_perm.shuffle(two_shares);
+        } else if state.id == p.next() {
+            self.prev_shared_perm.shuffle(two_shares);
+        }
+    }
+
+    fn shuffle_inverse_step<T: IntRing2k>(
+        &self,
+        p: PartyID,
+        two_shares: &mut [RingElement<T>],
+        state: &Rep3State,
+    ) {
+        if state.id == p {
+            self.next_shared_perm.inverse_shuffle(two_shares);
+        } else if state.id == p.next() {
+            self.prev_shared_perm.inverse_shuffle(two_shares);
+        }
+    }
+}
+
+fn append_from_2_share_components<T>(
+    local_components: &mut Vec<RingElement<T>>,
+    local_shares: Vec<RingElement<T>>,
+    from_1: PartyID,
+    from_2: PartyID,
+    state: &mut Rep3State,
+) where
+    T: IntRing2k,
+    Standard: Distribution<T>,
+{
+    assert_ne!(from_1, from_2);
+    assert!(from_1.next() == from_2 || from_1.prev() == from_2);
+
+    local_components.extend(local_shares.into_iter().map(|local_share| {
+        let (mut zero_share, other_zero_share) =
+            state.rngs.rand.random_elements::<RingElement<T>>();
+        zero_share ^= other_zero_share;
+        if state.id == from_1 || state.id == from_2 {
+            zero_share ^ local_share
+        } else {
+            zero_share
+        }
+    }));
+}
+
+fn write_reshared_components<T: IntRing2k>(
+    rep_array: &mut [Rep3RingShare<T>],
+    local_components: &[RingElement<T>],
+    next_components: &[RingElement<T>],
+    offset: &mut usize,
+) {
+    for share in rep_array {
+        *share = Rep3RingShare::new_ring(local_components[*offset], next_components[*offset]);
+        *offset += 1;
     }
 }
 
