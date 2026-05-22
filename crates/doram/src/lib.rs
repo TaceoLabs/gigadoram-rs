@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use circuits::{
     batcher::Batcher,
     dummy_check::dummy_check_circuit,
-    lowmc::{self, ROUND_KEYS},
+    lowmc2::{self as lowmc, ROUND_KEYS},
     replace_if_dummy::replace_if_dummy_circuit,
 };
 use eyre::{Result, ensure};

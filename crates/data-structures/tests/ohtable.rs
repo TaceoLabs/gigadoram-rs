@@ -1,4 +1,4 @@
-use circuits::lowmc::ROUND_KEYS;
+use circuits::lowmc2::ROUND_KEYS;
 use data_structures::{OHTableParams, OhTable, cht};
 use mpc_core::protocols::{
     rep3::{Rep3State, conversion::A2BType, id::PartyID},

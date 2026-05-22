@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use circuits::lowmc::{self, ROUND_KEYS};
+use circuits::lowmc2::{self as lowmc, ROUND_KEYS};
 use eyre::{Result, ensure};
 use mpc_core::protocols::{
     rep3::{Rep3State, id::PartyID, network::Rep3NetworkExt},
