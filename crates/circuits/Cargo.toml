@@ -1,5 +1,5 @@
 [package]
-name = "core"
+name = "circuits"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,9 @@ publish.workspace = true
 readme.workspace = true
 
 [dependencies]
+eyre.workspace = true
+fancy-garbling = { git = "https://github.com/GaloisInc/swanky", rev = "5ff648457218b74da9d8323b7ca47166ff5be4b3" }
 mpc-core.workspace = true
 mpc-net.workspace = true
 primitives.workspace = true
-structures.workspace = true
+scuttlebutt = { git = "https://github.com/GaloisInc/swanky", rev = "5ff648457218b74da9d8323b7ca47166ff5be4b3" }
