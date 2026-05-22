@@ -4,7 +4,6 @@ pub mod speed_cache;
 
 pub use cht::*;
 pub use ohtable::{
-    OHTableParams, ObliviousHashTable, OhTable, OhTableParams, OhTablePrfNetwork,
-    OhTableQueryTiming, OhTableTiming,
+    OHTableParams, ObliviousHashTable, OhTable, OhTableParams, OhTableQueryTiming, OhTableTiming,
 };
 pub use speed_cache::SpeedCache;

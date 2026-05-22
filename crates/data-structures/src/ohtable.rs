@@ -11,7 +11,7 @@ use mpc_core::protocols::{
         ring::ring_impl::RingElement,
     },
 };
-use mpc_net::{Network, local::LocalNetwork, tcp::TcpNetwork};
+use mpc_net::Network;
 use primitives::{
     ArrayShuffler, Block, BlockShare, LocalPermutation, XShare, YShare, bit_to_binary_mask,
     reshare_3_to_2, reveal_to_party,
@@ -24,20 +24,6 @@ pub type OhTableParams = OHTableParams;
 pub type ObliviousHashTable = OhTable;
 
 pub const BUILDER_ID: PartyID = PartyID::ID0;
-
-pub trait OhTablePrfNetwork: Network + Sized {
-    fn evaluate_repeated_lowmc(
-        &self,
-        expanded_key: &[BlockShare],
-        inputs: &[BlockShare],
-        state: &mut Rep3State,
-    ) -> eyre::Result<Vec<BlockShare>> {
-        lowmc::encrypt_many_with_repeated_key(expanded_key, inputs, self, state)
-    }
-}
-
-impl OhTablePrfNetwork for LocalNetwork {}
-impl OhTablePrfNetwork for TcpNetwork {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OHTableParams {
@@ -136,7 +122,7 @@ impl OhTableQueryTiming {
 }
 
 impl OhTable {
-    pub fn new<N: OhTablePrfNetwork>(
+    pub fn new<N: Network>(
         params: OHTableParams,
         xs: Vec<XShare>,
         ys: Vec<YShare>,
@@ -175,7 +161,7 @@ impl OhTable {
         Ok(table)
     }
 
-    pub fn build<N: OhTablePrfNetwork>(
+    pub fn build<N: Network>(
         &mut self,
         xs: Vec<XShare>,
         ys: Vec<YShare>,
@@ -418,7 +404,7 @@ impl OhTable {
         }
     }
 
-    fn evaluate_prf_tags<N: OhTablePrfNetwork>(
+    fn evaluate_prf_tags<N: Network>(
         &self,
         inputs: &[BlockShare],
         net: &N,
@@ -427,7 +413,7 @@ impl OhTable {
         assert_eq!(inputs.len(), self.params.num_elements);
         assert_eq!(self.prf_key_size_blocks(), ROUND_KEYS);
 
-        net.evaluate_repeated_lowmc(&self.key, inputs, state)
+        lowmc::encrypt_many_with_repeated_key(&self.key, inputs, net, state)
     }
 
     fn shuffle_builder_order<N: Network>(
