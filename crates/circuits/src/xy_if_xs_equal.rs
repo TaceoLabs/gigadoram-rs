@@ -2,10 +2,11 @@
 //! For each row, it checks whether `x == x_query` and returns masked `x`, masked
 //! `y`, and a found bit for the matching rows.
 
-use mpc_core::protocols::{rep3::Rep3State, rep3_ring::casts::downcast};
+use mpc_core::protocols::rep3::Rep3State;
 use mpc_net::Network;
 use primitives::{
-    XShare, YShare, bit_to_binary_mask, cmux_many_custom, is_zero_many, types::BitShare,
+    XShare, YShare, bit_to_binary_mask, cmux_many_custom, downcast_many, is_zero_many,
+    types::BitShare,
 };
 
 pub fn xy_if_xs_equal_circuit(
@@ -32,11 +33,7 @@ pub fn xy_if_xs_equal_circuit(
 
     let selected = cmux_many_custom(&found_y, x, y, net, state)?;
 
-    let x_if_xs_equal = selected[..x.len()]
-        .iter()
-        .copied()
-        .map(downcast)
-        .collect::<Vec<XShare>>();
+    let x_if_xs_equal = downcast_many(selected[..x.len()].to_vec());
     let y_if_xs_equal = selected[x.len()..].to_vec();
 
     Ok((x_if_xs_equal, y_if_xs_equal, found))
