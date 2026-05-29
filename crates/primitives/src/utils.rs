@@ -3,11 +3,10 @@ use mpc_core::protocols::{
     rep3_ring::{
         Rep3RingShare,
         arithmetic::RingShare,
-        binary::and_vec,
         ring::{bit::Bit, int_ring::IntRing2k, ring_impl::RingElement},
     },
 };
-use mpc_net::{Network, local::LocalNetwork};
+use mpc_net::{Network, join, local::LocalNetwork};
 use num_traits::AsPrimitive;
 use rand::{
     Rng,
@@ -237,5 +236,45 @@ pub fn cmux_many_custom<N: Network>(
     values.extend(x.iter().copied().map(upcast_x_to_y));
     values.extend_from_slice(y);
 
-    and_vec(&masks, &values, net, state)
+    and_vec_y_raw(&masks, &values, net, state)
+}
+
+fn and_vec_y_raw<N: Network>(
+    lhs: &[YShare],
+    rhs: &[YShare],
+    net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<Vec<YShare>> {
+    let local = lhs
+        .iter()
+        .zip(rhs)
+        .map(|(lhs, rhs)| {
+            let (mut mask, mask_b) = state.rngs.rand.random_elements::<RingElement<u64>>();
+            mask ^= mask_b;
+            (lhs & rhs) ^ mask
+        })
+        .collect::<Vec<_>>();
+
+    let mut payload = Vec::with_capacity(8 * local.len());
+    for value in &local {
+        payload.extend_from_slice(&value.0.to_le_bytes());
+    }
+
+    let id = PartyID::try_from(net.id())?;
+    let (send, recv) = join(
+        || net.send(id.next().into(), &payload),
+        || net.recv(id.prev().into()),
+    );
+    send?;
+    let recv = recv?;
+    eyre::ensure!(
+        recv.len() == payload.len(),
+        "u64 AND reshare length mismatch"
+    );
+
+    Ok(local
+        .into_iter()
+        .zip(recv.chunks_exact(8))
+        .map(|(a, b)| YShare::new_ring(a, RingElement(u64::from_le_bytes(b.try_into().unwrap()))))
+        .collect())
 }

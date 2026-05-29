@@ -7,12 +7,9 @@ use std::{
 use clap::{ArgAction, Args};
 use doram::{GigaDoram, GigaDoramConfig, GigaDoramTiming};
 use eyre::{Result, ensure};
-use mpc_core::protocols::{
-    rep3::{Rep3State, conversion::A2BType, id::PartyID},
-    rep3_ring::binary,
-};
+use mpc_core::protocols::rep3::{Rep3State, conversion::A2BType, id::PartyID};
 use mpc_net::{Network, tcp::NetworkConfig};
-use primitives::{X, Y, promote_public};
+use primitives::{X, Y, YShare, open_many, promote_public};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -50,6 +47,7 @@ pub struct PartyReport {
     pub setup_time: Duration,
     pub total_time: Duration,
     pub timing: GigaDoramTiming,
+    pub result_open_time: Duration,
     pub bytes_sent: usize,
     pub bytes_received: usize,
 }
@@ -167,6 +165,9 @@ pub fn run_party<N: Network>(
     let mut state = Rep3State::new(&net, A2BType::Direct)?;
     let mut timing = GigaDoramTiming::default();
     let mut oracle = HashMap::<X, Y>::new();
+    let mut result_open_time = Duration::ZERO;
+    let mut results = Vec::<YShare>::with_capacity(queries.len());
+    let mut expected_results = Vec::<(X, Y)>::with_capacity(queries.len());
 
     let total_start = Instant::now();
     let setup_start = Instant::now();
@@ -195,7 +196,6 @@ pub fn run_party<N: Network>(
         };
         let expected = oracle.get(&query.x).copied().unwrap_or(initial_value);
         let x = promote_public(state.id, query.x);
-
         let result = if query.is_write {
             let y = promote_public(state.id, query.y);
             doram.write(x, y, &net, &mut state, Some(&mut timing))?
@@ -203,19 +203,26 @@ pub fn run_party<N: Network>(
             doram.read(x, &net, &mut state, Some(&mut timing))?
         };
 
-        let opened = binary::open(&result, &net)?.0;
-        ensure!(
-            opened == expected,
-            "party {:?}: query for x={} returned {}, expected {}",
-            state.id,
-            query.x,
-            opened,
-            expected
-        );
+        results.push(result);
+        expected_results.push((query.x, expected));
 
         if query.is_write {
             oracle.insert(query.x, query.y);
         }
+    }
+
+    let open_start = Instant::now();
+    let opened = open_many(&results, &net);
+    result_open_time += open_start.elapsed();
+    for (opened, (x, expected)) in opened.into_iter().zip(expected_results) {
+        ensure!(
+            opened == expected,
+            "party {:?}: query for x={} returned {}, expected {}",
+            state.id,
+            x,
+            opened,
+            expected
+        );
     }
 
     let total_time = total_start.elapsed();
@@ -231,6 +238,7 @@ pub fn run_party<N: Network>(
         setup_time,
         total_time,
         timing,
+        result_open_time,
         bytes_sent,
         bytes_received,
     })
@@ -251,8 +259,14 @@ pub fn print_report(config: &DoramBenchmarkConfig, report: &PartyReport) {
         .enumerate()
         .filter_map(|(level, duration)| (level != bottom_level).then_some(*duration))
         .sum::<Duration>();
+    let build_total = bottom_build + other_builds;
     let queries_per_sec = config.num_queries as f64 / report.total_time.as_secs_f64();
     let bytes_total = report.bytes_sent + report.bytes_received;
+    let total_accounted = report.setup_time
+        + build_total
+        + report.timing.time_total_queries
+        + report.result_open_time;
+    let total_other = report.total_time.saturating_sub(total_accounted);
     let query_accounted = report.timing.time_total_query_prf
         + report.timing.time_total_query_speed_cache
         + report.timing.time_total_query_ohtable
@@ -281,7 +295,7 @@ pub fn print_report(config: &DoramBenchmarkConfig, report: &PartyReport) {
             "|  |  |- batcher_sorting: {}\n",
             "|  |  |- bottom_level: {}\n",
             "|  |  `- other_levels: {}\n",
-            "|  `- Query\n",
+            "|  |- Query\n",
             "|     |- total: {}\n",
             "|     |- prf_eval: {}\n",
             "|     |- speed_cache: {}\n",
@@ -293,6 +307,8 @@ pub fn print_report(config: &DoramBenchmarkConfig, report: &PartyReport) {
             "|     |  `- bookkeeping: {}\n",
             "|     |- writeback: {}\n",
             "|     `- other: {}\n",
+            "|  |- result_open: {}\n",
+            "|  `- other: {}\n",
             "`- Summary\n",
             "   |- queries_per_sec: {:.2}\n",
             "   |- bytes_sent: {}\n",
@@ -329,6 +345,8 @@ pub fn print_report(config: &DoramBenchmarkConfig, report: &PartyReport) {
         format_duration(report.timing.time_total_query_ohtable_details.bookkeeping),
         format_duration(report.timing.time_total_query_writeback),
         format_duration(query_other),
+        format_duration(report.result_open_time),
+        format_duration(total_other),
         queries_per_sec,
         report.bytes_sent,
         report.bytes_received,

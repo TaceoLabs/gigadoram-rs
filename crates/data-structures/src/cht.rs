@@ -2,9 +2,8 @@
 //!
 //! `build` places each indexed block at one of its two hash locations when possible and
 //! returns a fixed-size stash for entries that cannot be placed. `lookup_from_2shares`
-//! takes the local lookup values of the two receiver parties, converts them back to replicated
-//! shares, runs the garbled lookup circuit, and reveals the selected table index only to the
-//! parties that need it.
+//! keeps the old replicated-share API, while `lookup_receiver_index_from_2shares` feeds the two
+//! receiver shares directly into the garbled lookup and returns the receiver-order index.
 
 use circuits::cht_lookup;
 use mpc_core::protocols::{
@@ -167,6 +166,65 @@ pub fn lookup_from_2shares<N: Network>(
     net: &N,
     state: &mut Rep3State,
 ) -> eyre::Result<ChtLookupResult> {
+    let (index, found) = lookup_index_share(
+        log_single_col_len,
+        table,
+        key,
+        dummy_index,
+        builder,
+        net,
+        state,
+    )?;
+    let index = reveal_index_to_receivers(&index, builder, net, state)?;
+
+    Ok(ChtLookupResult { index, found })
+}
+
+pub fn lookup_receiver_index_from_2shares<N: Network>(
+    log_single_col_len: u32,
+    table: &[Block],
+    key: Block,
+    dummy_index: XShare,
+    builder: PartyID,
+    net: &N,
+    state: &mut Rep3State,
+    map_index: impl FnOnce(usize) -> usize,
+) -> eyre::Result<ChtLookupResult> {
+    eyre::ensure!(
+        builder == PartyID::ID0,
+        "receiver-index CHT lookup assumes the fixed Yao evaluator/builder"
+    );
+    let mut lookup_values = vec![RingElement(0); 3];
+    if state.id != builder {
+        if state.id == builder.next() {
+            lookup_values[0] = RingElement(key);
+        }
+        lookup_values[1] = RingElement(table[h0(key, log_single_col_len)]);
+        lookup_values[2] = RingElement(table[h1(key, log_single_col_len)]);
+    }
+
+    let (index, found) = cht_lookup::compute_2share_found_with_public_index(
+        lookup_values[0].0,
+        lookup_values[1].0,
+        lookup_values[2].0,
+        dummy_index,
+        net,
+        state,
+    )?;
+    let index = map_index(index as usize);
+
+    Ok(ChtLookupResult { index, found })
+}
+
+fn lookup_index_share<N: Network>(
+    log_single_col_len: u32,
+    table: &[Block],
+    key: Block,
+    dummy_index: XShare,
+    builder: PartyID,
+    net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<(XShare, BitShare)> {
     let mut lookup_values = vec![RingElement(0); 3];
     if state.id != builder {
         if state.id == builder.next() {
@@ -180,20 +238,7 @@ pub fn lookup_from_2shares<N: Network>(
         from_2_shares(lookup_values, builder.prev(), builder.next(), net, state)?
             .try_into()
             .unwrap();
-    let (index, found) = cht_lookup::compute(key_share, b0, b1, dummy_index, net, state)?;
-    let index = reveal_index_to_receivers(&index, builder, net, state)?;
-
-    Ok(ChtLookupResult { index, found })
-}
-
-pub fn h0(block: Block, log_single_col_len: u32) -> usize {
-    let hash_mask = (1usize << log_single_col_len) - 1;
-    ((block >> 64) as usize) & hash_mask
-}
-
-pub fn h1(block: Block, log_single_col_len: u32) -> usize {
-    let hash_mask = (1usize << log_single_col_len) - 1;
-    (((block >> 96) as usize) & hash_mask) | (1usize << log_single_col_len)
+    cht_lookup::compute(key_share, b0, b1, dummy_index, net, state)
 }
 
 fn reveal_index_to_receivers<N: Network>(
@@ -215,4 +260,14 @@ fn reveal_index_to_receivers<N: Network>(
 
     let c = net.recv_from::<RingElement<u32>>(builder.next())?;
     Ok((index.a ^ index.b ^ c).0 as usize)
+}
+
+pub fn h0(block: Block, log_single_col_len: u32) -> usize {
+    let hash_mask = (1usize << log_single_col_len) - 1;
+    ((block >> 64) as usize) & hash_mask
+}
+
+pub fn h1(block: Block, log_single_col_len: u32) -> usize {
+    let hash_mask = (1usize << log_single_col_len) - 1;
+    (((block >> 96) as usize) & hash_mask) | (1usize << log_single_col_len)
 }

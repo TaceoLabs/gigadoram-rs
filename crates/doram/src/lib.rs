@@ -266,18 +266,43 @@ impl GigaDoram {
             .enumerate()
             .filter_map(|(level, table)| table.as_ref().map(|_| level))
             .collect::<Vec<_>>();
-        let start = Instant::now();
-        let qs = self.evaluate_prf_tags(&live_levels, query_x, net, state)?;
-        if let Some(timing) = &mut timing {
-            timing.time_total_query_prf += start.elapsed();
-        }
+        let (qs, mut y_accum, mut found) = if self.speed_cache.num_stored == 0 {
+            let start = Instant::now();
+            let qs = self.evaluate_prf_tags(&live_levels, query_x, net, state)?;
+            if let Some(timing) = &mut timing {
+                timing.time_total_query_prf += start.elapsed();
+            }
 
-        // Query the SpeedCache and extract alibi bits
-        let start = Instant::now();
-        let (mut y_accum, mut found) = self.speed_cache.query(query_x, net, state)?;
-        if let Some(timing) = &mut timing {
-            timing.time_total_query_speed_cache += start.elapsed();
-        }
+            (
+                qs,
+                YShare::default(),
+                promote_public(state.id, Bit::new(false)),
+            )
+        } else if live_levels.is_empty() {
+            let start = Instant::now();
+            let cache = self.speed_cache.query(query_x, net, state)?;
+            if let Some(timing) = &mut timing {
+                timing.time_total_query_speed_cache += start.elapsed();
+            }
+
+            (Vec::new(), cache.0, cache.1)
+        } else {
+            let start = Instant::now();
+            let (qs, found_out, selected_x, selected_y) =
+                self.evaluate_prf_tags_and_cache_query(&live_levels, query_x, net, state)?;
+            if let Some(timing) = &mut timing {
+                timing.time_total_query_prf += start.elapsed();
+            }
+
+            let start = Instant::now();
+            let cache = self
+                .speed_cache
+                .query_from_selected(found_out, selected_x, selected_y);
+            if let Some(timing) = &mut timing {
+                timing.time_total_query_speed_cache += start.elapsed();
+            }
+            (qs, cache.0, cache.1)
+        };
         let mut alibi_mask = self.extract_alibi_bits(&y_accum);
 
         // Traverse each live level and query the corresponding table
@@ -306,8 +331,8 @@ impl GigaDoram {
         // Write the new value on writes, or refresh the old value on reads.
         let start = Instant::now();
         let value_to_write = write_y.unwrap_or(y_accum);
-        self.speed_cache
-            .write(vec![query_x], vec![self.clear_alibi_bits(value_to_write)]);
+        let value_to_write = self.clear_alibi_bits(value_to_write);
+        self.speed_cache.write(vec![query_x], vec![value_to_write]);
         if let Some(timing) = &mut timing {
             timing.time_total_query_writeback += start.elapsed();
             timing.time_total_queries += query_start.elapsed();
@@ -616,7 +641,75 @@ impl GigaDoram {
         net: &N,
         state: &mut Rep3State,
     ) -> Result<Vec<BlockShare>> {
-        let keys = levels
+        if !levels.is_empty() && levels.len() <= 8 {
+            let keys = self.query_keys(levels);
+            return Ok(lowmc::encrypt_few_with_repeated_input_is_zero_and_cmux(
+                &keys,
+                upcast_x_to_block(input),
+                &[],
+                &[],
+                &[],
+                net,
+                state,
+            )?
+            .0);
+        }
+
+        let keys = self.expanded_keys(levels);
+        let inputs = vec![upcast_x_to_block(input); levels.len()];
+        lowmc::encrypt_many(&keys, &inputs, net, state)
+    }
+
+    fn evaluate_prf_tags_and_cache_query<N: Network>(
+        &self,
+        levels: &[usize],
+        input: XShare,
+        net: &N,
+        state: &mut Rep3State,
+    ) -> Result<(Vec<BlockShare>, Vec<BitShare>, Vec<XShare>, Vec<YShare>)> {
+        let xor = self.speed_cache.addrs[..self.speed_cache.num_stored]
+            .iter()
+            .map(|x| *x ^ input)
+            .collect::<Vec<_>>();
+        if levels.len() <= 8 {
+            let keys = self.query_keys(levels);
+            lowmc::encrypt_few_with_repeated_input_is_zero_and_cmux(
+                &keys,
+                upcast_x_to_block(input),
+                &xor,
+                &self.speed_cache.addrs[..self.speed_cache.num_stored],
+                &self.speed_cache.data[..self.speed_cache.num_stored],
+                net,
+                state,
+            )
+        } else {
+            let keys = self.expanded_keys(levels);
+            lowmc::encrypt_many_with_repeated_input_is_zero_and_cmux(
+                &keys,
+                upcast_x_to_block(input),
+                &xor,
+                &self.speed_cache.addrs[..self.speed_cache.num_stored],
+                &self.speed_cache.data[..self.speed_cache.num_stored],
+                net,
+                state,
+            )
+        }
+    }
+
+    fn query_keys(&self, levels: &[usize]) -> Vec<&lowmc::FewRoundKeys> {
+        levels
+            .iter()
+            .map(|&level| {
+                &self.levels[level]
+                    .as_ref()
+                    .expect("live level should have an OHTable")
+                    .query_key
+            })
+            .collect()
+    }
+
+    fn expanded_keys(&self, levels: &[usize]) -> Vec<&[BlockShare]> {
+        levels
             .iter()
             .map(|&level| {
                 let table = self.levels[level]
@@ -625,9 +718,7 @@ impl GigaDoram {
                 assert_eq!(table.key.len(), ROUND_KEYS);
                 table.key.as_slice()
             })
-            .collect::<Vec<_>>();
-        let inputs = vec![upcast_x_to_block(input); levels.len()];
-        lowmc::encrypt_many(&keys, &inputs, net, state)
+            .collect()
     }
 
     fn extract_alibi_bits(&self, y: &YShare) -> Vec<BitShare> {

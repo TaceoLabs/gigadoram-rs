@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use circuits::lowmc::{self, ROUND_KEYS};
+use circuits::lowmc::{self, FewRoundKeys, ROUND_KEYS};
 use mpc_core::protocols::{
     rep3::{Rep3State, id::PartyID, network::Rep3NetworkExt},
     rep3_ring::{
@@ -73,6 +73,7 @@ impl OHTableParams {
 pub struct OhTable {
     pub params: OHTableParams,
     pub key: Vec<BlockShare>,
+    pub query_key: FewRoundKeys,
     pub stash_xs: Vec<XShare>,
     pub stash_ys: Vec<YShare>,
     pub builder_stash_indices: Vec<usize>,
@@ -137,6 +138,7 @@ impl OhTable {
 
         let mut table = Self {
             params,
+            query_key: lowmc::precompute_few_round_keys(&key),
             key,
             stash_xs: vec![XShare::zero_share(); params.stash_size],
             stash_ys: vec![YShare::zero_share(); params.stash_size],
@@ -221,7 +223,11 @@ impl OhTable {
         let old_query_count = self.query_count;
         let dummy_index = downcast(self.dummy_indices[old_query_count]);
 
-        let lookup_result = cht::lookup_from_2shares(
+        let receiver_shuffle = self
+            .receiver_shuffle
+            .as_mut()
+            .expect("OHTable must be built before querying");
+        let lookup_result = cht::lookup_receiver_index_from_2shares(
             self.params.log_single_col_len,
             self.cht_2shares.as_ref().unwrap(),
             q_clear.0,
@@ -229,27 +235,14 @@ impl OhTable {
             self.params.builder,
             net,
             state,
+            |index| receiver_shuffle.evaluate_at(index),
         )?;
         if let Some(timing) = &mut timing {
             timing.cht_lookup += start.elapsed();
         }
 
         let start = Instant::now();
-        let index_receiver_order = if state.id != self.params.builder {
-            let receiver_shuffle = self
-                .receiver_shuffle
-                .as_mut()
-                .expect("OHTable must be built before querying");
-            let index_receiver_order = receiver_shuffle.evaluate_at(lookup_result.index);
-
-            if state.id == self.params.builder.prev() {
-                net.send_next(index_receiver_order)
-                    .expect("should send index to receiver");
-            }
-            index_receiver_order
-        } else {
-            net.recv_prev()?
-        };
+        let index_receiver_order = lookup_result.index;
         if let Some(timing) = &mut timing {
             timing.receiver_index += start.elapsed();
         }
@@ -441,10 +434,18 @@ impl OhTable {
             .collect::<Vec<_>>();
         let receiver_indices = match state.id {
             id if id == self.params.builder.prev() => {
+                let receiver_map = (0..self.params.total_size())
+                    .map(|i| receiver_shuffle.evaluate_at(i))
+                    .collect::<Vec<_>>();
                 net.send_to(self.params.builder, receiver_indices.clone())?;
+                net.send_to(self.params.builder, receiver_map)?;
                 receiver_indices
             }
-            id if id == self.params.builder => net.recv_from(self.params.builder.prev())?,
+            id if id == self.params.builder => {
+                let receiver_indices = net.recv_from(self.params.builder.prev())?;
+                receiver_shuffle.pi = Some(net.recv_from(self.params.builder.prev())?);
+                receiver_indices
+            }
             _ => receiver_indices,
         };
 
