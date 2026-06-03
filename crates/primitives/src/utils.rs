@@ -39,6 +39,23 @@ where
     })
 }
 
+pub fn run_parties_may_panic<R, F>(f: F) -> [std::thread::Result<R>; 3]
+where
+    R: Send,
+    F: Fn(LocalNetwork) -> R + Sync,
+{
+    let [net0, net1, net2] = LocalNetwork::new_3_parties();
+
+    std::thread::scope(|scope| {
+        let f = &f;
+        let party_0 = scope.spawn(move || f(net0));
+        let party_1 = scope.spawn(move || f(net1));
+        let party_2 = scope.spawn(move || f(net2));
+
+        [party_0.join(), party_1.join(), party_2.join()]
+    })
+}
+
 pub fn random_indexed_block(
     log_single_col_len: u32,
     left_vertex: usize,
@@ -76,6 +93,10 @@ pub fn random_indexed_blocks(log_single_col_len: u32, count: usize) -> Vec<Block
 
 pub fn low_u32(block: Block) -> u32 {
     block as u32
+}
+
+pub fn set_low_u32(block: Block, low: u32) -> Block {
+    (block & !(u32::MAX as Block)) | low as Block
 }
 
 pub fn reveal_to_party<T, N>(

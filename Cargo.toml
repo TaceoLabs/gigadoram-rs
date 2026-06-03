@@ -25,3 +25,4 @@ mpc-net = { git = "https://github.com/TaceoLabs/co-snarks", branch = "main", fea
 num-traits = "0.2"
 primitives = { path = "crates/primitives" }
 rand = "0.8"
+rand_chacha = "0.3"
