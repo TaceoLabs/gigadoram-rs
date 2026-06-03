@@ -705,12 +705,13 @@ fn execute_op(
     state: &mut Rep3State,
 ) -> eyre::Result<primitives::YShare> {
     match op {
-        Op::Read(x) => doram.read(promote_public(state.id, x), net, state),
+        Op::Read(x) => doram.read(promote_public(state.id, x), net, state, None),
         Op::Write(x, y) => doram.write(
             promote_public(state.id, x),
             promote_public(state.id, y),
             net,
             state,
+            None,
         ),
     }
 }

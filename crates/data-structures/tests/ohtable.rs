@@ -134,7 +134,7 @@ impl TestData {
         let q = table.qs_builder_order[builder_index];
         let use_dummy =
             binary::promote_to_trivial_share(state.id, &RingElement(Bit::new(use_dummy)));
-        let (value, found) = table.query(q, use_dummy, net, state).unwrap();
+        let (value, found) = table.query(q, use_dummy, net, state, None).unwrap();
         let found = binary::open(&found, net).unwrap().0.convert();
 
         (value, found)
@@ -423,7 +423,7 @@ fn build_table<N: Network>(
     let ys = promote_public_values(state.id, &ys_clear);
     let key = promote_public_values(state.id, clear_key);
 
-    OhTable::new(params, xs, ys, key, net, state)
+    OhTable::new(params, xs, ys, key, net, state, None)
 }
 
 fn real_builder_indices(qs_clear: &[Block]) -> Vec<usize> {
