@@ -10,14 +10,14 @@ use circuits::{
 };
 use mpc_core::protocols::{rep3::Rep3State, rep3_ring::ring::bit::Bit};
 use mpc_net::Network;
-use primitives::{XShare, YShare, promote_public, types::BitShare};
+use primitives::{XShare, YRecord, promote_public, types::BitShare};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpeedCache {
     pub length: usize,
     pub num_stored: usize,
     pub addrs: Vec<XShare>,
-    pub data: Vec<YShare>,
+    pub data: Vec<YRecord>,
 }
 
 impl SpeedCache {
@@ -26,7 +26,7 @@ impl SpeedCache {
             length,
             num_stored: 0,
             addrs: vec![XShare::default(); length],
-            data: vec![YShare::default(); length],
+            data: vec![YRecord::default(); length],
         }
     }
 
@@ -36,27 +36,37 @@ impl SpeedCache {
         precompute_data: Option<SpeedCachePrecomputeData>,
         net: &impl Network,
         state: &mut Rep3State,
-    ) -> eyre::Result<(YShare, BitShare)> {
+    ) -> eyre::Result<(YRecord, BitShare)> {
         if self.num_stored == 0 {
-            return Ok((YShare::default(), promote_public(state.id, Bit::new(false))));
+            return Ok((
+                YRecord::default(),
+                promote_public(state.id, Bit::new(false)),
+            ));
         }
 
         let length_for_query = self.num_stored;
-
         let result = precompute_data.and_then(|mut query| query.take_result());
         let (x_if_found, y_if_found, found_out) = match result {
             Some((x_if_found, y_if_found, found_out)) => (x_if_found, y_if_found, found_out),
             None => {
-                // circuit input:  x_query | x | y
-                // circuit output: x_mask | y | found
+                // circuit input:  x_query | x | (y, alibi)
+                // circuit output: x_mask | y | alibi | found
                 let query_addrs = vec![query_addr; length_for_query];
-                xy_if_xs_equal_circuit(
+                let ys = YRecord::get_y_values(&self.data[..length_for_query]);
+                let alibis = YRecord::get_alibis(&self.data[..length_for_query]);
+                let (x_if_found, y_if_found, alibi_if_found, found_out) = xy_if_xs_equal_circuit(
                     &self.addrs[..length_for_query],
                     &query_addrs,
-                    &self.data[..length_for_query],
+                    &ys,
+                    &alibis,
                     net,
                     state,
-                )?
+                )?;
+                (
+                    x_if_found,
+                    YRecord::from_columns(y_if_found, alibi_if_found),
+                    found_out,
+                )
             }
         };
 
@@ -87,14 +97,14 @@ impl SpeedCache {
         })
     }
 
-    pub fn extract(&mut self) -> (Vec<XShare>, Vec<YShare>) {
+    pub fn extract(&mut self) -> (Vec<XShare>, Vec<YRecord>) {
         assert_eq!(self.num_stored, self.length);
         assert_eq!(self.addrs.len(), self.length);
         assert_eq!(self.data.len(), self.length);
         (self.addrs.clone(), self.data.clone())
     }
 
-    pub fn write(&mut self, write_addrs: Vec<XShare>, write_data: Vec<YShare>) {
+    pub fn write(&mut self, write_addrs: Vec<XShare>, write_data: Vec<YRecord>) {
         assert_eq!(write_addrs.len(), write_data.len());
         assert!(
             self.num_stored < self.length,
