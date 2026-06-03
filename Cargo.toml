@@ -21,6 +21,7 @@ readme = "./README.md"
 [workspace.dependencies]
 circuits = { path = "crates/circuits" }
 data-structures = { path = "crates/data-structures" }
+clap = { version = "4.5", features = ["derive"] }
 eyre = "0.6"
 mpc-core = { git = "https://github.com/TaceoLabs/co-snarks", branch = "main" }
 mpc-net = { git = "https://github.com/TaceoLabs/co-snarks", branch = "main", features = ["local"] }
@@ -28,3 +29,7 @@ num-traits = "0.2"
 primitives = { path = "crates/primitives" }
 rand = "0.8"
 rand_chacha = "0.3"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1.43"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
