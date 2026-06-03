@@ -29,20 +29,6 @@ pub fn promote_public_values<T: IntRing2k>(id: PartyID, values: &[T]) -> Vec<Rep
         .collect()
 }
 
-pub fn upcast_x_to_y(share: XShare) -> YShare {
-    YShare::new_ring(
-        RingElement(u64::from(share.a.0)),
-        RingElement(u64::from(share.b.0)),
-    )
-}
-
-pub fn upcast_x_to_block(share: XShare) -> BlockShare {
-    BlockShare::new_ring(
-        RingElement(u128::from(share.a.0)),
-        RingElement(u128::from(share.b.0)),
-    )
-}
-
 pub fn open_many<T, N>(shares: &[Rep3RingShare<T>], net: &N) -> Vec<T>
 where
     T: IntRing2k,
@@ -72,6 +58,31 @@ pub fn bit_to_binary_mask<T: IntRing2k>(bit: &BitShare) -> Rep3RingShare<T> {
     )
 }
 
+/// Extracts local two-party XOR shares from replicated Rep3 ring shares.
+pub fn reshare_3_to_2<T: IntRing2k>(
+    rep_array: &[Rep3RingShare<T>],
+    to_1: PartyID,
+    to_2: PartyID,
+    state: &Rep3State,
+) -> Vec<RingElement<T>> {
+    rep_array
+        .iter()
+        .map(|share| {
+            if state.id == to_1 {
+                share.a ^ share.b
+            } else if state.id == to_2 {
+                if to_2 == to_1.prev() {
+                    share.b
+                } else {
+                    share.a
+                }
+            } else {
+                RingElement(T::zero())
+            }
+        })
+        .collect()
+}
+
 /// Re-replicates local XOR shares produced by `reshare_3_to_2`.
 pub fn from_2_shares<T, N>(
     local_shares: Vec<RingElement<T>>,
@@ -85,9 +96,6 @@ where
     Standard: Distribution<T>,
     N: Network,
 {
-    assert_ne!(from_1, from_2);
-    assert!(from_1.next() == from_2 || from_1.prev() == from_2);
-
     let has_input = state.id == from_1 || state.id == from_2;
     let local_components = local_shares
         .into_iter()
@@ -109,4 +117,29 @@ where
         .zip(next_components)
         .map(|(local, next)| Rep3RingShare::new_ring(local, next))
         .collect())
+}
+
+pub fn input<T, N>(
+    party_inputting: PartyID,
+    secrets: &[RingElement<T>],
+    net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<Vec<Rep3RingShare<T>>>
+where
+    T: IntRing2k,
+    Standard: Distribution<T>,
+    N: Network,
+{
+    let local_shares = if state.id == party_inputting {
+        secrets.to_vec()
+    } else {
+        vec![RingElement(T::zero()); secrets.len()]
+    };
+    from_2_shares(
+        local_shares,
+        party_inputting,
+        party_inputting.next(),
+        net,
+        state,
+    )
 }
