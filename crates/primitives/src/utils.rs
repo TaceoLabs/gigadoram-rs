@@ -3,7 +3,6 @@ use mpc_core::protocols::{
     rep3_ring::{
         Rep3RingShare,
         arithmetic::RingShare,
-        binary::and_vec,
         ring::{bit::Bit, int_ring::IntRing2k, ring_impl::RingElement},
     },
 };
@@ -17,26 +16,19 @@ use rand::{
 };
 use std::any::TypeId;
 
-use crate::{Block, XShare, YShare, upcast_x_to_y};
+use crate::{
+    AlibiShare, Block, XShare, Y, YShare,
+    bigintshare::bigint_mask,
+    cast::{downcast_y_to_x_many, upcast_x_to_y},
+};
 
 pub fn run_parties<R, F>(f: F) -> std::thread::Result<[R; 3]>
 where
     R: Send,
     F: Fn(LocalNetwork) -> R + Sync,
 {
-    let [net0, net1, net2] = LocalNetwork::new_3_parties();
-
-    std::thread::scope(|scope| {
-        let f = &f;
-        let party_0 = scope.spawn(move || f(net0));
-        let party_1 = scope.spawn(move || f(net1));
-        let party_2 = scope.spawn(move || f(net2));
-
-        let r0 = party_0.join();
-        let r1 = party_1.join();
-        let r2 = party_2.join();
-        Ok([r0?, r1?, r2?])
-    })
+    let [r0, r1, r2] = run_parties_may_panic(f);
+    Ok([r0?, r1?, r2?])
 }
 
 pub fn run_parties_may_panic<R, F>(f: F) -> [std::thread::Result<R>; 3]
@@ -226,16 +218,64 @@ pub fn cmux_many_custom<N: Network>(
     found: &[YShare],
     x: &[XShare],
     y: &[YShare],
+    alibi: &[AlibiShare],
+    net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<(Vec<XShare>, Vec<YShare>, Vec<AlibiShare>)> {
+    let mut masks = Vec::with_capacity(x.len() + y.len() + alibi.len());
+    masks.extend_from_slice(found);
+    masks.extend_from_slice(found);
+    masks.extend_from_slice(found);
+
+    let mut values = Vec::with_capacity(x.len() + y.len() + alibi.len());
+    values.extend(x.iter().copied().map(upcast_x_to_y));
+    values.extend_from_slice(y);
+    values.extend(alibi.iter().copied().map(upcast_alibi_to_y));
+
+    let selected = and_vec_y(&masks, &values, net, state)?;
+    let y_start = x.len();
+    let alibi_start = y_start + y.len();
+    Ok((
+        downcast_y_to_x_many(selected[..y_start].to_vec()),
+        selected[y_start..alibi_start].to_vec(),
+        selected[alibi_start..]
+            .iter()
+            .copied()
+            .map(downcast_y_to_alibi)
+            .collect(),
+    ))
+}
+
+fn upcast_alibi_to_y(share: AlibiShare) -> YShare {
+    let mut a = Y::default();
+    let mut b = Y::default();
+    a.as_mut()[0] = u64::from(share.a.0);
+    b.as_mut()[0] = u64::from(share.b.0);
+    YShare::new(a, b)
+}
+
+fn downcast_y_to_alibi(share: YShare) -> AlibiShare {
+    AlibiShare::new_ring(
+        RingElement(share.a.as_ref()[0] as u8),
+        RingElement(share.b.as_ref()[0] as u8),
+    )
+}
+
+fn and_vec_y<N: Network>(
+    lhs: &[YShare],
+    rhs: &[YShare],
     net: &N,
     state: &mut Rep3State,
 ) -> eyre::Result<Vec<YShare>> {
-    let mut masks = Vec::with_capacity(x.len() + y.len());
-    masks.extend_from_slice(found);
-    masks.extend_from_slice(found);
-
-    let mut values = Vec::with_capacity(x.len() + y.len());
-    values.extend(x.iter().copied().map(upcast_x_to_y));
-    values.extend_from_slice(y);
-
-    and_vec(&masks, &values, net, state)
+    let local = lhs
+        .iter()
+        .zip(rhs)
+        .map(|(lhs, rhs)| lhs.local_and(rhs) ^ bigint_mask::<crate::YField>(state))
+        .collect::<Vec<Y>>();
+    let next = net.reshare_many(&local)?;
+    Ok(local
+        .into_iter()
+        .zip(next)
+        .map(|(a, b)| YShare::new(a, b))
+        .collect())
 }

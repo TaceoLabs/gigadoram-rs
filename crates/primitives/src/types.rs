@@ -8,14 +8,106 @@ use mpc_core::protocols::{
 use mpc_net::Network;
 use rand::distributions::{Distribution, Standard};
 
+use crate::bigintshare::Rep3BigIntShare;
+
 pub type X = u32;
-pub type Y = u64;
+pub type YField = ark_bn254::Fr;
+pub type Y = <YField as ark_ff::PrimeField>::BigInt;
 pub type Block = u128;
+pub const Y_BITS: usize = 254;
 
 pub type XShare = Rep3RingShare<X>;
-pub type YShare = Rep3RingShare<Y>;
+pub type YShare = Rep3BigIntShare<YField>;
 pub type BlockShare = Rep3RingShare<Block>;
 pub type BitShare = Rep3RingShare<Bit>;
+
+pub type AlibiShare = Rep3RingShare<u8>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YRecord {
+    pub value: YShare,
+    pub alibi: AlibiShare,
+}
+
+impl YRecord {
+    pub fn new(value: YShare, alibi: AlibiShare) -> Self {
+        Self { value, alibi }
+    }
+
+    pub fn zero_share() -> Self {
+        Self::from_value(YShare::zero_share())
+    }
+
+    pub fn from_value(value: YShare) -> Self {
+        Self {
+            value,
+            alibi: AlibiShare::zero_share(),
+        }
+    }
+
+    pub fn get_y_values(records: &[Self]) -> Vec<YShare> {
+        records.iter().map(|r| r.value).collect()
+    }
+
+    pub fn get_alibis(records: &[Self]) -> Vec<AlibiShare> {
+        records.iter().map(|r| r.alibi).collect()
+    }
+
+    pub fn from_columns(values: Vec<YShare>, alibis: Vec<AlibiShare>) -> Vec<Self> {
+        values
+            .into_iter()
+            .zip(alibis)
+            .map(|(value, alibi)| Self::new(value, alibi))
+            .collect()
+    }
+
+    pub fn get_alibi_bits(&self, num_levels: usize) -> Vec<BitShare> {
+        (0..num_levels)
+            .map(|level| {
+                BitShare::new_ring(
+                    RingElement(Bit::new((self.alibi.a.0 >> level) & 1 == 1)),
+                    RingElement(Bit::new((self.alibi.b.0 >> level) & 1 == 1)),
+                )
+            })
+            .collect()
+    }
+
+    pub fn set_alibi_bit(mut self, level: usize, party_id: PartyID) -> Self {
+        let mask = 1u8 << level;
+        let and_a = self.alibi.a.0 & mask;
+        let and_b = self.alibi.b.0 & mask;
+        match party_id {
+            PartyID::ID0 => self.alibi.a.0 ^= mask,
+            PartyID::ID1 => self.alibi.b.0 ^= mask,
+            PartyID::ID2 => {}
+        }
+        self.alibi.a.0 ^= and_a;
+        self.alibi.b.0 ^= and_b;
+        self
+    }
+
+    pub fn clear_alibi(mut self) -> Self {
+        self.alibi = AlibiShare::zero_share();
+        self
+    }
+}
+
+impl std::ops::BitXor for YRecord {
+    type Output = YRecord;
+    fn bitxor(self, rhs: Self) -> Self {
+        Self {
+            value: self.value ^ rhs.value,
+            alibi: self.alibi ^ rhs.alibi,
+        }
+    }
+}
+
+impl std::ops::BitXorAssign for YRecord {
+    fn bitxor_assign(&mut self, rhs: Self) {
+        self.value ^= rhs.value;
+        self.alibi ^= rhs.alibi;
+    }
+}
 
 pub fn promote_public<T: IntRing2k>(id: PartyID, value: T) -> Rep3RingShare<T> {
     binary::promote_to_trivial_share(id, &RingElement(value))
@@ -34,6 +126,37 @@ pub fn promote_public_values<T: IntRing2k>(id: PartyID, values: &[T]) -> Vec<Rep
         .collect()
 }
 
+pub fn y_low_mask(bits: usize) -> Y {
+    let mut y = Y::default();
+    for (i, limb) in y.as_mut().iter_mut().enumerate() {
+        let covered = i * 64;
+        *limb = if bits >= covered + 64 {
+            u64::MAX
+        } else if bits > covered {
+            (1u64 << (bits - covered)) - 1
+        } else {
+            0
+        };
+    }
+    y
+}
+
+pub fn promote_public_y(id: PartyID, value: Y) -> YShare {
+    match id {
+        PartyID::ID0 => YShare::new(value, Y::default()),
+        PartyID::ID1 => YShare::new(Y::default(), value),
+        PartyID::ID2 => YShare::new(Y::default(), Y::default()),
+    }
+}
+
+pub fn promote_public_y_values(id: PartyID, values: &[Y]) -> Vec<YShare> {
+    values
+        .iter()
+        .copied()
+        .map(|value| promote_public_y(id, value))
+        .collect()
+}
+
 pub fn open_many<T, N>(shares: &[Rep3RingShare<T>], net: &N) -> Vec<T>
 where
     T: IntRing2k,
@@ -45,6 +168,19 @@ where
         .zip(net.reshare_many(&bs).unwrap())
         .map(|(share, next)| (share.a ^ share.b ^ next).0)
         .collect()
+}
+
+pub fn open_many_y<N: Network>(shares: &[YShare], net: &N) -> Vec<Y> {
+    let bs = shares.iter().map(|share| share.b).collect::<Vec<_>>();
+    shares
+        .iter()
+        .zip(net.reshare_many(&bs).unwrap())
+        .map(|(share, next)| share.a ^ share.b ^ next)
+        .collect()
+}
+
+pub fn open_y<N: Network>(share: &YShare, net: &N) -> Y {
+    open_many_y(&[*share], net).remove(0)
 }
 
 pub fn bit_to_binary_mask<T: IntRing2k>(bit: &BitShare) -> Rep3RingShare<T> {
@@ -60,6 +196,22 @@ pub fn bit_to_binary_mask<T: IntRing2k>(bit: &BitShare) -> Rep3RingShare<T> {
         } else {
             T::zero()
         }),
+    )
+}
+
+pub fn bit_to_y_mask(bit: &BitShare) -> YShare {
+    let all_ones = y_low_mask(Y_BITS);
+    YShare::new(
+        if bit.a.0.convert() {
+            all_ones
+        } else {
+            Y::default()
+        },
+        if bit.b.0.convert() {
+            all_ones
+        } else {
+            Y::default()
+        },
     )
 }
 

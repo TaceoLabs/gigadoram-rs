@@ -17,3 +17,6 @@ mpc-core.workspace = true
 mpc-net.workspace = true
 primitives.workspace = true
 scuttlebutt = { git = "https://github.com/GaloisInc/swanky", rev = "5ff648457218b74da9d8323b7ca47166ff5be4b3" }
+
+[dev-dependencies]
+rand.workspace = true

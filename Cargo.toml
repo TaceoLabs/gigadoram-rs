@@ -19,6 +19,9 @@ publish = false
 readme = "./README.md"
 
 [workspace.dependencies]
+ark-bn254 = "0.5"
+ark-ff = "0.5"
+ark-serialize = "0.5"
 circuits = { path = "crates/circuits" }
 data-structures = { path = "crates/data-structures" }
 clap = { version = "4.5", features = ["derive"] }
