@@ -4,6 +4,7 @@ members = [
     "crates/circuits",
     "crates/primitives",
     "crates/data-structures",
+    "crates/doram",
 ]
 
 [workspace.package]
@@ -19,9 +20,11 @@ readme = "./README.md"
 
 [workspace.dependencies]
 circuits = { path = "crates/circuits" }
+data-structures = { path = "crates/data-structures" }
 eyre = "0.6"
 mpc-core = { git = "https://github.com/TaceoLabs/co-snarks", branch = "main" }
 mpc-net = { git = "https://github.com/TaceoLabs/co-snarks", branch = "main", features = ["local"] }
 num-traits = "0.2"
 primitives = { path = "crates/primitives" }
 rand = "0.8"
+rand_chacha = "0.3"

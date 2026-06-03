@@ -1,5 +1,5 @@
 [package]
-name = "primitives"
+name = "doram"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,9 +11,9 @@ publish.workspace = true
 readme.workspace = true
 
 [dependencies]
+circuits.workspace = true
+data-structures.workspace = true
 eyre.workspace = true
 mpc-core.workspace = true
 mpc-net.workspace = true
-num-traits.workspace = true
-rand.workspace = true
-rand_chacha.workspace = true
+primitives.workspace = true
