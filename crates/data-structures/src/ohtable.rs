@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use circuits::lowmc::{self, ROUND_KEYS};
 use eyre::Ok;
 use mpc_core::protocols::{
@@ -95,6 +97,30 @@ pub struct OhTableQueryTrace {
     pub was_touched_before: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct OhTableTiming {
+    pub build_prf: Duration,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct OhTableQueryTiming {
+    pub dummy_cmux: Duration,
+    pub tag_reveal: Duration,
+    pub cht_lookup: Duration,
+    pub receiver_index: Duration,
+    pub bookkeeping: Duration,
+}
+
+impl OhTableQueryTiming {
+    pub fn add_assign(&mut self, other: &Self) {
+        self.dummy_cmux += other.dummy_cmux;
+        self.tag_reveal += other.tag_reveal;
+        self.cht_lookup += other.cht_lookup;
+        self.receiver_index += other.receiver_index;
+        self.bookkeeping += other.bookkeeping;
+    }
+}
+
 impl OhTable {
     pub fn new<N: Network>(
         params: OHTableParams,
@@ -103,6 +129,7 @@ impl OhTable {
         key: Vec<BlockShare>,
         net: &N,
         state: &mut Rep3State,
+        timing: Option<&mut OhTableTiming>,
     ) -> Self {
         params.validate();
         assert_eq!(xs.len(), params.num_elements);
@@ -129,7 +156,7 @@ impl OhTable {
         };
 
         table
-            .build(xs, ys, net, state)
+            .build(xs, ys, net, state, timing)
             .expect("OHTable build should succeed");
         table
     }
@@ -140,12 +167,17 @@ impl OhTable {
         ys: Vec<YShare>,
         net: &N,
         state: &mut Rep3State,
+        mut timing: Option<&mut OhTableTiming>,
     ) -> eyre::Result<()> {
         assert_eq!(xs.len(), self.params.num_elements);
         assert_eq!(ys.len(), self.params.num_elements);
 
         // Evaluate PRF tags.
+        let start = Instant::now();
         self.fill_prf_tags(&xs, net, state)?;
+        if let Some(timing) = &mut timing {
+            timing.build_prf += start.elapsed();
+        }
 
         // Shuffle tags, payloads, and source indices into builder order.
         self.shuffle_builder_order(xs, ys, net, state)?;
@@ -168,16 +200,25 @@ impl OhTable {
         use_dummy: BitShare,
         net: &N,
         state: &mut Rep3State,
+        mut timing: Option<&mut OhTableQueryTiming>,
     ) -> eyre::Result<(YShare, BitShare)> {
         assert!(self.query_count < self.params.num_dummies);
 
         // TODO: Maybe just pass dummy as a Block
+        let start = Instant::now();
         let use_dummy = bit_to_binary_mask(&use_dummy);
-
         let q_or_dummy = binary::cmux(&use_dummy, &arithmetic::rand(state), &q, net, state)?;
+        if let Some(timing) = &mut timing {
+            timing.dummy_cmux += start.elapsed();
+        }
 
+        let start = Instant::now();
         let q_clear = reveal_to_receivers(&q_or_dummy, self.params.builder, net, state)?;
+        if let Some(timing) = &mut timing {
+            timing.tag_reveal += start.elapsed();
+        }
 
+        let start = Instant::now();
         let old_query_count = self.query_count;
         let dummy_index = downcast(self.dummy_indices[old_query_count]);
 
@@ -190,7 +231,11 @@ impl OhTable {
             net,
             state,
         )?;
+        if let Some(timing) = &mut timing {
+            timing.cht_lookup += start.elapsed();
+        }
 
+        let start = Instant::now();
         let index_receiver_order = if state.id != self.params.builder {
             let receiver_shuffle = self
                 .receiver_shuffle
@@ -206,7 +251,11 @@ impl OhTable {
         } else {
             net.recv_prev()?
         };
+        if let Some(timing) = &mut timing {
+            timing.receiver_index += start.elapsed();
+        }
 
+        let start = Instant::now();
         let was_touched_before = self.touched[index_receiver_order];
         assert!(!was_touched_before);
         self.touched[index_receiver_order] = true;
@@ -217,6 +266,9 @@ impl OhTable {
             selected_receiver_index: index_receiver_order,
             was_touched_before,
         });
+        if let Some(timing) = &mut timing {
+            timing.bookkeeping += start.elapsed();
+        }
 
         Ok((
             self.ys_receiver_order[index_receiver_order],
