@@ -34,7 +34,7 @@ fn test_speed_cache_query() {
             .map(|addr| {
                 let query_addr = promote_public(state.id, addr);
 
-                let (value, found) = cache.query(query_addr, &net, &mut state).unwrap();
+                let (value, found) = cache.query(query_addr, None, &net, &mut state).unwrap();
                 let value = arithmetic::open_bit(value, &net).unwrap();
                 let found = arithmetic::open_bit(found, &net).unwrap();
 

@@ -1,10 +1,13 @@
 //! Small linear cache for recently accessed ORAM entries.
-//! Queries scan stored addresses with `xy_if_xs_equal_circuit`, remove the
-//! matching address mask from the cache, and return the matched value/found bit.
+//! Queries scan stored addresses, remove the matching address mask from the
+//! cache, and return the matched value/found bit.
 
 use std::ops::BitXor;
 
-use circuits::xy_if_xs_equal::xy_if_xs_equal_circuit;
+use circuits::{
+    lowmc::packed_u8_lanes_with_speed_cache::SpeedCachePrecomputeData,
+    xy_if_xs_equal::xy_if_xs_equal_circuit,
+};
 use mpc_core::protocols::{rep3::Rep3State, rep3_ring::ring::bit::Bit};
 use mpc_net::Network;
 use primitives::{XShare, YShare, promote_public, types::BitShare};
@@ -30,6 +33,7 @@ impl SpeedCache {
     pub fn query(
         &mut self,
         query_addr: XShare,
+        precompute_data: Option<SpeedCachePrecomputeData>,
         net: &impl Network,
         state: &mut Rep3State,
     ) -> eyre::Result<(YShare, BitShare)> {
@@ -39,16 +43,22 @@ impl SpeedCache {
 
         let length_for_query = self.num_stored;
 
-        // circuit input:  x_query | x | y
-        // circuit output: x_mask | y | found
-        let query_addrs = vec![query_addr; length_for_query];
-        let (x_if_found, y_if_found, found_out) = xy_if_xs_equal_circuit(
-            &self.addrs[..length_for_query],
-            &query_addrs,
-            &self.data[..length_for_query],
-            net,
-            state,
-        )?;
+        let result = precompute_data.and_then(|mut query| query.take_result());
+        let (x_if_found, y_if_found, found_out) = match result {
+            Some((x_if_found, y_if_found, found_out)) => (x_if_found, y_if_found, found_out),
+            None => {
+                // circuit input:  x_query | x | y
+                // circuit output: x_mask | y | found
+                let query_addrs = vec![query_addr; length_for_query];
+                xy_if_xs_equal_circuit(
+                    &self.addrs[..length_for_query],
+                    &query_addrs,
+                    &self.data[..length_for_query],
+                    net,
+                    state,
+                )?
+            }
+        };
 
         self.addrs[..length_for_query]
             .iter_mut()
@@ -65,6 +75,16 @@ impl SpeedCache {
             .expect("circuit output should be non-empty");
 
         Ok((y_xor, found_xor))
+    }
+
+    pub fn precompute_query(&self, query_addr: XShare) -> Option<SpeedCachePrecomputeData> {
+        (self.num_stored > 0).then(|| {
+            SpeedCachePrecomputeData::new(
+                query_addr,
+                self.addrs[..self.num_stored].to_vec(),
+                self.data[..self.num_stored].to_vec(),
+            )
+        })
     }
 
     pub fn extract(&mut self) -> (Vec<XShare>, Vec<YShare>) {

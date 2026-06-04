@@ -11,7 +11,7 @@ use primitives::BlockShare;
 use crate::lowmc::common::{BLOCK_SIZE, M4R_WINDOW_SIZE, N_ROUNDS, N_SBOXES, ROUND_KEYS};
 use crate::lowmc::parameters;
 
-type Share = Rep3RingShare<u8>;
+pub(crate) type Share = Rep3RingShare<u8>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackedU8RoundKeys {
@@ -88,7 +88,7 @@ pub fn encrypt_few_with_repeated_input<N: Network>(
     Ok(pack_lanes(&state_bits, round_keys_len(active_mask)))
 }
 
-fn combine_round_keys(keys: &[&PackedU8RoundKeys]) -> [[Share; BLOCK_SIZE]; ROUND_KEYS] {
+pub(crate) fn combine_round_keys(keys: &[&PackedU8RoundKeys]) -> [[Share; BLOCK_SIZE]; ROUND_KEYS] {
     std::array::from_fn(|round| {
         let mut wires = [Share::zero_share(); BLOCK_SIZE];
         for (lane, key) in keys.iter().enumerate() {
@@ -120,7 +120,11 @@ fn sbox_layer_one_into<N: Network>(
     Ok(())
 }
 
-fn collect_sbox_ands(input: &[Share], and_lhs: &mut Vec<Share>, and_rhs: &mut Vec<Share>) {
+pub(crate) fn collect_sbox_ands(
+    input: &[Share],
+    and_lhs: &mut Vec<Share>,
+    and_rhs: &mut Vec<Share>,
+) {
     for i in 0..N_SBOXES {
         let a = input[3 * i];
         let b = input[3 * i + 1];
@@ -135,7 +139,7 @@ fn collect_sbox_ands(input: &[Share], and_lhs: &mut Vec<Share>, and_rhs: &mut Ve
     }
 }
 
-fn apply_sbox_ands(input: &[Share], ands: &[Share], output: &mut [Share]) {
+pub(crate) fn apply_sbox_ands(input: &[Share], ands: &[Share], output: &mut [Share]) {
     for i in 0..N_SBOXES {
         let a = input[3 * i];
         let b = input[3 * i + 1];
@@ -156,7 +160,7 @@ fn apply_sbox_ands(input: &[Share], ands: &[Share], output: &mut [Share]) {
     output[(3 * N_SBOXES)..BLOCK_SIZE].copy_from_slice(&input[(3 * N_SBOXES)..BLOCK_SIZE]);
 }
 
-fn four_russians_into(round: usize, input: &[Share], output: &mut [Share]) {
+pub(crate) fn four_russians_into(round: usize, input: &[Share], output: &mut [Share]) {
     for window in 0..(BLOCK_SIZE / M4R_WINDOW_SIZE) {
         let lut =
             fill_out_lut(&input[(window * M4R_WINDOW_SIZE)..((window + 1) * M4R_WINDOW_SIZE)]);
@@ -181,7 +185,12 @@ fn fill_out_lut(input: &[Share]) -> [Share; 1 << M4R_WINDOW_SIZE] {
     lut
 }
 
-fn xor_constants(round: usize, state_bits: &mut [Share], active_mask: u8, party_id: PartyID) {
+pub(crate) fn xor_constants(
+    round: usize,
+    state_bits: &mut [Share],
+    active_mask: u8,
+    party_id: PartyID,
+) {
     for (bit, constant) in state_bits
         .iter_mut()
         .zip(parameters::ROUND_CONSTANTS[round].iter().copied())
@@ -192,13 +201,13 @@ fn xor_constants(round: usize, state_bits: &mut [Share], active_mask: u8, party_
     }
 }
 
-fn add_round_key(state: &mut [Share], round_key: &[Share]) {
+pub(crate) fn add_round_key(state: &mut [Share], round_key: &[Share]) {
     for (state_bit, key_bit) in state.iter_mut().zip(round_key) {
         *state_bit = binary::xor(state_bit, key_bit);
     }
 }
 
-fn bit_slice<T: IntRing2k>(
+pub(crate) fn bit_slice<T: IntRing2k>(
     blocks: impl IntoIterator<Item = (BlockShare, T)>,
 ) -> Vec<Rep3RingShare<T>> {
     let mut wires = vec![Rep3RingShare::<T>::zero_share(); BLOCK_SIZE];
@@ -215,7 +224,7 @@ fn bit_slice<T: IntRing2k>(
     wires
 }
 
-fn pack_lanes(wires: &[Share], len: usize) -> Vec<BlockShare> {
+pub(crate) fn pack_lanes(wires: &[Share], len: usize) -> Vec<BlockShare> {
     let mut blocks = vec![BlockShare::zero_share(); len];
     for (lane, block) in blocks.iter_mut().enumerate() {
         let lane_mask = 1u8 << lane;
@@ -232,10 +241,10 @@ fn pack_lanes(wires: &[Share], len: usize) -> Vec<BlockShare> {
     blocks
 }
 
-fn lane_mask(len: usize) -> u8 {
+pub(crate) fn lane_mask(len: usize) -> u8 {
     if len == 8 { u8::MAX } else { (1u8 << len) - 1 }
 }
 
-fn round_keys_len(active_mask: u8) -> usize {
+pub(crate) fn round_keys_len(active_mask: u8) -> usize {
     active_mask.count_ones() as usize
 }
