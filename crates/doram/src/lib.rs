@@ -627,7 +627,7 @@ impl GigaDoram {
             })
             .collect::<Vec<_>>();
         let inputs = vec![upcast_x_to_block(input); levels.len()];
-        lowmc::encrypt_many(&keys, &inputs, net, state)
+        lowmc::packed_u64::encrypt_many(&keys, &inputs, net, state)
     }
 
     fn extract_alibi_bits(&self, y: &YShare) -> Vec<BitShare> {
