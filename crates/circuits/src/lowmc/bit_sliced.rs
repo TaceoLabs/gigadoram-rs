@@ -1,7 +1,7 @@
 //! Batched LowMC evaluation for secret-shared blocks. See <https://eprint.iacr.org/2016/687>.
 //!
 //! `encrypt_many` handles the general case where each input has its own expanded
-//! key. `encrypt_many_with_repeated_key` is the common case for building OH Tables: many
+//! key. `encrypt_many_with_same_key` is the common case for building OH Tables: many
 //! inputs use one key, so the bit-sliced round keys can be reused across chunks.
 
 use mpc_core::protocols::{
@@ -11,16 +11,12 @@ use mpc_core::protocols::{
 use mpc_net::Network;
 use primitives::BlockShare;
 
-pub const BLOCK_SIZE: usize = 128;
-pub const N_ROUNDS: usize = 9;
-pub const N_SBOXES: usize = 42;
-pub const M4R_WINDOW_SIZE: usize = 4;
-pub const ROUND_KEYS: usize = N_ROUNDS + 1;
-const LANES: usize = 128;
+use crate::lowmc::common::{BLOCK_SIZE, M4R_WINDOW_SIZE, N_ROUNDS, N_SBOXES};
+use crate::lowmc::parameters;
 
-mod params {
-    include!("lowmc_params.rs");
-}
+pub use crate::lowmc::common::{LowMCParameters, ROUND_KEYS, RoundKeys};
+
+const LANES: usize = 128;
 
 pub fn encrypt_many<N: Network>(
     expanded_keys: &[&[BlockShare]],
@@ -28,27 +24,29 @@ pub fn encrypt_many<N: Network>(
     net: &N,
     state: &mut Rep3State,
 ) -> eyre::Result<Vec<BlockShare>> {
-    if let Some(key) = repeated_key(expanded_keys) {
-        return encrypt_many_with_repeated_key(key, inputs, net, state);
-    }
-
+    let keys = expanded_keys
+        .iter()
+        .map(|key| RoundKeys::from_expanded_key(key))
+        .collect::<Vec<_>>();
+    let key_refs = keys.iter().collect::<Vec<_>>();
     encrypt_many_inner(inputs, net, state, |chunk, len| {
-        bit_slice_round_keys(expanded_keys, chunk * LANES, len)
+        bit_slice_round_keys(&key_refs, chunk * LANES, len)
     })
 }
 
-pub fn encrypt_many_with_repeated_key<N: Network>(
+pub fn encrypt_many_with_same_key<N: Network>(
     expanded_key: &[BlockShare],
     inputs: &[BlockShare],
     net: &N,
     state: &mut Rep3State,
 ) -> eyre::Result<Vec<BlockShare>> {
-    let full_round_keys = bit_slice_repeated_round_keys(expanded_key, LANES);
+    let key = RoundKeys::from_expanded_key(expanded_key);
+    let full_round_keys = bit_slice_repeated_round_keys(&key, LANES);
     encrypt_many_inner(inputs, net, state, |_, len| {
         if len == LANES {
             full_round_keys.clone()
         } else {
-            bit_slice_repeated_round_keys(expanded_key, len)
+            bit_slice_repeated_round_keys(&key, len)
         }
     })
 }
@@ -107,7 +105,7 @@ fn four_russians_matrix_mult(round: usize, input: &[BlockShare]) -> Vec<BlockSha
             fill_out_lut(&input[(window * M4R_WINDOW_SIZE)..((window + 1) * M4R_WINDOW_SIZE)]);
 
         for (output_wire, output_bit) in output.iter_mut().enumerate() {
-            let mask = params::M4R_MASKS[round][window][output_wire] as usize;
+            let mask = parameters::M4R_MASKS[round][window][output_wire] as usize;
             let selected = lut[mask];
             *output_bit = if window == 0 {
                 selected
@@ -127,7 +125,7 @@ fn xor_constants(
 ) {
     for (bit, constant) in state_bits
         .iter_mut()
-        .zip(params::ROUND_CONSTANTS[round].iter().copied())
+        .zip(parameters::ROUND_CONSTANTS[round].iter().copied())
     {
         if constant {
             *bit = binary::xor_public(bit, &RingElement(active_mask), party_id);
@@ -218,35 +216,21 @@ fn fill_out_lut(input: &[BlockShare]) -> [BlockShare; 1 << M4R_WINDOW_SIZE] {
     lut
 }
 
-fn bit_slice_round_keys(
-    expanded_keys: &[&[BlockShare]],
-    start: usize,
-    len: usize,
-) -> Vec<Vec<BlockShare>> {
+fn bit_slice_round_keys(keys: &[&RoundKeys], start: usize, len: usize) -> Vec<Vec<BlockShare>> {
     (0..ROUND_KEYS)
         .map(|round| {
             let round_keys = (start..(start + len))
-                .map(|index| expanded_keys[index][round])
+                .map(|index| keys[index].get(round))
                 .collect::<Vec<_>>();
             bit_slice_blocks(&round_keys)
         })
         .collect()
 }
 
-fn repeated_key<'a>(expanded_keys: &[&'a [BlockShare]]) -> Option<&'a [BlockShare]> {
-    let first = expanded_keys.first().copied()?;
-    expanded_keys
-        .iter()
-        .all(|key| key.as_ptr() == first.as_ptr())
-        .then_some(first)
-}
-
-fn bit_slice_repeated_round_keys(expanded_key: &[BlockShare], len: usize) -> Vec<Vec<BlockShare>> {
+fn bit_slice_repeated_round_keys(key: &RoundKeys, len: usize) -> Vec<Vec<BlockShare>> {
     let active_mask = lane_mask(len);
-    expanded_key
-        .iter()
-        .copied()
-        .map(|round_key| broadcast_block(round_key, active_mask))
+    (0..ROUND_KEYS)
+        .map(|round| broadcast_block(key.get(round), active_mask))
         .collect()
 }
 
