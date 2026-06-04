@@ -1,4 +1,4 @@
-use mpc_core::protocols::{rep3_ring::ring::ring_impl::RingElement};
+use mpc_core::protocols::rep3_ring::ring::ring_impl::RingElement;
 use primitives::BlockShare;
 
 pub const BLOCK_SIZE: usize = 128;
