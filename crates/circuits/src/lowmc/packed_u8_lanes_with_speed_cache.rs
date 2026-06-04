@@ -1,0 +1,407 @@
+use mpc_core::protocols::{
+    rep3::{Rep3State, network::Rep3NetworkExt},
+    rep3_ring::{Rep3RingShare, binary, ring::ring_impl::RingElement},
+};
+use mpc_net::Network;
+use primitives::{BitShare, BlockShare, X, XShare, YShare, bit_to_binary_mask};
+
+use crate::lowmc::{
+    common::{BLOCK_SIZE, N_ROUNDS, N_SBOXES},
+    packed_u8_lanes::{
+        PackedU8RoundKeys, Share, add_round_key, apply_sbox_ands, bit_slice, collect_sbox_ands,
+        combine_round_keys, four_russians_into, lane_mask, pack_lanes, precompute_round_keys,
+        xor_constants,
+    },
+};
+const ZERO_CHECK_ROUNDS: usize = X::BITS.ilog2() as usize;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpeedCachePrecomputeData {
+    query_addr: XShare,
+    addrs: Vec<XShare>,
+    data: Vec<YShare>,
+    result: Option<(Vec<XShare>, Vec<YShare>, Vec<BitShare>)>,
+}
+
+impl SpeedCachePrecomputeData {
+    pub fn new(query_addr: XShare, addrs: Vec<XShare>, data: Vec<YShare>) -> Self {
+        assert_eq!(addrs.len(), data.len());
+        Self {
+            query_addr,
+            addrs,
+            data,
+            result: None,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.addrs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.addrs.is_empty()
+    }
+
+    pub fn take_result(&mut self) -> Option<(Vec<XShare>, Vec<YShare>, Vec<BitShare>)> {
+        self.result.take()
+    }
+
+    fn zero_inputs(&self) -> Vec<XShare> {
+        self.addrs
+            .iter()
+            .copied()
+            .map(|addr| addr ^ self.query_addr)
+            .collect()
+    }
+
+    fn set_result(&mut self, result: (Vec<XShare>, Vec<YShare>, Vec<BitShare>)) {
+        self.result = Some(result);
+    }
+}
+
+pub fn encrypt_many_with_repeated_input<N: Network>(
+    expanded_keys: &[&[BlockShare]],
+    input: BlockShare,
+    mut speed_cache: Option<&mut SpeedCachePrecomputeData>,
+    net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<Vec<BlockShare>> {
+    let mut outputs = Vec::with_capacity(expanded_keys.len());
+    for keys in expanded_keys.chunks(8) {
+        let round_keys = keys
+            .iter()
+            .map(|key| precompute_round_keys(key))
+            .collect::<Vec<_>>();
+        let round_key_refs = round_keys.iter().collect::<Vec<_>>();
+        outputs.extend(encrypt_few_with_repeated_input(
+            &round_key_refs,
+            input,
+            speed_cache.take(),
+            net,
+            state,
+        )?);
+    }
+    Ok(outputs)
+}
+
+pub fn encrypt_few_with_repeated_input<N: Network>(
+    round_keys: &[&PackedU8RoundKeys],
+    input: BlockShare,
+    speed_cache: Option<&mut SpeedCachePrecomputeData>,
+    net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<Vec<BlockShare>> {
+    if round_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    assert!(round_keys.len() <= 8);
+
+    let num_lanes = round_keys.len();
+    let active_mask = lane_mask(num_lanes);
+    let round_keys = combine_round_keys(round_keys);
+    let mut state_bits = bit_slice([(input, active_mask)]);
+    let mut sboxed = vec![Share::zero_share(); BLOCK_SIZE];
+    let mut linear = vec![Share::zero_share(); BLOCK_SIZE];
+    let mut and_lhs = Vec::new();
+    let mut and_rhs = Vec::new();
+    let mut extra_lhs = Vec::new();
+    let mut extra_rhs = Vec::new();
+    let mut speed_cache = speed_cache.map(SpeedCacheRoundData::new);
+
+    add_round_key(&mut state_bits, &round_keys[0]);
+    for round in 0..N_ROUNDS {
+        match speed_cache.as_mut() {
+            Some(speed_cache) if round < ZERO_CHECK_ROUNDS => {
+                speed_cache
+                    .zero_values
+                    .pairs_into(round, &mut extra_lhs, &mut extra_rhs);
+                let zero_ands = sbox_layer_one_with_extra_into(
+                    &state_bits,
+                    &extra_lhs,
+                    &extra_rhs,
+                    net,
+                    state,
+                    SboxScratch {
+                        and_lhs: &mut and_lhs,
+                        and_rhs: &mut and_rhs,
+                        output: &mut sboxed,
+                    },
+                )?;
+                speed_cache.zero_values.apply(zero_ands, round);
+            }
+            Some(speed_cache) if round == ZERO_CHECK_ROUNDS && !speed_cache.target.is_empty() => {
+                let found = speed_cache.zero_values.found_bits();
+                let masks_x = found
+                    .iter()
+                    .map(bit_to_binary_mask::<u32>)
+                    .collect::<Vec<_>>();
+                let masks_y = found
+                    .iter()
+                    .map(bit_to_binary_mask::<u64>)
+                    .collect::<Vec<_>>();
+                let (x_if_found, y_if_found) = sbox_layer_one_with_cmux_into(
+                    &state_bits,
+                    CmuxAnds {
+                        masks_x: &masks_x,
+                        x: &speed_cache.target.addrs,
+                        masks_y: &masks_y,
+                        y: &speed_cache.target.data,
+                    },
+                    net,
+                    state,
+                    SboxScratch {
+                        and_lhs: &mut and_lhs,
+                        and_rhs: &mut and_rhs,
+                        output: &mut sboxed,
+                    },
+                )?;
+                speed_cache
+                    .target
+                    .set_result((x_if_found, y_if_found, found));
+            }
+            _ => {
+                sbox_layer_one_with_extra_into(
+                    &state_bits,
+                    &[],
+                    &[],
+                    net,
+                    state,
+                    SboxScratch {
+                        and_lhs: &mut and_lhs,
+                        and_rhs: &mut and_rhs,
+                        output: &mut sboxed,
+                    },
+                )?;
+            }
+        }
+
+        four_russians_into(round, &sboxed, &mut linear);
+        std::mem::swap(&mut state_bits, &mut linear);
+        xor_constants(round, &mut state_bits, active_mask, state.id);
+        add_round_key(&mut state_bits, &round_keys[round + 1]);
+    }
+
+    Ok(pack_lanes(&state_bits, num_lanes))
+}
+
+struct SpeedCacheRoundData<'a> {
+    target: &'a mut SpeedCachePrecomputeData,
+    zero_values: ZeroU8Values,
+}
+
+impl<'a> SpeedCacheRoundData<'a> {
+    fn new(target: &'a mut SpeedCachePrecomputeData) -> Self {
+        let zero_inputs = target.zero_inputs();
+        Self {
+            target,
+            zero_values: ZeroU8Values::new(&zero_inputs),
+        }
+    }
+}
+
+enum ZeroU8Values {
+    Four(Vec<[Share; 4]>),
+    Two(Vec<[Share; 2]>),
+    One(Vec<Share>),
+}
+
+impl ZeroU8Values {
+    fn new(inputs: &[XShare]) -> Self {
+        Self::Four(
+            inputs
+                .iter()
+                .copied()
+                .map(|x| {
+                    let x = !x;
+                    [0, 8, 16, 24].map(|shift| {
+                        Share::new_ring(
+                            RingElement(((x.a.0 >> shift) & 0xff) as u8),
+                            RingElement(((x.b.0 >> shift) & 0xff) as u8),
+                        )
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn pairs_into(&self, round: usize, lhs: &mut Vec<Share>, rhs: &mut Vec<Share>) {
+        lhs.clear();
+        rhs.clear();
+        match self {
+            Self::Four(values) => {
+                lhs.reserve(2 * values.len());
+                rhs.reserve(2 * values.len());
+                for value in values {
+                    lhs.extend([value[0], value[2]]);
+                    rhs.extend([value[1], value[3]]);
+                }
+            }
+            Self::Two(values) => {
+                lhs.reserve(values.len());
+                rhs.reserve(values.len());
+                for value in values {
+                    lhs.push(value[0]);
+                    rhs.push(value[1]);
+                }
+            }
+            Self::One(values) => {
+                lhs.reserve(values.len());
+                rhs.reserve(values.len());
+                for &value in values {
+                    lhs.push(value);
+                    rhs.push(value >> (1 << (ZERO_CHECK_ROUNDS - 1 - round)));
+                }
+            }
+        }
+    }
+
+    fn apply(&mut self, ands: Vec<Share>, round: usize) {
+        *self = if round == 0 {
+            Self::Two(
+                ands.chunks_exact(2)
+                    .map(|chunk| [chunk[0], chunk[1]])
+                    .collect(),
+            )
+        } else {
+            Self::One(ands)
+        };
+    }
+
+    fn found_bits(&self) -> Vec<BitShare> {
+        match self {
+            Self::One(values) => values.iter().map(|value| value.get_bit(0)).collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+struct SboxScratch<'a> {
+    and_lhs: &'a mut Vec<Share>,
+    and_rhs: &'a mut Vec<Share>,
+    output: &'a mut [Share],
+}
+
+struct AndBatch<'a, T> {
+    lhs: &'a [T],
+    rhs: &'a [T],
+}
+
+struct CmuxAnds<'a> {
+    masks_x: &'a [XShare],
+    x: &'a [XShare],
+    masks_y: &'a [YShare],
+    y: &'a [YShare],
+}
+
+fn sbox_layer_one_with_extra_into<N: Network>(
+    input: &[Share],
+    extra_lhs: &[Share],
+    extra_rhs: &[Share],
+    net: &N,
+    state: &mut Rep3State,
+    scratch: SboxScratch<'_>,
+) -> eyre::Result<Vec<Share>> {
+    let ands_per_block = 3 * N_SBOXES;
+    scratch.and_lhs.clear();
+    scratch.and_rhs.clear();
+    scratch.and_lhs.reserve(ands_per_block + extra_lhs.len());
+    scratch.and_rhs.reserve(ands_per_block + extra_rhs.len());
+    collect_sbox_ands(input, scratch.and_lhs, scratch.and_rhs);
+    scratch.and_lhs.extend_from_slice(extra_lhs);
+    scratch.and_rhs.extend_from_slice(extra_rhs);
+
+    let mut ands = binary::and_vec(scratch.and_lhs, scratch.and_rhs, net, state)?;
+    let extra_ands = ands.split_off(ands_per_block);
+    apply_sbox_ands(input, &ands, scratch.output);
+    Ok(extra_ands)
+}
+
+fn sbox_layer_one_with_cmux_into<N: Network>(
+    input: &[Share],
+    cmux: CmuxAnds<'_>,
+    net: &N,
+    state: &mut Rep3State,
+    scratch: SboxScratch<'_>,
+) -> eyre::Result<(Vec<XShare>, Vec<YShare>)> {
+    let ands_per_block = 3 * N_SBOXES;
+    scratch.and_lhs.clear();
+    scratch.and_rhs.clear();
+    scratch.and_lhs.reserve(ands_per_block);
+    scratch.and_rhs.reserve(ands_per_block);
+    collect_sbox_ands(input, scratch.and_lhs, scratch.and_rhs);
+
+    let (ands, x_if_found, y_if_found) = and_vec_mixed_u8_x_y(
+        AndBatch {
+            lhs: scratch.and_lhs,
+            rhs: scratch.and_rhs,
+        },
+        AndBatch {
+            lhs: cmux.masks_x,
+            rhs: cmux.x,
+        },
+        AndBatch {
+            lhs: cmux.masks_y,
+            rhs: cmux.y,
+        },
+        net,
+        state,
+    )?;
+    apply_sbox_ands(input, &ands, scratch.output);
+    Ok((x_if_found, y_if_found))
+}
+
+macro_rules! local_ands {
+    ($lhs:expr, $rhs:expr, $state:expr, $ty:ty) => {
+        $lhs.iter()
+            .zip($rhs)
+            .map(|(lhs, rhs)| {
+                let (mut mask, mask_b) = $state.rngs.rand.random_elements::<RingElement<$ty>>();
+                mask ^= mask_b;
+                (lhs & rhs) ^ mask
+            })
+            .collect::<Vec<_>>()
+    };
+}
+
+fn and_vec_mixed_u8_x_y<N: Network>(
+    u8s: AndBatch<'_, Share>,
+    xs: AndBatch<'_, XShare>,
+    ys: AndBatch<'_, YShare>,
+    net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<(Vec<Share>, Vec<XShare>, Vec<YShare>)> {
+    assert_eq!(u8s.lhs.len(), u8s.rhs.len());
+    assert_eq!(xs.lhs.len(), xs.rhs.len());
+    assert_eq!(ys.lhs.len(), ys.rhs.len());
+
+    let local8 = local_ands!(u8s.lhs, u8s.rhs, state, u8);
+    let local_x = local_ands!(xs.lhs, xs.rhs, state, u32);
+    let local_y = local_ands!(ys.lhs, ys.rhs, state, u64);
+
+    let (recv8, recv_x, recv_y) =
+        net.reshare((local8.clone(), local_x.clone(), local_y.clone()))?;
+    eyre::ensure!(
+        recv8.len() == local8.len()
+            && recv_x.len() == local_x.len()
+            && recv_y.len() == local_y.len(),
+        "mixed AND reshare received wrong lengths"
+    );
+
+    Ok((
+        local8
+            .into_iter()
+            .zip(recv8)
+            .map(|(a, b)| Share::new_ring(a, b))
+            .collect(),
+        local_x
+            .into_iter()
+            .zip(recv_x)
+            .map(|(a, b)| Rep3RingShare::new_ring(a, b))
+            .collect(),
+        local_y
+            .into_iter()
+            .zip(recv_y)
+            .map(|(a, b)| Rep3RingShare::new_ring(a, b))
+            .collect(),
+    ))
+}
