@@ -7,12 +7,9 @@ use std::{
 use clap::{ArgAction, Args};
 use doram::{GigaDoram, GigaDoramConfig, GigaDoramTiming};
 use eyre::{Result, ensure};
-use mpc_core::protocols::{
-    rep3::{Rep3State, conversion::A2BType, id::PartyID},
-    rep3_ring::binary,
-};
+use mpc_core::protocols::rep3::{Rep3State, conversion::A2BType, id::PartyID};
 use mpc_net::{Network, tcp::NetworkConfig};
-use primitives::{X, Y, promote_public};
+use primitives::{X, Y, Y_BITS, YField, open_y, promote_public, promote_public_y, random_bigint};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -71,18 +68,11 @@ pub fn install_tracing() {
 }
 
 pub fn doram_config(config: &DoramBenchmarkConfig) -> Result<GigaDoramConfig> {
-    let doram_config = GigaDoramConfig::new(
+    Ok(GigaDoramConfig::new(
         config.log_address_space,
         config.num_levels,
         config.log_amp_factor,
-    );
-
-    ensure!(
-        config.log_address_space < Y::BITS as usize - doram_config.num_levels,
-        "benchmark y values must not overlap DORAM alibi bits"
-    );
-
-    Ok(doram_config)
+    ))
 }
 
 pub fn generate_queries(config: &DoramBenchmarkConfig) -> Vec<BenchmarkQuery> {
@@ -91,7 +81,7 @@ pub fn generate_queries(config: &DoramBenchmarkConfig) -> Vec<BenchmarkQuery> {
     (0..config.num_queries)
         .map(|_| BenchmarkQuery {
             x: rng.gen_range(1..address_space_size) as X,
-            y: rng.gen_range(1..address_space_size) as Y,
+            y: benchmark_y(rng.r#gen()),
             is_write: rng.gen_bool(0.5),
         })
         .collect()
@@ -146,7 +136,7 @@ pub fn print_startup_config(
         config.build_bottom_level_at_startup,
         config.log_address_space,
         real_entries,
-        Y::BITS,
+        Y_BITS,
         doram_config.num_levels,
         doram_config.log_amp_factor,
         doram_config.amp_factor(),
@@ -173,7 +163,7 @@ pub fn run_party<N: Network>(
     let mut doram = if config.build_bottom_level_at_startup {
         let bottom_num_elements = (1usize << config.log_address_space) - 1;
         let ys = (1..=bottom_num_elements)
-            .map(|y| promote_public(state.id, y as Y))
+            .map(|y| promote_public_y(state.id, benchmark_y(y as u64)))
             .collect::<Vec<_>>();
         GigaDoram::new_with_initial_bottom_level(
             doram_config,
@@ -189,24 +179,24 @@ pub fn run_party<N: Network>(
 
     for query in queries {
         let initial_value = if config.build_bottom_level_at_startup {
-            query.x as Y
+            benchmark_y(query.x as u64)
         } else {
-            0
+            Y::default()
         };
         let expected = oracle.get(&query.x).copied().unwrap_or(initial_value);
         let x = promote_public(state.id, query.x);
 
         let result = if query.is_write {
-            let y = promote_public(state.id, query.y);
+            let y = promote_public_y(state.id, query.y);
             doram.write(x, y, &net, &mut state, Some(&mut timing))?
         } else {
             doram.read(x, &net, &mut state, Some(&mut timing))?
         };
 
-        let opened = binary::open(&result, &net)?.0;
+        let opened = open_y(&result, &net);
         ensure!(
             opened == expected,
-            "party {:?}: query for x={} returned {}, expected {}",
+            "party {:?}: query for x={} returned {:?}, expected {:?}",
             state.id,
             query.x,
             opened,
@@ -234,6 +224,11 @@ pub fn run_party<N: Network>(
         bytes_sent,
         bytes_received,
     })
+}
+
+fn benchmark_y(seed: u64) -> Y {
+    let mut rng = ChaCha20Rng::seed_from_u64(seed);
+    random_bigint::<YField, _>(&mut rng)
 }
 
 pub fn print_report(config: &DoramBenchmarkConfig, report: &PartyReport) {
@@ -306,7 +301,7 @@ pub fn print_report(config: &DoramBenchmarkConfig, report: &PartyReport) {
         config.log_address_space - (config.num_levels - 1) * config.log_amp_factor,
         config.log_amp_factor,
         config.num_levels,
-        Y::BITS,
+        Y_BITS,
         format_duration(report.total_time),
         format_duration(report.setup_time),
         format_duration(report.timing.time_total_build_prf),

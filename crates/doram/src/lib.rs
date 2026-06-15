@@ -10,16 +10,13 @@ use data_structures::{OHTableParams, OhTable, OhTableQueryTiming, OhTableTiming,
 use eyre::{Result, ensure};
 use mpc_core::protocols::{
     rep3::{Rep3State, id::PartyID},
-    rep3_ring::{
-        arithmetic,
-        binary::{self, and_with_public, or_public},
-        ring::{bit::Bit, ring_impl::RingElement},
-    },
+    rep3_ring::{arithmetic, binary, ring::bit::Bit},
 };
 use mpc_net::Network;
 use primitives::{
-    ArrayShuffler, BitShare, Block, BlockShare, X, XShare, Y, YShare, open_many, promote_public,
-    upcast_x_to_block,
+    AlibiShare, ArrayShuffler, Block, BlockShare, X, XShare, YRecord, YShare, alibi_from_blocks,
+    alibi_to_blocks, open_many, promote_public, upcast_x_to_block, y_from_block_pairs,
+    y_to_block_pairs,
 };
 
 pub const EMPIRICAL_CHT_STASH_SIZE: usize = 8;
@@ -161,8 +158,8 @@ impl GigaDoramConfig {
             "stash must fit inside the speed cache"
         );
         assert!(
-            self.num_levels <= Y::BITS as usize,
-            "alibi bits are stored in the high bits of y"
+            self.num_levels <= u8::BITS as usize,
+            "alibi bits must fit in YRecord's alibi byte"
         );
         assert_eq!(
             self.log_address_space_size,
@@ -246,10 +243,8 @@ impl GigaDoram {
         let xs = (1..=bottom_num_elements)
             .map(|x| promote_public(state.id, x as X))
             .collect::<Vec<_>>();
-        let ys = ys
-            .into_iter()
-            .map(|y| doram.clear_alibi_bits(y))
-            .collect::<Vec<_>>();
+        // The value keeps its full field width now; the alibi byte starts zero.
+        let ys = ys.into_iter().map(YRecord::from_value).collect::<Vec<_>>();
 
         doram.new_ohtable_of_level(bottom_level, xs, ys, net, state, timing)?;
         doram.insert_stash(bottom_level, state.id);
@@ -331,11 +326,12 @@ impl GigaDoram {
         if let Some(timing) = &mut timing {
             timing.time_total_query_speed_cache += start.elapsed();
         }
+        let mut alibi_mask = y_accum.get_alibi_bits(self.config.num_levels);
 
         // Traverse each live level and query the corresponding table
         for (&level, &q) in live_levels.iter().zip(&qs) {
             let start = Instant::now();
-            let use_dummy = binary::xor(&self.alibi_bit(&y_accum, level), &found);
+            let use_dummy = binary::xor(&alibi_mask[level], &found);
             let table = self.levels[level]
                 .as_mut()
                 .expect("live level should still exist during query");
@@ -346,6 +342,7 @@ impl GigaDoram {
 
             y_accum ^= y_returned;
             found ^= found_returned;
+            alibi_mask = y_accum.get_alibi_bits(self.config.num_levels);
             if let Some(timing) = &mut timing {
                 timing.time_total_query_ohtable += start.elapsed();
                 timing
@@ -355,17 +352,17 @@ impl GigaDoram {
         }
 
         // Write the new value on writes, or refresh the old value on reads.
+        // Either way the speed-cache entry starts with a fresh (zero) alibi byte.
         let start = Instant::now();
-        let value_to_write = write_y.unwrap_or(y_accum);
-        self.speed_cache
-            .write(vec![query_x], vec![self.clear_alibi_bits(value_to_write)]);
+        let value_to_write = YRecord::from_value(write_y.unwrap_or(y_accum.value));
+        self.speed_cache.write(vec![query_x], vec![value_to_write]);
         if let Some(timing) = &mut timing {
             timing.time_total_query_writeback += start.elapsed();
             timing.time_total_queries += query_start.elapsed();
         }
 
-        // Reset alibi bits for returned value as well
-        Ok(self.clear_alibi_bits(y_accum))
+        // Return the full-field value (alibi bits live separately now).
+        Ok(y_accum.value)
     }
 
     fn rebuild<N: Network>(
@@ -393,7 +390,7 @@ impl GigaDoram {
             let offset = extracted_xs.len();
             let end = offset + self.num_elements_at(level, self.base_b_state_vec[level]);
             extracted_xs.resize(end, XShare::default());
-            extracted_ys.resize(end, YShare::default());
+            extracted_ys.resize(end, YRecord::default());
             extracted_xs[offset..offset + xs.len()].clone_from_slice(&xs);
             extracted_ys[offset..offset + ys.len()].clone_from_slice(&ys);
         }
@@ -407,15 +404,27 @@ impl GigaDoram {
             "rebuild extracted mismatched x/y lengths"
         );
 
+        // Extracted elements are re-inserted at a fresh level, so reset their
+        // alibi bytes (they get re-stamped on insert).
         for y in extracted_ys.iter_mut() {
-            *y = self.clear_alibi_bits(*y);
+            *y = y.clear_alibi();
         }
 
         if rebuild_to == self.config.num_levels - 1 {
             if self.had_initial_bottom_level {
                 let shuffler = ArrayShuffler::new(extracted_xs.len(), state);
+                let values = YRecord::get_y_values(&extracted_ys);
+                let alibis = YRecord::get_alibis(&extracted_ys);
+                let (mut y_low, mut y_high) = y_to_block_pairs(&values);
+                let mut y_alibi = alibi_to_blocks(&alibis);
                 shuffler.forward(&mut extracted_xs, net, state)?;
-                shuffler.forward(&mut extracted_ys, net, state)?;
+                shuffler.forward(&mut y_low, net, state)?;
+                shuffler.forward(&mut y_high, net, state)?;
+                shuffler.forward(&mut y_alibi, net, state)?;
+                extracted_ys = YRecord::from_columns(
+                    y_from_block_pairs(y_low, y_high),
+                    alibi_from_blocks(y_alibi),
+                );
             }
 
             (extracted_xs, extracted_ys) = self.cleanse_bottom_level(
@@ -470,7 +479,7 @@ impl GigaDoram {
         &mut self,
         level: usize,
         xs: Vec<XShare>,
-        ys: Vec<YShare>,
+        ys: Vec<YRecord>,
         net: &N,
         state: &mut Rep3State,
         mut timing: Option<&mut GigaDoramTiming>,
@@ -534,7 +543,7 @@ impl GigaDoram {
             let stash_ys = table
                 .stash_ys
                 .iter()
-                .map(|y| self.set_alibi_bit(*y, level, party_id))
+                .map(|y| y.set_alibi_bit(level, party_id))
                 .collect::<Vec<_>>();
             (table.stash_xs.clone(), stash_ys)
         };
@@ -594,11 +603,11 @@ impl GigaDoram {
     fn cleanse_bottom_level<N: Network>(
         &self,
         mut xs: Vec<XShare>,
-        mut ys: Vec<YShare>,
+        mut ys: Vec<YRecord>,
         net: &N,
         state: &mut Rep3State,
         mut timing: Option<&mut GigaDoramTiming>,
-    ) -> Result<(Vec<XShare>, Vec<YShare>)> {
+    ) -> Result<(Vec<XShare>, Vec<YRecord>)> {
         ensure!(
             xs.len() == ys.len(),
             "bottom cleanse received mismatched x/y lengths"
@@ -634,17 +643,29 @@ impl GigaDoram {
         }
 
         let sort_len = xs.len().next_power_of_two();
+        let mut values = YRecord::get_y_values(&ys);
+        let mut alibis = YRecord::get_alibis(&ys);
         xs.resize(sort_len, XShare::default());
-        ys.resize(sort_len, YShare::default());
+        values.resize(sort_len, YShare::default());
+        alibis.resize(sort_len, AlibiShare::default());
         dummy_flags.resize(sort_len, promote_public(state.id, Bit::new(true)));
         let start = Instant::now();
-        Batcher::sort(&mut dummy_flags, &mut xs, &mut ys, net, state)?;
+        Batcher::sort(
+            &mut dummy_flags,
+            &mut xs,
+            &mut values,
+            &mut alibis,
+            net,
+            state,
+        )?;
         if let Some(timing) = &mut timing {
             timing.time_total_batcher += start.elapsed();
         }
 
         xs.truncate(bottom_num_elements);
-        ys.truncate(bottom_num_elements);
+        values.truncate(bottom_num_elements);
+        alibis.truncate(bottom_num_elements);
+        ys = YRecord::from_columns(values, alibis);
         self.relabel_dummies(&mut xs, net, state)?;
 
         Ok((xs, ys))
@@ -681,24 +702,5 @@ impl GigaDoram {
             net,
             state,
         )
-    }
-
-    fn alibi_bit(&self, y: &YShare, level: usize) -> BitShare {
-        y.get_bit(Y::BITS as usize - 1 - level)
-    }
-
-    fn set_alibi_bit(&self, y: YShare, level: usize, party_id: PartyID) -> YShare {
-        let mask = 1u64 << (Y::BITS as usize - 1 - level);
-        or_public(&y, &RingElement(mask), party_id)
-    }
-
-    fn clear_alibi_bits(&self, y: YShare) -> YShare {
-        let keep_bits = Y::BITS as usize - self.config.num_levels;
-        let mask = if keep_bits == Y::BITS as usize {
-            Y::MAX
-        } else {
-            (1u64 << keep_bits) - 1
-        };
-        and_with_public(&y, &RingElement(mask))
     }
 }

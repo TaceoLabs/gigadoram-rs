@@ -3,7 +3,10 @@ use mpc_core::protocols::{
     rep3_ring::{Rep3RingShare, binary, ring::ring_impl::RingElement},
 };
 use mpc_net::Network;
-use primitives::{BitShare, BlockShare, X, XShare, YShare, bit_to_binary_mask};
+use primitives::{
+    BitShare, BlockShare, X, XShare, YRecord, alibi_from_blocks, alibi_to_blocks,
+    bit_to_binary_mask, y_from_block_pairs, y_to_block_pairs,
+};
 
 use crate::lowmc::{
     common::{BLOCK_SIZE, N_ROUNDS, N_SBOXES},
@@ -19,12 +22,12 @@ const ZERO_CHECK_ROUNDS: usize = X::BITS.ilog2() as usize;
 pub struct SpeedCachePrecomputeData {
     query_addr: XShare,
     addrs: Vec<XShare>,
-    data: Vec<YShare>,
-    result: Option<(Vec<XShare>, Vec<YShare>, Vec<BitShare>)>,
+    data: Vec<YRecord>,
+    result: Option<(Vec<XShare>, Vec<YRecord>, Vec<BitShare>)>,
 }
 
 impl SpeedCachePrecomputeData {
-    pub fn new(query_addr: XShare, addrs: Vec<XShare>, data: Vec<YShare>) -> Self {
+    pub fn new(query_addr: XShare, addrs: Vec<XShare>, data: Vec<YRecord>) -> Self {
         assert_eq!(addrs.len(), data.len());
         Self {
             query_addr,
@@ -42,7 +45,7 @@ impl SpeedCachePrecomputeData {
         self.addrs.is_empty()
     }
 
-    pub fn take_result(&mut self) -> Option<(Vec<XShare>, Vec<YShare>, Vec<BitShare>)> {
+    pub fn take_result(&mut self) -> Option<(Vec<XShare>, Vec<YRecord>, Vec<BitShare>)> {
         self.result.take()
     }
 
@@ -54,7 +57,7 @@ impl SpeedCachePrecomputeData {
             .collect()
     }
 
-    fn set_result(&mut self, result: (Vec<XShare>, Vec<YShare>, Vec<BitShare>)) {
+    fn set_result(&mut self, result: (Vec<XShare>, Vec<YRecord>, Vec<BitShare>)) {
         self.result = Some(result);
     }
 }
@@ -137,24 +140,35 @@ pub fn encrypt_few_with_repeated_input<N: Network>(
                     .collect::<Vec<_>>();
                 let masks_y = found
                     .iter()
-                    .map(bit_to_binary_mask::<u64>)
+                    .map(bit_to_binary_mask::<u128>)
                     .collect::<Vec<_>>();
-                let (x_if_found, y_if_found) = sbox_layer_one_with_cmux_into(
-                    &state_bits,
-                    CmuxAnds {
-                        masks_x: &masks_x,
-                        x: &speed_cache.target.addrs,
-                        masks_y: &masks_y,
-                        y: &speed_cache.target.data,
-                    },
-                    net,
-                    state,
-                    SboxScratch {
-                        and_lhs: &mut and_lhs,
-                        and_rhs: &mut and_rhs,
-                        output: &mut sboxed,
-                    },
-                )?;
+                let values = YRecord::get_y_values(&speed_cache.target.data);
+                let alibis = YRecord::get_alibis(&speed_cache.target.data);
+                let (y_low, y_high) = y_to_block_pairs(&values);
+                let alibis = alibi_to_blocks(&alibis);
+                let (x_if_found, selected_y_low, selected_y_high, selected_alibi) =
+                    sbox_layer_one_with_cmux_into(
+                        &state_bits,
+                        CmuxAnds {
+                            masks_x: &masks_x,
+                            x: &speed_cache.target.addrs,
+                            masks_y: &masks_y,
+                            y_low: &y_low,
+                            y_high: &y_high,
+                            alibi: &alibis,
+                        },
+                        net,
+                        state,
+                        SboxScratch {
+                            and_lhs: &mut and_lhs,
+                            and_rhs: &mut and_rhs,
+                            output: &mut sboxed,
+                        },
+                    )?;
+                let y_if_found = YRecord::from_columns(
+                    y_from_block_pairs(selected_y_low, selected_y_high),
+                    alibi_from_blocks(selected_alibi),
+                );
                 speed_cache
                     .target
                     .set_result((x_if_found, y_if_found, found));
@@ -289,9 +303,18 @@ struct AndBatch<'a, T> {
 struct CmuxAnds<'a> {
     masks_x: &'a [XShare],
     x: &'a [XShare],
-    masks_y: &'a [YShare],
-    y: &'a [YShare],
+    masks_y: &'a [BlockShare],
+    y_low: &'a [BlockShare],
+    y_high: &'a [BlockShare],
+    alibi: &'a [BlockShare],
 }
+
+type SelectedCacheChunks = (
+    Vec<XShare>,
+    Vec<BlockShare>,
+    Vec<BlockShare>,
+    Vec<BlockShare>,
+);
 
 fn sbox_layer_one_with_extra_into<N: Network>(
     input: &[Share],
@@ -322,7 +345,11 @@ fn sbox_layer_one_with_cmux_into<N: Network>(
     net: &N,
     state: &mut Rep3State,
     scratch: SboxScratch<'_>,
-) -> eyre::Result<(Vec<XShare>, Vec<YShare>)> {
+) -> eyre::Result<SelectedCacheChunks> {
+    assert_eq!(cmux.x.len(), cmux.y_low.len());
+    assert_eq!(cmux.x.len(), cmux.y_high.len());
+    assert_eq!(cmux.x.len(), cmux.alibi.len());
+
     let ands_per_block = 3 * N_SBOXES;
     scratch.and_lhs.clear();
     scratch.and_rhs.clear();
@@ -330,7 +357,16 @@ fn sbox_layer_one_with_cmux_into<N: Network>(
     scratch.and_rhs.reserve(ands_per_block);
     collect_sbox_ands(input, scratch.and_lhs, scratch.and_rhs);
 
-    let (ands, x_if_found, y_if_found) = and_vec_mixed_u8_x_y(
+    let mut block_lhs = Vec::with_capacity(3 * cmux.x.len());
+    let mut block_rhs = Vec::with_capacity(3 * cmux.x.len());
+    block_lhs.extend_from_slice(cmux.masks_y);
+    block_rhs.extend_from_slice(cmux.y_low);
+    block_lhs.extend_from_slice(cmux.masks_y);
+    block_rhs.extend_from_slice(cmux.y_high);
+    block_lhs.extend_from_slice(cmux.masks_y);
+    block_rhs.extend_from_slice(cmux.alibi);
+
+    let (ands, x_if_found, block_outputs) = and_vec_mixed_u8_x_block(
         AndBatch {
             lhs: scratch.and_lhs,
             rhs: scratch.and_rhs,
@@ -340,14 +376,21 @@ fn sbox_layer_one_with_cmux_into<N: Network>(
             rhs: cmux.x,
         },
         AndBatch {
-            lhs: cmux.masks_y,
-            rhs: cmux.y,
+            lhs: &block_lhs,
+            rhs: &block_rhs,
         },
         net,
         state,
     )?;
     apply_sbox_ands(input, &ands, scratch.output);
-    Ok((x_if_found, y_if_found))
+    let (selected_y_low, blocks) = block_outputs.split_at(cmux.x.len());
+    let (selected_y_high, selected_alibi) = blocks.split_at(cmux.x.len());
+    Ok((
+        x_if_found,
+        selected_y_low.to_vec(),
+        selected_y_high.to_vec(),
+        selected_alibi.to_vec(),
+    ))
 }
 
 macro_rules! local_ands {
@@ -363,27 +406,27 @@ macro_rules! local_ands {
     };
 }
 
-fn and_vec_mixed_u8_x_y<N: Network>(
+fn and_vec_mixed_u8_x_block<N: Network>(
     u8s: AndBatch<'_, Share>,
     xs: AndBatch<'_, XShare>,
-    ys: AndBatch<'_, YShare>,
+    blocks: AndBatch<'_, BlockShare>,
     net: &N,
     state: &mut Rep3State,
-) -> eyre::Result<(Vec<Share>, Vec<XShare>, Vec<YShare>)> {
+) -> eyre::Result<(Vec<Share>, Vec<XShare>, Vec<BlockShare>)> {
     assert_eq!(u8s.lhs.len(), u8s.rhs.len());
     assert_eq!(xs.lhs.len(), xs.rhs.len());
-    assert_eq!(ys.lhs.len(), ys.rhs.len());
+    assert_eq!(blocks.lhs.len(), blocks.rhs.len());
 
     let local8 = local_ands!(u8s.lhs, u8s.rhs, state, u8);
     let local_x = local_ands!(xs.lhs, xs.rhs, state, u32);
-    let local_y = local_ands!(ys.lhs, ys.rhs, state, u64);
+    let local_block = local_ands!(blocks.lhs, blocks.rhs, state, u128);
 
-    let (recv8, recv_x, recv_y) =
-        net.reshare((local8.clone(), local_x.clone(), local_y.clone()))?;
+    let (recv8, recv_x, recv_block) =
+        net.reshare((local8.clone(), local_x.clone(), local_block.clone()))?;
     eyre::ensure!(
         recv8.len() == local8.len()
             && recv_x.len() == local_x.len()
-            && recv_y.len() == local_y.len(),
+            && recv_block.len() == local_block.len(),
         "mixed AND reshare received wrong lengths"
     );
 
@@ -398,9 +441,9 @@ fn and_vec_mixed_u8_x_y<N: Network>(
             .zip(recv_x)
             .map(|(a, b)| Rep3RingShare::new_ring(a, b))
             .collect(),
-        local_y
+        local_block
             .into_iter()
-            .zip(recv_y)
+            .zip(recv_block)
             .map(|(a, b)| Rep3RingShare::new_ring(a, b))
             .collect(),
     ))

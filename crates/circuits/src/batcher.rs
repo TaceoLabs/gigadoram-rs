@@ -7,7 +7,10 @@ use mpc_core::protocols::{
     },
 };
 use mpc_net::Network;
-use primitives::{BitShare, Block, BlockShare, X, XShare, Y, YShare};
+use primitives::{
+    AlibiShare, BitShare, Block, BlockShare, X, XShare, YShare, alibi_from_blocks, alibi_to_blocks,
+    y_from_block_pairs, y_to_block_pairs,
+};
 
 type PermRing = u32;
 
@@ -18,31 +21,37 @@ impl Batcher {
         dummy_flags: &mut [BitShare],
         xs: &mut [XShare],
         ys: &mut [YShare],
+        alibis: &mut [AlibiShare],
         net: &N,
         state: &mut Rep3State,
     ) -> Result<()> {
         debug_assert_eq!(xs.len(), dummy_flags.len());
         debug_assert_eq!(ys.len(), dummy_flags.len());
-        assert!(
-            !dummy_flags.is_empty(),
-            "batcher sort does not support empty arrays"
-        );
+        debug_assert_eq!(alibis.len(), dummy_flags.len());
 
         let bits = conversion::bit_inject_from_bits_many::<PermRing, _>(dummy_flags, net, state)?;
         let perm = gen_bit_perm(bits, net, state)?;
         let rows = dummy_flags
             .iter()
             .zip(xs.iter())
-            .zip(ys.iter())
-            .map(|((flag, x), y)| pack_row(*flag, *x, *y))
+            .map(|(flag, x)| pack_row(*flag, *x))
             .collect::<Vec<_>>();
+        let (y_low, y_high) = y_to_block_pairs(ys);
+        let alibi_blocks = alibi_to_blocks(alibis);
 
-        for (i, row) in apply_inv(&perm, &rows, net, state)?.into_iter().enumerate() {
-            let (flag, x, y) = unpack_row(row);
+        let mut sorted =
+            apply_inv_many(&perm, &[&rows, &y_low, &y_high, &alibi_blocks], net, state)?
+                .into_iter();
+
+        for (i, row) in sorted.next().unwrap().into_iter().enumerate() {
+            let (flag, x) = unpack_row(row);
             dummy_flags[i] = flag;
             xs[i] = x;
-            ys[i] = y;
         }
+        let y_low = sorted.next().unwrap();
+        let y_high = sorted.next().unwrap();
+        ys.clone_from_slice(&y_from_block_pairs(y_low, y_high));
+        alibis.clone_from_slice(&alibi_from_blocks(sorted.next().unwrap()));
         Ok(())
     }
 }
@@ -83,12 +92,12 @@ fn gen_bit_perm<N: Network>(
     )
 }
 
-fn apply_inv<N: Network>(
+fn apply_inv_many<N: Network>(
     rho: &[Rep3RingShare<PermRing>],
-    rows: &[BlockShare],
+    row_sets: &[&[BlockShare]],
     net: &N,
     state: &mut Rep3State,
-) -> Result<Vec<BlockShare>> {
+) -> Result<Vec<Vec<BlockShare>>> {
     let unshuffled = (0..rho.len() as PermRing).collect::<Vec<_>>();
     let (perm_a, perm_b) = state.rngs.rand.random_perm(unshuffled);
     let perm = perm_a
@@ -98,109 +107,156 @@ fn apply_inv<N: Network>(
         .collect::<Vec<_>>();
 
     let opened = shuffle_reveal_perm(&perm, rho, net, state)?;
-    let shuffled = shuffle_rows(&perm, rows, net, state)?;
-    let mut result = vec![BlockShare::zero_share(); rho.len()];
-    for (position, row) in opened.into_iter().zip(shuffled) {
-        result[position.0 as usize - 1] = row;
+    let shuffled_sets = shuffle_rows_many(&perm, row_sets, net, state)?;
+    let mut results = Vec::with_capacity(row_sets.len());
+    for shuffled in shuffled_sets {
+        let mut result = vec![BlockShare::zero_share(); rho.len()];
+        for (position, row) in opened.iter().copied().zip(shuffled) {
+            result[position.0 as usize - 1] = row;
+        }
+        results.push(result);
     }
-    Ok(result)
+    Ok(results)
 }
 
-fn shuffle_rows<N: Network>(
+fn shuffle_rows_many<N: Network>(
     pi: &[Rep3RingShare<PermRing>],
-    input: &[BlockShare],
+    inputs: &[&[BlockShare]],
     net: &N,
     state: &mut Rep3State,
-) -> Result<Vec<BlockShare>> {
+) -> Result<Vec<Vec<BlockShare>>> {
     let len = pi.len();
+
     Ok(match state.id {
         PartyID::ID0 => {
-            let mut alpha_1 = Vec::with_capacity(len);
-            let mut alpha_3 = Vec::with_capacity(len);
-            let mut beta_1 = Vec::with_capacity(len);
-            for row in input {
-                let (a1, a3) = state.rngs.rand.random_elements::<RingElement<Block>>();
-                alpha_1.push(a1);
-                alpha_3.push(a3);
-                beta_1.push(row.a ^ row.b);
-            }
+            let mut shuffled_3_all = Vec::with_capacity(inputs.len() * len);
+            for input in inputs {
+                let mut alpha_1 = Vec::with_capacity(len);
+                let mut alpha_3 = Vec::with_capacity(len);
+                let mut beta_1 = Vec::with_capacity(len);
+                for row in *input {
+                    let (a1, a3) = state.rngs.rand.random_elements::<RingElement<Block>>();
+                    alpha_1.push(a1);
+                    alpha_3.push(a3);
+                    beta_1.push(row.a ^ row.b);
+                }
 
-            let mut shuffled_1 = Vec::with_capacity(len);
-            for (pi, alpha) in pi.iter().zip(alpha_1.iter()) {
-                shuffled_1.push(beta_1[pi.a.0 as usize] ^ alpha);
+                let mut shuffled_1 = Vec::with_capacity(len);
+                for (pi, alpha) in pi.iter().zip(alpha_1.iter()) {
+                    shuffled_1.push(beta_1[pi.a.0 as usize] ^ alpha);
+                }
+                let mut shuffled_3 = alpha_1;
+                for (dst, (pi, alpha)) in shuffled_3.iter_mut().zip(pi.iter().zip(alpha_3)) {
+                    *dst = shuffled_1[pi.b.0 as usize] ^ alpha;
+                }
+                shuffled_3_all.extend(shuffled_3);
             }
-            let mut shuffled_3 = alpha_1;
-            for (dst, (pi, alpha)) in shuffled_3.iter_mut().zip(pi.iter().zip(alpha_3)) {
-                *dst = shuffled_1[pi.b.0 as usize] ^ alpha;
-            }
-            net.send_next_many(&shuffled_3)?;
+            net.send_next_many(&shuffled_3_all)?;
 
-            (0..len)
+            (0..inputs.len())
                 .map(|_| {
-                    let (a, b) = state.rngs.rand.random_elements::<RingElement<Block>>();
-                    BlockShare::new_ring(a, b)
+                    (0..len)
+                        .map(|_| {
+                            let (a, b) = state.rngs.rand.random_elements::<RingElement<Block>>();
+                            BlockShare::new_ring(a, b)
+                        })
+                        .collect()
                 })
                 .collect()
         }
         PartyID::ID1 => {
-            let mut alpha_1 = Vec::with_capacity(len);
-            let mut beta_2 = Vec::with_capacity(len);
-            for row in input {
-                alpha_1.push(state.rngs.rand.random_element_rng2::<RingElement<Block>>());
-                beta_2.push(row.a);
-            }
+            let mut beta_sets = Vec::with_capacity(inputs.len());
+            let mut shuffled_1_all = Vec::with_capacity(inputs.len() * len);
+            for input in inputs {
+                let mut alpha_1 = Vec::with_capacity(len);
+                let mut beta_2 = Vec::with_capacity(len);
+                for row in *input {
+                    alpha_1.push(state.rngs.rand.random_element_rng2::<RingElement<Block>>());
+                    beta_2.push(row.a);
+                }
 
-            let mut shuffled_1 = Vec::with_capacity(len);
-            for (pi, alpha) in pi.iter().zip(alpha_1) {
-                shuffled_1.push(beta_2[pi.b.0 as usize] ^ alpha);
+                for (pi, alpha) in pi.iter().zip(alpha_1) {
+                    shuffled_1_all.push(beta_2[pi.b.0 as usize] ^ alpha);
+                }
+                beta_sets.push(beta_2);
             }
-            let delta = net.reshare_many(&shuffled_1)?;
-            for (dst, pi) in beta_2.iter_mut().zip(pi) {
-                *dst = delta[pi.a.0 as usize];
-            }
+            let delta_all = net.reshare_many(&shuffled_1_all)?;
 
-            let mut result = Vec::with_capacity(len);
-            let mut rand = Vec::with_capacity(len);
-            for beta in beta_2 {
-                let b = state.rngs.rand.random_element_rng2::<RingElement<Block>>();
-                rand.push(beta ^ b);
-                result.push(BlockShare::new_ring(RingElement::default(), b));
+            let mut results = Vec::with_capacity(inputs.len());
+            let mut rand_all = Vec::with_capacity(inputs.len() * len);
+            for (set, beta_2) in beta_sets.iter_mut().enumerate() {
+                let delta = &delta_all[(set * len)..((set + 1) * len)];
+                for (dst, pi) in beta_2.iter_mut().zip(pi) {
+                    *dst = delta[pi.a.0 as usize];
+                }
+
+                let mut result = Vec::with_capacity(len);
+                for beta in beta_2 {
+                    let b = state.rngs.rand.random_element_rng2::<RingElement<Block>>();
+                    rand_all.push(*beta ^ b);
+                    result.push(BlockShare::new_ring(RingElement::default(), b));
+                }
+                results.push(result);
             }
-            let rcv: Vec<RingElement<Block>> =
-                net.send_and_recv_many(PartyID::ID2, &rand, PartyID::ID2)?;
-            for (res, (r1, r2)) in result.iter_mut().zip(rcv.into_iter().zip(rand)) {
-                res.a = r1 ^ r2;
+            let rcv_all: Vec<RingElement<Block>> =
+                net.send_and_recv_many(PartyID::ID2, &rand_all, PartyID::ID2)?;
+            for (result, (rcv, rand)) in results
+                .iter_mut()
+                .zip(rcv_all.chunks_exact(len).zip(rand_all.chunks_exact(len)))
+            {
+                for (res, (&r1, &r2)) in result.iter_mut().zip(rcv.iter().zip(rand)) {
+                    res.a = r1 ^ r2;
+                }
             }
-            result
+            results
         }
         PartyID::ID2 => {
-            let mut alpha_3 = Vec::with_capacity(len);
-            for _ in 0..len {
-                alpha_3.push(state.rngs.rand.random_element_rng1::<RingElement<Block>>());
-            }
-            let gamma: Vec<RingElement<Block>> = net.recv_prev_many()?;
-
-            let mut shuffled_1 = Vec::with_capacity(len);
-            for (pi, alpha) in pi.iter().zip(alpha_3.iter()) {
-                shuffled_1.push(gamma[pi.a.0 as usize] ^ alpha);
-            }
-            for (dst, pi) in alpha_3.iter_mut().zip(pi) {
-                *dst = shuffled_1[pi.b.0 as usize];
+            let mut alpha_sets = Vec::with_capacity(inputs.len());
+            for _ in inputs {
+                let mut alpha_3 = Vec::with_capacity(len);
+                for _ in 0..len {
+                    alpha_3.push(state.rngs.rand.random_element_rng1::<RingElement<Block>>());
+                }
+                alpha_sets.push(alpha_3);
             }
 
-            let mut result = Vec::with_capacity(len);
-            let mut rand = Vec::with_capacity(len);
-            for beta in alpha_3 {
-                let a = state.rngs.rand.random_element_rng1::<RingElement<Block>>();
-                rand.push(beta ^ a);
-                result.push(BlockShare::new_ring(a, RingElement::default()));
+            let gamma_all: Vec<RingElement<Block>> = net.recv_prev_many()?;
+            debug_assert_eq!(gamma_all.len(), inputs.len() * len);
+
+            let mut beta_sets = Vec::with_capacity(inputs.len());
+            for (gamma, mut alpha_3) in gamma_all.chunks_exact(len).zip(alpha_sets) {
+                let mut shuffled_1 = Vec::with_capacity(len);
+                for (pi, alpha) in pi.iter().zip(alpha_3.iter()) {
+                    shuffled_1.push(gamma[pi.a.0 as usize] ^ alpha);
+                }
+                for (dst, pi) in alpha_3.iter_mut().zip(pi) {
+                    *dst = shuffled_1[pi.b.0 as usize];
+                }
+                beta_sets.push(alpha_3);
             }
-            let rcv: Vec<RingElement<Block>> =
-                net.send_and_recv_many(PartyID::ID1, &rand, PartyID::ID1)?;
-            for (res, (r1, r2)) in result.iter_mut().zip(rcv.into_iter().zip(rand)) {
-                res.b = r1 ^ r2;
+
+            let mut results = Vec::with_capacity(inputs.len());
+            let mut rand_all = Vec::with_capacity(inputs.len() * len);
+            for beta_set in beta_sets {
+                let mut result = Vec::with_capacity(len);
+                for beta in beta_set {
+                    let a = state.rngs.rand.random_element_rng1::<RingElement<Block>>();
+                    rand_all.push(beta ^ a);
+                    result.push(BlockShare::new_ring(a, RingElement::default()));
+                }
+                results.push(result);
             }
-            result
+            let rcv_all: Vec<RingElement<Block>> =
+                net.send_and_recv_many(PartyID::ID1, &rand_all, PartyID::ID1)?;
+            for (result, (rcv, rand)) in results
+                .iter_mut()
+                .zip(rcv_all.chunks_exact(len).zip(rand_all.chunks_exact(len)))
+            {
+                for (res, (&r1, &r2)) in result.iter_mut().zip(rcv.iter().zip(rand)) {
+                    res.b = r1 ^ r2;
+                }
+            }
+            results
         }
     })
 }
@@ -273,22 +329,14 @@ fn shuffle_reveal_perm<N: Network>(
     })
 }
 
-fn pack_row(dummy_flag: BitShare, x: XShare, y: YShare) -> BlockShare {
+fn pack_row(dummy_flag: BitShare, x: XShare) -> BlockShare {
     BlockShare::new_ring(
-        RingElement(
-            Block::from(dummy_flag.a.0.convert())
-                | (Block::from(x.a.0) << 32)
-                | (Block::from(y.a.0) << 64),
-        ),
-        RingElement(
-            Block::from(dummy_flag.b.0.convert())
-                | (Block::from(x.b.0) << 32)
-                | (Block::from(y.b.0) << 64),
-        ),
+        RingElement(Block::from(dummy_flag.a.0.convert()) | (Block::from(x.a.0) << 32)),
+        RingElement(Block::from(dummy_flag.b.0.convert()) | (Block::from(x.b.0) << 32)),
     )
 }
 
-fn unpack_row(row: BlockShare) -> (BitShare, XShare, YShare) {
+fn unpack_row(row: BlockShare) -> (BitShare, XShare) {
     (
         BitShare::new_ring(
             RingElement(Bit::new(row.a.0 & 1 != 0)),
@@ -297,10 +345,6 @@ fn unpack_row(row: BlockShare) -> (BitShare, XShare, YShare) {
         XShare::new_ring(
             RingElement(((row.a.0 >> 32) & Block::from(X::MAX)) as X),
             RingElement(((row.b.0 >> 32) & Block::from(X::MAX)) as X),
-        ),
-        YShare::new_ring(
-            RingElement((row.a.0 >> 64) as Y),
-            RingElement((row.b.0 >> 64) as Y),
         ),
     )
 }

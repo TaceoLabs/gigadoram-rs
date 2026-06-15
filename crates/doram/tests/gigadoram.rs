@@ -2,12 +2,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use data_structures::{OhTable, cht};
 use doram::{GigaDoram, GigaDoramConfig};
-use mpc_core::protocols::{
-    rep3::{Rep3State, conversion::A2BType, id::PartyID, network::Rep3NetworkExt},
-    rep3_ring::binary,
+use mpc_core::protocols::rep3::{
+    Rep3State, conversion::A2BType, id::PartyID, network::Rep3NetworkExt,
 };
 use mpc_net::local::LocalNetwork;
-use primitives::{Block, X, Y, open_many, promote_public, run_parties};
+use primitives::{
+    Block, X, Y, Y_BITS, YField, YRecord, open_many, open_many_y, open_y, promote_public,
+    promote_public_y, random_bigint, run_parties, y_low_mask,
+};
+use rand::{SeedableRng, rngs::StdRng};
 
 const NUM_LEVELS: usize = 4;
 const LOG_SPEED_CACHE_SIZE: usize = 4;
@@ -147,7 +150,7 @@ fn test_doram_invariants_with_rebuild() {
 fn test_rebuild_extracts_higher_levels_after_dummy_budget_is_spent() {
     let config = get_standard_config();
     let trace = (0..(config.fill_time() * config.amp_factor() * 2 + 1))
-        .map(|i| Op::write((i + 1) as X, (i + 1) as Y * 10))
+        .map(|i| Op::write((i + 1) as X, ((i + 1) * 10) as u64))
         .collect::<Vec<_>>();
     let expected_outputs = oracle(&trace);
 
@@ -167,8 +170,8 @@ impl Op {
         Self::Read(x)
     }
 
-    const fn write(x: X, y: Y) -> Self {
-        Self::Write(x, y)
+    fn write(x: X, y: u64) -> Self {
+        Self::Write(x, random_y(y))
     }
 
     const fn x(self) -> X {
@@ -210,18 +213,28 @@ fn get_standard_config() -> GigaDoramConfig {
     GigaDoramConfig::new(LOG_ADDRESS_SPACE_SIZE, NUM_LEVELS, LOG_AMP_FACTOR)
 }
 
-fn assert_trace(config: GigaDoramConfig, trace: &[Op], expected: &[Y]) {
+fn assert_trace(config: GigaDoramConfig, trace: &[Op], expected: &[u64]) {
     let outputs = run_trace(config, trace);
+    let expected = expected
+        .iter()
+        .copied()
+        .map(|y| if y == 0 { Y::default() } else { random_y(y) })
+        .collect::<Vec<_>>();
 
     for party_output in outputs {
         assert_eq!(party_output, expected);
     }
 }
 
+fn random_y(seed: u64) -> Y {
+    let mut rng = StdRng::seed_from_u64(seed);
+    random_bigint::<YField, _>(&mut rng) & y_low_mask(Y_BITS - NUM_LEVELS)
+}
+
 // Generates a trace that will trigger a rebuild + some additional provided operations
 fn first_rebuild_trace_with_tail(n_to_rebuild: usize, tail: &[Op]) -> Vec<Op> {
     let mut trace: Vec<Op> = (1..=n_to_rebuild)
-        .map(|x| Op::write(x as X, x as Y * 10))
+        .map(|x| Op::write(x as X, (x * 10) as u64))
         .collect();
     trace.extend_from_slice(tail);
     trace
@@ -237,7 +250,7 @@ fn run_trace(config: GigaDoramConfig, trace: &[Op]) -> [Vec<Y>; 3] {
         for op in trace {
             let value = execute_op(&mut doram, *op, &net, &mut state).unwrap();
 
-            outputs.push(binary::open(&value, &net).unwrap().0);
+            outputs.push(open_y(&value, &net));
         }
 
         outputs
@@ -254,10 +267,10 @@ fn run_trace_assert_invariants(config: GigaDoramConfig, trace: &[Op]) -> [Vec<Y>
 
         for op in trace {
             let before = before_op(&doram, &net);
-            let old_value = *oracle.get(&op.x()).unwrap_or(&0);
+            let old_value = *oracle.get(&op.x()).unwrap_or(&Y::default());
             let value = execute_op(&mut doram, *op, &net, &mut state).unwrap();
 
-            let opened = binary::open(&value, &net).unwrap().0;
+            let opened = open_y(&value, &net);
             outputs.push(opened);
 
             match *op {
@@ -286,10 +299,10 @@ fn oracle(trace: &[Op]) -> Vec<Y> {
     for op in trace {
         match *op {
             Op::Read(x) => {
-                outputs.push(*map.get(&x).unwrap_or(&0));
+                outputs.push(*map.get(&x).unwrap_or(&Y::default()));
             }
             Op::Write(x, y) => {
-                let old = map.insert(x, y).unwrap_or(0);
+                let old = map.insert(x, y).unwrap_or_default();
                 outputs.push(old);
             }
         }
@@ -658,10 +671,7 @@ fn assert_query_invariants(
 fn clear_doram(doram: &GigaDoram, net: &LocalNetwork, state: &Rep3State) -> ClearDoram {
     ClearDoram {
         speed_cache_addrs: open_many(&doram.speed_cache.addrs, net),
-        speed_cache_data: open_many(&doram.speed_cache.data, net)
-            .into_iter()
-            .map(|y| clear_alibi_bits(y, doram.config.num_levels))
-            .collect(),
+        speed_cache_data: open_record_values(&doram.speed_cache.data, net),
         levels: doram
             .levels
             .iter()
@@ -669,20 +679,11 @@ fn clear_doram(doram: &GigaDoram, net: &LocalNetwork, state: &Rep3State) -> Clea
                 level.as_ref().map(|table| ClearOhTable {
                     qs_builder_order: open_many(&table.qs_builder_order, net),
                     builder_xs: open_many(&table.xs_builder_order, net),
-                    builder_ys: open_many(&table.ys_builder_order, net)
-                        .into_iter()
-                        .map(|y| clear_alibi_bits(y, doram.config.num_levels))
-                        .collect(),
+                    builder_ys: open_record_values(&table.ys_builder_order, net),
                     receiver_xs: open_many(&table.xs_receiver_order, net),
-                    receiver_ys: open_many(&table.ys_receiver_order, net)
-                        .into_iter()
-                        .map(|y| clear_alibi_bits(y, doram.config.num_levels))
-                        .collect(),
+                    receiver_ys: open_record_values(&table.ys_receiver_order, net),
                     stash_xs: open_many(&table.stash_xs, net),
-                    stash_ys: open_many(&table.stash_ys, net)
-                        .into_iter()
-                        .map(|y| clear_alibi_bits(y, doram.config.num_levels))
-                        .collect(),
+                    stash_ys: open_record_values(&table.stash_ys, net),
                     dummy_indices: open_many(&table.dummy_indices, net),
                     cht: open_cht(
                         table
@@ -708,7 +709,7 @@ fn execute_op(
         Op::Read(x) => doram.read(promote_public(state.id, x), net, state, None),
         Op::Write(x, y) => doram.write(
             promote_public(state.id, x),
-            promote_public(state.id, y),
+            promote_public_y(state.id, y),
             net,
             state,
             None,
@@ -734,10 +735,8 @@ fn collect_latest_live_values(
     assert_eq!(speed_cache_addrs.len(), doram.speed_cache.num_stored);
 
     let mut values = BTreeMap::new();
-    let speed_cache_data = open_many(&doram.speed_cache.data[..doram.speed_cache.num_stored], net)
-        .into_iter()
-        .map(|y| clear_alibi_bits(y, doram.config.num_levels))
-        .collect::<Vec<_>>();
+    let speed_cache_data =
+        open_record_values(&doram.speed_cache.data[..doram.speed_cache.num_stored], net);
 
     for i in (0..doram.speed_cache.num_stored).rev() {
         let x = speed_cache_addrs[i];
@@ -748,10 +747,7 @@ fn collect_latest_live_values(
 
     for table in doram.levels.iter().flatten() {
         let receiver_xs = open_many(&table.xs_receiver_order, net);
-        let receiver_ys = open_many(&table.ys_receiver_order, net)
-            .into_iter()
-            .map(|y| clear_alibi_bits(y, doram.config.num_levels))
-            .collect::<Vec<_>>();
+        let receiver_ys = open_record_values(&table.ys_receiver_order, net);
 
         for (i, (&x, &y)) in receiver_xs.iter().zip(receiver_ys.iter()).enumerate() {
             if is_real_addr(&doram.config, x) && !table.touched[i] {
@@ -829,9 +825,10 @@ fn blocks_from_wire(words: &[u64]) -> Vec<Block> {
         .collect()
 }
 
-fn clear_alibi_bits(y: Y, num_levels: usize) -> Y {
-    let keep_bits = Y::BITS as usize - num_levels;
-    y & ((1u64 << keep_bits) - 1)
+/// Open the full-field values of a slice of records (alibi bits live separately
+/// now, so the opened value needs no masking).
+fn open_record_values(records: &[YRecord], net: &LocalNetwork) -> Vec<Y> {
+    open_many_y(&records.iter().map(|r| r.value).collect::<Vec<_>>(), net)
 }
 
 fn address_space_size(config: &GigaDoramConfig) -> u64 {
