@@ -310,7 +310,7 @@ impl OhTable {
     ) -> eyre::Result<()> {
         let inputs = upcast_x_to_block_many(xs);
         let keys = vec![self.key.as_slice(); inputs.len()];
-        let qs = lowmc::encrypt_many(&keys, &inputs, net, state)?;
+        let qs = lowmc::packed_u64::encrypt_many(&keys, &inputs, net, state)?;
         self.qs_builder_order[..self.params.num_elements].copy_from_slice(&qs);
         Ok(())
     }

@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use circuits::{
     batcher::Batcher,
     dummy_check::dummy_check_circuit,
-    lowmc::{self, ROUND_KEYS},
+    lowmc::{self, ROUND_KEYS, packed_u8_lanes_with_speed_cache::SpeedCachePrecomputeData},
     replace_if_dummy::replace_if_dummy_circuit,
 };
 use data_structures::{OHTableParams, OhTable, OhTableQueryTiming, OhTableTiming, SpeedCache};
@@ -25,6 +25,32 @@ use primitives::{
 pub const EMPIRICAL_CHT_STASH_SIZE: usize = 8;
 pub const PROVEN_CHT_STASH_SIZE: usize = 50;
 
+/// Which cuckoo-hash-table analysis the stash size and column lengths are
+/// based on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChtBounds {
+    /// Empirically chosen stash size with column load factor 1.2.
+    Empirical,
+    /// Proven stash bound with column load factor 2.0.
+    Proven,
+}
+
+impl ChtBounds {
+    fn stash_size(self) -> usize {
+        match self {
+            Self::Empirical => EMPIRICAL_CHT_STASH_SIZE,
+            Self::Proven => PROVEN_CHT_STASH_SIZE,
+        }
+    }
+
+    fn column_load_factor(self) -> f64 {
+        match self {
+            Self::Empirical => 1.2,
+            Self::Proven => 2.0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GigaDoramConfig {
     pub log_address_space_size: usize,
@@ -32,15 +58,16 @@ pub struct GigaDoramConfig {
     pub log_speed_cache_size: usize,
     pub log_amp_factor: usize,
     pub stash_size: usize,
+    pub cht_bounds: ChtBounds,
 }
 
 impl GigaDoramConfig {
     pub fn new(log_address_space_size: usize, num_levels: usize, log_amp_factor: usize) -> Self {
-        Self::with_stash_size(
+        Self::with_cht_bounds(
             log_address_space_size,
             num_levels,
             log_amp_factor,
-            EMPIRICAL_CHT_STASH_SIZE,
+            ChtBounds::Empirical,
         )
     }
 
@@ -49,11 +76,26 @@ impl GigaDoramConfig {
         num_levels: usize,
         log_amp_factor: usize,
     ) -> Self {
+        Self::with_cht_bounds(
+            log_address_space_size,
+            num_levels,
+            log_amp_factor,
+            ChtBounds::Proven,
+        )
+    }
+
+    pub fn with_cht_bounds(
+        log_address_space_size: usize,
+        num_levels: usize,
+        log_amp_factor: usize,
+        cht_bounds: ChtBounds,
+    ) -> Self {
         Self::with_stash_size(
             log_address_space_size,
             num_levels,
             log_amp_factor,
-            PROVEN_CHT_STASH_SIZE,
+            cht_bounds.stash_size(),
+            cht_bounds,
         )
     }
 
@@ -62,6 +104,7 @@ impl GigaDoramConfig {
         num_levels: usize,
         log_amp_factor: usize,
         stash_size: usize,
+        cht_bounds: ChtBounds,
     ) -> Self {
         assert!(num_levels > 0, "DORAM must have at least one OHTable level");
 
@@ -78,6 +121,7 @@ impl GigaDoramConfig {
             log_speed_cache_size,
             log_amp_factor,
             stash_size,
+            cht_bounds,
         };
         config.validate();
         config
@@ -169,7 +213,7 @@ impl GigaDoram {
         Self {
             config,
             speed_cache,
-            levels: (0..config.num_levels).map(|_| None).collect(),
+            levels: vec![None; config.num_levels],
             base_b_state_vec: vec![0; config.num_levels],
             had_initial_bottom_level: false,
         }
@@ -193,7 +237,7 @@ impl GigaDoram {
         let mut doram = Self {
             config,
             speed_cache: SpeedCache::new(config.speed_cache_size()),
-            levels: (0..config.num_levels).map(|_| None).collect(),
+            levels: vec![None; config.num_levels],
             base_b_state_vec: vec![0; config.num_levels],
             had_initial_bottom_level: true,
         };
@@ -266,27 +310,35 @@ impl GigaDoram {
             .enumerate()
             .filter_map(|(level, table)| table.as_ref().map(|_| level))
             .collect::<Vec<_>>();
+        let mut speed_cache_precompute_data = self.speed_cache.precompute_query(query_x);
         let start = Instant::now();
-        let qs = self.evaluate_prf_tags(&live_levels, query_x, net, state)?;
+        let qs = self.evaluate_prf_tags(
+            &live_levels,
+            query_x,
+            speed_cache_precompute_data.as_mut(),
+            net,
+            state,
+        )?;
         if let Some(timing) = &mut timing {
             timing.time_total_query_prf += start.elapsed();
         }
 
         // Query the SpeedCache and extract alibi bits
         let start = Instant::now();
-        let (mut y_accum, mut found) = self.speed_cache.query(query_x, net, state)?;
+        let (mut y_accum, mut found) =
+            self.speed_cache
+                .query(query_x, speed_cache_precompute_data, net, state)?;
         if let Some(timing) = &mut timing {
             timing.time_total_query_speed_cache += start.elapsed();
         }
-        let mut alibi_mask = self.extract_alibi_bits(&y_accum);
 
         // Traverse each live level and query the corresponding table
         for (&level, &q) in live_levels.iter().zip(&qs) {
             let start = Instant::now();
+            let use_dummy = binary::xor(&self.alibi_bit(&y_accum, level), &found);
             let table = self.levels[level]
                 .as_mut()
                 .expect("live level should still exist during query");
-            let use_dummy = binary::xor(&alibi_mask[level], &found);
             let mut ohtable_timing = OhTableQueryTiming::default();
             let table_timing = timing.is_some().then_some(&mut ohtable_timing);
             let (y_returned, found_returned) =
@@ -294,7 +346,6 @@ impl GigaDoram {
 
             y_accum ^= y_returned;
             found ^= found_returned;
-            alibi_mask = self.extract_alibi_bits(&y_accum);
             if let Some(timing) = &mut timing {
                 timing.time_total_query_ohtable += start.elapsed();
                 timing
@@ -440,11 +491,7 @@ impl GigaDoram {
         } else {
             self.base_b_state_vec[level]
         };
-        let d = if self.config.stash_size == PROVEN_CHT_STASH_SIZE {
-            2.0
-        } else {
-            1.2
-        };
+        let d = self.config.cht_bounds.column_load_factor();
         let log_single_col_len = level * self.config.log_amp_factor
             + self.config.log_speed_cache_size
             + ((d * base_b_num as f64) as usize).ilog2() as usize
@@ -613,6 +660,7 @@ impl GigaDoram {
         &self,
         levels: &[usize],
         input: XShare,
+        speed_cache_precompute_data: Option<&mut SpeedCachePrecomputeData>,
         net: &N,
         state: &mut Rep3State,
     ) -> Result<Vec<BlockShare>> {
@@ -626,14 +674,17 @@ impl GigaDoram {
                 table.key.as_slice()
             })
             .collect::<Vec<_>>();
-        let inputs = vec![upcast_x_to_block(input); levels.len()];
-        lowmc::encrypt_many(&keys, &inputs, net, state)
+        lowmc::packed_u8_lanes_with_speed_cache::encrypt_many_with_repeated_input(
+            &keys,
+            upcast_x_to_block(input),
+            speed_cache_precompute_data,
+            net,
+            state,
+        )
     }
 
-    fn extract_alibi_bits(&self, y: &YShare) -> Vec<BitShare> {
-        (0..self.config.num_levels)
-            .map(|level| y.get_bit(Y::BITS as usize - 1 - level))
-            .collect()
+    fn alibi_bit(&self, y: &YShare, level: usize) -> BitShare {
+        y.get_bit(Y::BITS as usize - 1 - level)
     }
 
     fn set_alibi_bit(&self, y: YShare, level: usize, party_id: PartyID) -> YShare {
