@@ -665,7 +665,7 @@ fn assert_query_invariants(
 
     let selected_x = clear.receiver_xs[trace.selected_receiver_index];
 
-    if selected_x == 0 {
+    if selected_x == 1 << table.params.log_address_space_size {
         let dummy_index = clear.dummy_indices[trace.old_query_count] as usize;
         let mut receiver_shuffle = table.receiver_shuffle.clone().unwrap();
 

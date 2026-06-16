@@ -631,7 +631,7 @@ impl GigaDoram {
             let mut cleansed_xs = Vec::with_capacity(bottom_num_elements);
             let mut cleansed_ys = Vec::with_capacity(bottom_num_elements);
 
-            for ((x, y), is_dummy) in xs.into_iter().zip(ys.into_iter()).zip(dummy_flags) {
+            for ((x, y), is_dummy) in xs.into_iter().zip(ys).zip(dummy_flags) {
                 if !is_dummy.convert() {
                     cleansed_xs.push(x);
                     cleansed_ys.push(y);

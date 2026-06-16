@@ -91,7 +91,7 @@ pub fn generate_queries(config: &DoramBenchmarkConfig) -> Vec<BenchmarkQuery> {
     (0..config.num_queries)
         .map(|_| BenchmarkQuery {
             x: rng.gen_range(0..address_space_size) as X,
-            y: rng.gen_range(1..address_space_size) as Y,
+            y: rng.gen_range(0..address_space_size) as Y,
             is_write: rng.gen_bool(0.5),
         })
         .collect()
