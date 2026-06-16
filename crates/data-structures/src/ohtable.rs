@@ -14,7 +14,7 @@ use mpc_core::protocols::{
 use mpc_net::Network;
 use primitives::{
     ArrayShuffler, Block, BlockShare, LocalPermutation, XShare, YShare, bit_to_binary_mask,
-    downcast_many, reshare_3_to_2, reveal_to_party, set_low_u32,
+    downcast_many, dummy_x, reshare_3_to_2, reveal_to_party, set_low_u32,
     types::{BitShare, input},
     upcast_x_to_block_many, upcast_y_to_block_many,
 };
@@ -32,6 +32,7 @@ pub struct OHTableParams {
     pub stash_size: usize,
     pub builder: PartyID,
     pub log_single_col_len: u32,
+    pub log_address_space_size: usize,
 }
 
 impl OHTableParams {
@@ -40,6 +41,7 @@ impl OHTableParams {
         num_dummies: usize,
         stash_size: usize,
         log_single_col_len: u32,
+        log_address_space_size: usize,
     ) -> Self {
         Self {
             num_elements,
@@ -47,6 +49,7 @@ impl OHTableParams {
             stash_size,
             builder: BUILDER_ID,
             log_single_col_len,
+            log_address_space_size,
         }
     }
 
@@ -136,6 +139,7 @@ impl OhTable {
         assert_eq!(ys.len(), params.num_elements);
         assert_eq!(key.len(), ROUND_KEYS);
 
+        let dummy = dummy_x(state.id, params.log_address_space_size);
         let mut table = Self {
             params,
             key,
@@ -143,7 +147,7 @@ impl OhTable {
             stash_ys: vec![YShare::zero_share(); params.stash_size],
             builder_stash_indices: vec![0; params.stash_size],
             qs_builder_order: vec![BlockShare::zero_share(); params.total_size()],
-            xs_builder_order: vec![XShare::zero_share(); params.total_size()],
+            xs_builder_order: vec![dummy; params.total_size()],
             ys_builder_order: vec![YShare::zero_share(); params.total_size()],
             dummy_indices: vec![XShare::zero_share(); params.num_dummies],
             xs_receiver_order: vec![XShare::zero_share(); params.total_size()],

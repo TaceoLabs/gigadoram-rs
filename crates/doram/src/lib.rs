@@ -2,7 +2,6 @@ use std::time::{Duration, Instant};
 
 use circuits::{
     batcher::Batcher,
-    dummy_check::dummy_check_circuit,
     lowmc::{self, ROUND_KEYS, packed_u8_lanes_with_speed_cache::SpeedCachePrecomputeData},
     replace_if_dummy::replace_if_dummy_circuit,
 };
@@ -18,8 +17,8 @@ use mpc_core::protocols::{
 };
 use mpc_net::Network;
 use primitives::{
-    ArrayShuffler, BitShare, Block, BlockShare, X, XShare, Y, YShare, open_many, promote_public,
-    upcast_x_to_block,
+    ArrayShuffler, BitShare, Block, BlockShare, X, XShare, Y, YShare, dummy_x, open_many,
+    promote_public, upcast_x_to_block,
 };
 
 pub const EMPIRICAL_CHT_STASH_SIZE: usize = 8;
@@ -204,10 +203,11 @@ impl GigaDoramTiming {
 }
 
 impl GigaDoram {
-    pub fn new(config: GigaDoramConfig) -> Self {
+    pub fn new(config: GigaDoramConfig, id: PartyID) -> Self {
         config.validate();
 
-        let mut speed_cache = SpeedCache::new(config.speed_cache_size());
+        let mut speed_cache =
+            SpeedCache::new(config.speed_cache_size(), config.log_address_space_size, id);
         speed_cache.skip(config.stash_size);
 
         Self {
@@ -228,22 +228,26 @@ impl GigaDoram {
     ) -> Result<Self> {
         config.validate();
 
-        let bottom_num_elements = (1usize << config.log_address_space_size) - 1;
+        let bottom_num_elements = 1usize << config.log_address_space_size;
         ensure!(
             ys.len() == bottom_num_elements,
-            "initial bottom level must contain exactly every nonzero address"
+            "initial bottom level must contain exactly every address in [0, 2^N)"
         );
 
         let mut doram = Self {
             config,
-            speed_cache: SpeedCache::new(config.speed_cache_size()),
+            speed_cache: SpeedCache::new(
+                config.speed_cache_size(),
+                config.log_address_space_size,
+                state.id,
+            ),
             levels: vec![None; config.num_levels],
             base_b_state_vec: vec![0; config.num_levels],
             had_initial_bottom_level: true,
         };
 
         let bottom_level = doram.config.num_levels - 1;
-        let xs = (1..=bottom_num_elements)
+        let xs = (0..bottom_num_elements)
             .map(|x| promote_public(state.id, x as X))
             .collect::<Vec<_>>();
         let ys = ys
@@ -379,7 +383,11 @@ impl GigaDoram {
 
         // Extract from the SpeedCache and reset it
         let (mut extracted_xs, mut extracted_ys) = self.speed_cache.extract();
-        self.speed_cache = SpeedCache::new(self.config.speed_cache_size());
+        self.speed_cache = SpeedCache::new(
+            self.config.speed_cache_size(),
+            self.config.log_address_space_size,
+            state.id,
+        );
 
         let last_level_to_extract = rebuild_to + usize::from(need_to_extract_from_rebuild_to);
         for level in 0..last_level_to_extract {
@@ -392,7 +400,9 @@ impl GigaDoram {
             table.extract(&mut xs, &mut ys);
             let offset = extracted_xs.len();
             let end = offset + self.num_elements_at(level, self.base_b_state_vec[level]);
-            extracted_xs.resize(end, XShare::default());
+
+            // Pad missing entries with the dummy sentinel
+            extracted_xs.resize(end, dummy_x(state.id, self.config.log_address_space_size));
             extracted_ys.resize(end, YShare::default());
             extracted_xs[offset..offset + xs.len()].clone_from_slice(&xs);
             extracted_ys[offset..offset + ys.len()].clone_from_slice(&ys);
@@ -502,6 +512,7 @@ impl GigaDoram {
             self.num_dummies(level),
             self.config.stash_size,
             log_single_col_len as u32,
+            self.config.log_address_space_size,
         );
         let key = Self::generate_prf_key(state);
         let start = Instant::now();
@@ -559,7 +570,7 @@ impl GigaDoram {
     }
 
     fn bottom_num_elements(&self) -> usize {
-        (1usize << self.config.log_address_space_size) - 1
+        1usize << self.config.log_address_space_size
     }
 
     fn dummy_label(&self, offset: usize) -> X {
@@ -605,8 +616,10 @@ impl GigaDoram {
         );
         let bottom_num_elements = self.bottom_num_elements();
 
-        let mut dummy_flags =
-            dummy_check_circuit(&xs, self.config.log_address_space_size, net, state)?;
+        let mut dummy_flags = xs
+            .iter()
+            .map(|x| x.get_bit(self.config.log_address_space_size))
+            .collect::<Vec<_>>();
 
         if self.had_initial_bottom_level {
             ensure!(
@@ -634,7 +647,10 @@ impl GigaDoram {
         }
 
         let sort_len = xs.len().next_power_of_two();
-        xs.resize(sort_len, XShare::default());
+        xs.resize(
+            sort_len,
+            dummy_x(state.id, self.config.log_address_space_size),
+        );
         ys.resize(sort_len, YShare::default());
         dummy_flags.resize(sort_len, promote_public(state.id, Bit::new(true)));
         let start = Instant::now();

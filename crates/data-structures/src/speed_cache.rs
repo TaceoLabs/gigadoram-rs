@@ -8,24 +8,29 @@ use circuits::{
     lowmc::packed_u8_lanes_with_speed_cache::SpeedCachePrecomputeData,
     xy_if_xs_equal::xy_if_xs_equal_circuit,
 };
-use mpc_core::protocols::{rep3::Rep3State, rep3_ring::ring::bit::Bit};
+use mpc_core::protocols::{
+    rep3::{Rep3State, id::PartyID},
+    rep3_ring::ring::{bit::Bit, ring_impl::RingElement},
+};
 use mpc_net::Network;
-use primitives::{XShare, YShare, promote_public, types::BitShare};
+use primitives::{X, XShare, YShare, bit_to_binary_mask, dummy_x, promote_public, types::BitShare};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpeedCache {
     pub length: usize,
+    pub log_address_space_size: usize,
     pub num_stored: usize,
     pub addrs: Vec<XShare>,
     pub data: Vec<YShare>,
 }
 
 impl SpeedCache {
-    pub fn new(length: usize) -> Self {
+    pub fn new(length: usize, log_address_space_size: usize, id: PartyID) -> Self {
         Self {
             length,
+            log_address_space_size,
             num_stored: 0,
-            addrs: vec![XShare::default(); length],
+            addrs: vec![dummy_x(id, log_address_space_size); length],
             data: vec![YShare::default(); length],
         }
     }
@@ -60,15 +65,25 @@ impl SpeedCache {
             }
         };
 
+        let sentinel = RingElement((1 as X) << self.log_address_space_size);
+
+        // Update addrs with the following logic for each entry:
+        // if addrs_i matches query_addr, then the addr_i after the query becomes a dummy sentinel (bit N set) share.
+        // else the addrs_i is updated obliviously, but the value it opens to remains unchanged
         self.addrs[..length_for_query]
             .iter_mut()
             .zip(x_if_found)
-            .for_each(|(x, x_mask)| *x ^= x_mask);
+            .zip(&found_out)
+            .for_each(|((x, x_mask), found)| {
+                let found_mask = bit_to_binary_mask::<X>(found);
+                *x ^= x_mask ^ (found_mask & sentinel);
+            });
 
         let y_xor = y_if_found
             .into_iter()
             .reduce(BitXor::bitxor)
             .expect("circuit output should be non-empty");
+
         let found_xor = found_out
             .into_iter()
             .reduce(BitXor::bitxor)
