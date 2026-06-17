@@ -10,6 +10,24 @@ This crate is a Rust port of the original **GigaDORAM C++ reference implementati
 
 The MPC backend (replicated secret sharing, networking, garbled circuits) comes from [co-snarks](https://github.com/TaceoLabs/co-snarks) (`mpc-core`, `mpc-net`).
 
+## Full address space via dummy-address reassignment
+
+The original GigaDORAM reserves address `0` as a special marker for dummy elements in its hierarchical ORAM design. This is inconvenient for applications that need to access address `0`, since they must introduce address offsets, an operation that is costly in MPC.
+
+We modify GigaDORAM to enable the use of the full address space `{0, …, 2^N − 1}` for `N`-bit addresses by reassigning the dummy marker from `0` to `2^N`. Beyond enabling the full address space, this change improves protocol performance by eliminating costly zero-checks, which require multiple rounds of communication. Concretely, we make the following changes:
+
+- **SpeedCache query.** When an element is found in the SpeedCache, its address is overwritten with the dummy address. We modify the `xy_if_xs_equal_circuit` to obliviously overwrite the found value with `2^N` instead of `0`.
+- **Rebuild (upper levels).** Dummy elements inherited from upper levels are detected and relabeled by checking whether the address is `0` or its MSB is set (i.e. the address lies in `[2^N, 2^(N+1) − 1]`). With the new encoding, only the MSB check is needed, so the zero-check is eliminated.
+- **Rebuild (bottom level).** Dummies are detected and cleansed via the same procedure as for the upper levels, again eliminating the zero-check.
+
+### Correctness and security implications
+
+The choice of dummy marker does not impact the correctness or obliviousness of the protocol, as long as it does not collide with the real address space. For an `N`-bit address space, real elements live in `[0, 2^N − 1]` while dummies live in `[2^N, 2^(N+1) − 1]`. The value `2^N` also serves as the initial dummy marker assigned to newly created dummy elements before their first relabeling.
+
+Relabeling is necessary because the `OhTable` build uses a PRF on the element addresses, and without unique addresses multiple dummies would collide to the same table slot. Relabeling assigns unique addresses to every dummy that is part of an `OhTable` build before they are ever used as PRF inputs, so overlapping the initial dummy marker with the dummy space after relabeling is not an issue.
+
+Increasing the address space by `1` increases the number of real elements in the bottom level by `1`, to `2^N` elements. This means a maximum of `2^N` dummy addresses are needed for the relabel operation, for which there is sufficient space; upper levels require fewer.
+
 ## Workspace layout
 
 The repository is a Cargo workspace with four crates:
