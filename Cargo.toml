@@ -23,8 +23,8 @@ circuits = { path = "crates/circuits" }
 data-structures = { path = "crates/data-structures" }
 clap = { version = "4.5", features = ["derive"] }
 eyre = "0.6"
-mpc-core = { git = "https://github.com/TaceoLabs/co-snarks", branch = "main" }
-mpc-net = { git = "https://github.com/TaceoLabs/co-snarks", branch = "main", features = ["local"] }
+mpc-core = { git = "https://github.com/TaceoLabs/co-snarks", rev = "5454c3e" }
+mpc-net = { git = "https://github.com/TaceoLabs/co-snarks", rev = "5454c3e", features = ["local"] }
 num-traits = "0.2"
 primitives = { path = "crates/primitives" }
 rand = "0.8"
