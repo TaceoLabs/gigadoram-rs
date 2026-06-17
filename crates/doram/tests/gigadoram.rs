@@ -156,6 +156,33 @@ fn test_rebuild_extracts_higher_levels_after_dummy_budget_is_spent() {
     }
 }
 
+// Address 0 is a real address
+#[test]
+fn test_address_zero_usable() {
+    let trace = [
+        Op::read(0),
+        Op::write(0, 42),
+        Op::read(0),
+        Op::write(1, 10),
+        Op::read(0),
+    ];
+
+    assert_trace(get_standard_config(), &trace, &[0, 0, 42, 0, 42]);
+}
+
+// Address 0 survives a rebuild
+#[test]
+fn test_address_zero_rebuild() {
+    let config = get_standard_config();
+    let tail = [Op::write(0, 42), Op::read(0), Op::write(0, 43), Op::read(0)];
+    let trace = first_rebuild_trace_with_tail(config.fill_time(), &tail);
+    let expected_outputs = oracle(&trace);
+
+    for outputs in run_trace_assert_invariants(config, &trace) {
+        assert_eq!(outputs, expected_outputs);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Op {
     Read(X),
@@ -231,7 +258,7 @@ fn first_rebuild_trace_with_tail(n_to_rebuild: usize, tail: &[Op]) -> Vec<Op> {
 fn run_trace(config: GigaDoramConfig, trace: &[Op]) -> [Vec<Y>; 3] {
     run_parties(|net| {
         let mut state = Rep3State::new(&net, A2BType::Direct).unwrap();
-        let mut doram = GigaDoram::new(config);
+        let mut doram = GigaDoram::new(config, state.id);
         let mut outputs = Vec::with_capacity(trace.len());
 
         for op in trace {
@@ -248,7 +275,7 @@ fn run_trace(config: GigaDoramConfig, trace: &[Op]) -> [Vec<Y>; 3] {
 fn run_trace_assert_invariants(config: GigaDoramConfig, trace: &[Op]) -> [Vec<Y>; 3] {
     run_parties(|net| {
         let mut state = Rep3State::new(&net, A2BType::Direct).unwrap();
-        let mut doram = GigaDoram::new(config);
+        let mut doram = GigaDoram::new(config, state.id);
         let mut oracle = BTreeMap::new();
         let mut outputs = Vec::with_capacity(trace.len());
 
@@ -420,9 +447,9 @@ fn assert_speed_cache_invariants(
         {
             if before_x == op.x() && is_real_addr(&doram.config, before_x) {
                 assert_eq!(
-                    live_addrs[i],
-                    0,
-                    "old SpeedCache slot {i} for x={} was not removed",
+                    u64::from(live_addrs[i]),
+                    address_space_size(&doram.config),
+                    "old SpeedCache slot {i} for x={} was not remapped to the dummy sentinel",
                     op.x()
                 );
             }
@@ -481,14 +508,10 @@ fn assert_ohtable_address_invariants(
     assert_eq!(element_rows.len(), table.params.num_elements);
 
     if level == doram.config.num_levels - 1 {
-        assert!(table.params.num_elements < address_space_size(&doram.config) as usize);
+        assert!(table.params.num_elements <= address_space_size(&doram.config) as usize);
     }
 
     for (x, _) in element_rows {
-        assert_ne!(
-            x, 0,
-            "level {level} has an unrelabelled dummy in an OHTable element row"
-        );
         assert!(
             is_real_addr(&doram.config, x) || is_dummy_label(&doram.config, x),
             "level {level} has address {x} outside the real and reserved dummy bands"
@@ -642,7 +665,7 @@ fn assert_query_invariants(
 
     let selected_x = clear.receiver_xs[trace.selected_receiver_index];
 
-    if selected_x == 0 {
+    if selected_x == 1 << table.params.log_address_space_size {
         let dummy_index = clear.dummy_indices[trace.old_query_count] as usize;
         let mut receiver_shuffle = table.receiver_shuffle.clone().unwrap();
 
@@ -840,7 +863,7 @@ fn address_space_size(config: &GigaDoramConfig) -> u64 {
 
 fn is_real_addr(config: &GigaDoramConfig, x: X) -> bool {
     let x = u64::from(x);
-    x != 0 && x < address_space_size(config)
+    x < address_space_size(config)
 }
 
 fn is_dummy_label(config: &GigaDoramConfig, x: X) -> bool {

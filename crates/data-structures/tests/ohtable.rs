@@ -416,7 +416,7 @@ fn build_table<N: Network>(
     net: &N,
     state: &mut Rep3State,
 ) -> OhTable {
-    let params = OHTableParams::new(NUM_ELEMENTS, num_dummies, STASH_SIZE, 4);
+    let params = OHTableParams::new(NUM_ELEMENTS, num_dummies, STASH_SIZE, 4, 5);
     let xs_clear = (0..NUM_ELEMENTS).map(|i| 10 + i as X).collect::<Vec<_>>();
     let ys_clear = (0..NUM_ELEMENTS).map(|i| 1000 + i as Y).collect::<Vec<_>>();
     let xs = promote_public_values(state.id, &xs_clear);

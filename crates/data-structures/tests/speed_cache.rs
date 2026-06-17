@@ -9,7 +9,7 @@ use mpc_core::protocols::{
 use primitives::{promote_public, run_parties};
 
 fn init_speed_cache(state: &Rep3State) -> SpeedCache {
-    let mut cache = SpeedCache::new(2);
+    let mut cache = SpeedCache::new(2, 4, state.id);
     cache.write(
         vec![
             promote_public(state.id, 7u32),
