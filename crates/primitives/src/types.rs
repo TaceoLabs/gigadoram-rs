@@ -21,6 +21,11 @@ pub fn promote_public<T: IntRing2k>(id: PartyID, value: T) -> Rep3RingShare<T> {
     binary::promote_to_trivial_share(id, &RingElement(value))
 }
 
+/// The canonical dummy sentinel address share: `2^log_n`.
+pub fn dummy_x(id: PartyID, log_n: usize) -> XShare {
+    promote_public(id, (1 as X) << log_n)
+}
+
 pub fn promote_public_values<T: IntRing2k>(id: PartyID, values: &[T]) -> Vec<Rep3RingShare<T>> {
     values
         .iter()

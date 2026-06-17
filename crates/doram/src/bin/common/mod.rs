@@ -90,8 +90,8 @@ pub fn generate_queries(config: &DoramBenchmarkConfig) -> Vec<BenchmarkQuery> {
     let address_space_size = 1usize << config.log_address_space;
     (0..config.num_queries)
         .map(|_| BenchmarkQuery {
-            x: rng.gen_range(1..address_space_size) as X,
-            y: rng.gen_range(1..address_space_size) as Y,
+            x: rng.gen_range(0..address_space_size) as X,
+            y: rng.gen_range(0..address_space_size) as Y,
             is_write: rng.gen_bool(0.5),
         })
         .collect()
@@ -103,7 +103,7 @@ pub fn print_startup_config(
     transport: &str,
     network: Option<(&Path, &NetworkConfig)>,
 ) {
-    let real_entries = (1usize << config.log_address_space) - 1;
+    let real_entries = 1usize << config.log_address_space;
 
     if let Some((network_path, network_config)) = network {
         tracing::info!(
@@ -171,8 +171,8 @@ pub fn run_party<N: Network>(
     let total_start = Instant::now();
     let setup_start = Instant::now();
     let mut doram = if config.build_bottom_level_at_startup {
-        let bottom_num_elements = (1usize << config.log_address_space) - 1;
-        let ys = (1..=bottom_num_elements)
+        let bottom_num_elements = 1usize << config.log_address_space;
+        let ys = (0..bottom_num_elements)
             .map(|y| promote_public(state.id, y as Y))
             .collect::<Vec<_>>();
         GigaDoram::new_with_initial_bottom_level(
@@ -183,7 +183,7 @@ pub fn run_party<N: Network>(
             Some(&mut timing),
         )?
     } else {
-        GigaDoram::new(doram_config)
+        GigaDoram::new(doram_config, state.id)
     };
     let setup_time = setup_start.elapsed();
 
