@@ -1,5 +1,6 @@
 [package]
 name = "doram"
+description = "GigaDoram: a three-party distributed oblivious RAM, generic over the stored value type."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

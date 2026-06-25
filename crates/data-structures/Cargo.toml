@@ -1,5 +1,6 @@
 [package]
 name = "data-structures"
+description = "Oblivious data structures for GigaDoram: the oblivious hash table, CHT, and SpeedCache."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

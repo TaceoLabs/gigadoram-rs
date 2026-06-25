@@ -1,5 +1,6 @@
 [package]
 name = "circuits"
+description = "MPC circuits for GigaDoram: LowMC PRF evaluation, oblivious sorting (Batcher), cuckoo-hash lookups, and conditional selects."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,3 +18,6 @@ mpc-core.workspace = true
 mpc-net.workspace = true
 primitives.workspace = true
 scuttlebutt = { git = "https://github.com/GaloisInc/swanky", rev = "5ff648457218b74da9d8323b7ca47166ff5be4b3" }
+
+[dev-dependencies]
+rand.workspace = true
