@@ -13,55 +13,65 @@ use mpc_core::protocols::{
     rep3_ring::ring::{bit::Bit, ring_impl::RingElement},
 };
 use mpc_net::Network;
-use primitives::{X, XShare, YShare, bit_to_binary_mask, dummy_x, promote_public, types::BitShare};
+use primitives::{
+    DoramValue, Record, X, XShare, bit_to_binary_mask, dummy_x, promote_public, types::BitShare,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SpeedCache {
+pub struct SpeedCache<V: DoramValue> {
     pub length: usize,
     pub log_address_space_size: usize,
     pub num_stored: usize,
     pub addrs: Vec<XShare>,
-    pub data: Vec<YShare>,
+    pub data: Vec<Record<V>>,
 }
 
-impl SpeedCache {
+impl<V: DoramValue> SpeedCache<V> {
     pub fn new(length: usize, log_address_space_size: usize, id: PartyID) -> Self {
         Self {
             length,
             log_address_space_size,
             num_stored: 0,
             addrs: vec![dummy_x(id, log_address_space_size); length],
-            data: vec![YShare::default(); length],
+            data: vec![Record::default(); length],
         }
     }
 
     pub fn query(
         &mut self,
         query_addr: XShare,
-        precompute_data: Option<SpeedCachePrecomputeData>,
+        precompute_data: Option<SpeedCachePrecomputeData<V>>,
         net: &impl Network,
         state: &mut Rep3State,
-    ) -> eyre::Result<(YShare, BitShare)> {
+    ) -> eyre::Result<(Record<V>, BitShare)> {
         if self.num_stored == 0 {
-            return Ok((YShare::default(), promote_public(state.id, Bit::new(false))));
+            return Ok((Record::default(), promote_public(state.id, Bit::new(false))));
         }
 
         let length_for_query = self.num_stored;
-
         let result = precompute_data.and_then(|mut query| query.take_result());
         let (x_if_found, y_if_found, found_out) = match result {
             Some((x_if_found, y_if_found, found_out)) => (x_if_found, y_if_found, found_out),
             None => {
-                // circuit input:  x_query | x | y
-                // circuit output: x_mask | y | found
+                // circuit input:  x_query | x | (y, alibi)
+                // circuit output: x_mask | y | alibi | found
                 let query_addrs = vec![query_addr; length_for_query];
-                xy_if_xs_equal_circuit(
-                    &self.addrs[..length_for_query],
-                    &query_addrs,
-                    &self.data[..length_for_query],
-                    net,
-                    state,
-                )?
+                let ys = Record::<V>::get_y_values(&self.data[..length_for_query]);
+                let alibis = Record::<V>::get_alibis(&self.data[..length_for_query]);
+                let (x_if_found, y_if_found, alibi_if_found, found_out) =
+                    xy_if_xs_equal_circuit::<V>(
+                        &self.addrs[..length_for_query],
+                        &query_addrs,
+                        &ys,
+                        &alibis,
+                        net,
+                        state,
+                    )?;
+                (
+                    x_if_found,
+                    Record::<V>::from_columns(y_if_found, alibi_if_found),
+                    found_out,
+                )
             }
         };
 
@@ -92,7 +102,7 @@ impl SpeedCache {
         Ok((y_xor, found_xor))
     }
 
-    pub fn precompute_query(&self, query_addr: XShare) -> Option<SpeedCachePrecomputeData> {
+    pub fn precompute_query(&self, query_addr: XShare) -> Option<SpeedCachePrecomputeData<V>> {
         (self.num_stored > 0).then(|| {
             SpeedCachePrecomputeData::new(
                 query_addr,
@@ -102,14 +112,14 @@ impl SpeedCache {
         })
     }
 
-    pub fn extract(&mut self) -> (Vec<XShare>, Vec<YShare>) {
+    pub fn extract(&mut self) -> (Vec<XShare>, Vec<Record<V>>) {
         assert_eq!(self.num_stored, self.length);
         assert_eq!(self.addrs.len(), self.length);
         assert_eq!(self.data.len(), self.length);
         (self.addrs.clone(), self.data.clone())
     }
 
-    pub fn write(&mut self, write_addrs: Vec<XShare>, write_data: Vec<YShare>) {
+    pub fn write(&mut self, write_addrs: Vec<XShare>, write_data: Vec<Record<V>>) {
         assert_eq!(write_addrs.len(), write_data.len());
         assert!(
             self.num_stored < self.length,
