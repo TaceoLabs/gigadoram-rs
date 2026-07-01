@@ -12,8 +12,8 @@
 use std::time::{Duration, Instant};
 
 use circuits::{
-    batcher::Batcher,
     lowmc::{self, ROUND_KEYS, packed_u8_lanes_with_speed_cache::SpeedCachePrecomputeData},
+    oblivious_sort::ObliviousSort,
     replace_if_dummy::replace_if_dummy_circuit,
 };
 use data_structures::{OHTableParams, OhTable, OhTableQueryTiming, OhTableTiming, SpeedCache};
@@ -687,7 +687,7 @@ impl<V: DoramValue> GigaDoram<V> {
         alibis.resize(sort_len, AlibiShare::default());
         dummy_flags.resize(sort_len, promote_public(state.id, Bit::new(true)));
         let start = Instant::now();
-        Batcher::sort::<V, _>(
+        ObliviousSort::sort::<V, _>(
             &mut dummy_flags,
             &mut xs,
             &mut values,

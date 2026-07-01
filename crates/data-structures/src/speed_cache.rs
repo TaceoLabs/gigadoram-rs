@@ -51,7 +51,7 @@ impl<V: DoramValue> SpeedCache<V> {
         let length_for_query = self.num_stored;
         let result = precompute_data.and_then(|mut query| query.take_result());
         let (x_if_found, y_if_found, found_out) = match result {
-            Some((x_if_found, y_if_found, found_out)) => (x_if_found, y_if_found, found_out),
+            Some(result) => (result.x_if_found, result.y_if_found, result.found),
             None => {
                 // circuit input:  x_query | x | (y, alibi)
                 // circuit output: x_mask | y | alibi | found

@@ -18,7 +18,12 @@ use crate::lowmc::{
 };
 const ZERO_CHECK_ROUNDS: usize = X::BITS.ilog2() as usize;
 
-type SpeedCacheQueryResult<V> = (Vec<XShare>, Vec<Record<V>>, Vec<BitShare>);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpeedCacheQueryResult<V: DoramValue> {
+    pub x_if_found: Vec<XShare>,
+    pub y_if_found: Vec<Record<V>>,
+    pub found: Vec<BitShare>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpeedCachePrecomputeData<V: DoramValue> {
@@ -148,31 +153,33 @@ pub(crate) fn encrypt_few_with_repeated_input<V: DoramValue, N: Network>(
                 let alibis = Record::<V>::get_alibis(&speed_cache.target.data);
                 let value_blocks = V::to_blocks(&values);
                 let alibis = alibi_to_blocks(&alibis);
-                let (x_if_found, selected_value_blocks, selected_alibi) =
-                    sbox_layer_one_with_cmux_into(
-                        &state_bits,
-                        CmuxAnds {
-                            masks_x: &masks_x,
-                            x: &speed_cache.target.addrs,
-                            masks_y: &masks_y,
-                            value_blocks: &value_blocks,
-                            alibi: &alibis,
-                        },
-                        net,
-                        state,
-                        SboxScratch {
-                            and_lhs: &mut and_lhs,
-                            and_rhs: &mut and_rhs,
-                            output: &mut sboxed,
-                        },
-                    )?;
+                let selected = sbox_layer_one_with_cmux_into(
+                    &state_bits,
+                    CmuxAnds {
+                        masks_x: &masks_x,
+                        x: &speed_cache.target.addrs,
+                        masks_y: &masks_y,
+                        value_blocks: &value_blocks,
+                        alibi: &alibis,
+                    },
+                    net,
+                    state,
+                    SboxScratch {
+                        and_lhs: &mut and_lhs,
+                        and_rhs: &mut and_rhs,
+                        output: &mut sboxed,
+                    },
+                )?;
+                let x_if_found = selected.x_if_found;
                 let y_if_found = Record::<V>::from_columns(
-                    V::from_blocks(selected_value_blocks),
-                    alibi_from_blocks(selected_alibi),
+                    V::from_blocks(selected.value_blocks),
+                    alibi_from_blocks(selected.alibi),
                 );
-                speed_cache
-                    .target
-                    .set_result((x_if_found, y_if_found, found));
+                speed_cache.target.set_result(SpeedCacheQueryResult {
+                    x_if_found,
+                    y_if_found,
+                    found,
+                });
             }
             _ => {
                 sbox_layer_one_with_extra_into(
@@ -309,7 +316,11 @@ struct CmuxAnds<'a> {
     alibi: &'a [BlockShare],
 }
 
-type SelectedCacheChunks = (Vec<XShare>, Vec<Vec<BlockShare>>, Vec<BlockShare>);
+struct SelectedCacheChunks {
+    x_if_found: Vec<XShare>,
+    value_blocks: Vec<Vec<BlockShare>>,
+    alibi: Vec<BlockShare>,
+}
 
 fn sbox_layer_one_with_extra_into<N: Network>(
     input: &[Share],
@@ -390,7 +401,11 @@ fn sbox_layer_one_with_cmux_into<N: Network>(
         offset += num_values;
     }
     let selected_alibi = block_outputs[offset..offset + num_values].to_vec();
-    Ok((x_if_found, selected_value_blocks, selected_alibi))
+    Ok(SelectedCacheChunks {
+        x_if_found,
+        value_blocks: selected_value_blocks,
+        alibi: selected_alibi,
+    })
 }
 
 macro_rules! local_ands {

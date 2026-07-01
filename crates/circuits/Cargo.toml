@@ -1,6 +1,6 @@
 [package]
 name = "circuits"
-description = "MPC circuits for GigaDoram: LowMC PRF evaluation, oblivious sorting (Batcher), cuckoo-hash lookups, and conditional selects."
+description = "MPC circuits for GigaDoram: LowMC PRF evaluation, oblivious sorting, cuckoo-hash lookups, and conditional selects."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

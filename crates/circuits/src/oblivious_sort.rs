@@ -14,9 +14,13 @@ use primitives::{
 
 type PermRing = u32;
 
-pub struct Batcher;
+/// Oblivious stable sort that moves dummy rows to the end while keeping the
+/// `(x, value, alibi)` columns aligned.
+///
+/// We use the algorithm described in <https://eprint.iacr.org/2019/695.pdf>.
+pub struct ObliviousSort;
 
-impl Batcher {
+impl ObliviousSort {
     pub fn sort<V: DoramValue, N: Network>(
         dummy_flags: &mut [BitShare],
         xs: &mut [XShare],

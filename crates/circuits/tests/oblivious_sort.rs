@@ -1,4 +1,4 @@
-use circuits::batcher::Batcher;
+use circuits::oblivious_sort::ObliviousSort;
 use mpc_core::protocols::{
     rep3::{Rep3State, conversion::A2BType},
     rep3_ring::ring::bit::Bit,
@@ -10,8 +10,8 @@ use primitives::{
 use rand::thread_rng;
 
 #[test]
-fn test_batcher_sorts_dummies_to_end() {
-    assert_batcher_sort(
+fn test_sorts_dummies_to_end() {
+    assert_sort(
         vec![true, false, true, false, false, true, false, true],
         vec![10u32, 11, 12, 13, 14, 15, 16, 17],
         vec![11, 13, 14, 16],
@@ -20,8 +20,8 @@ fn test_batcher_sorts_dummies_to_end() {
 }
 
 #[test]
-fn test_batcher_sorts_non_power_of_two_length() {
-    assert_batcher_sort(
+fn test_sorts_non_power_of_two_length() {
+    assert_sort(
         vec![true, false, true, false, false, true],
         vec![20u32, 21, 22, 23, 24, 25],
         vec![21, 23, 24],
@@ -29,7 +29,7 @@ fn test_batcher_sorts_non_power_of_two_length() {
     );
 }
 
-fn assert_batcher_sort(
+fn assert_sort(
     flags: Vec<bool>,
     xs: Vec<u32>,
     expected_real_xs: Vec<u32>,
@@ -46,7 +46,7 @@ fn assert_batcher_sort(
         let mut y_shares = promote_public_y_values(state.id, &ys);
         let mut alibi_shares = vec![primitives::AlibiShare::zero_share(); xs.len()];
 
-        Batcher::sort::<primitives::FieldValue<primitives::YField>, _>(
+        ObliviousSort::sort::<primitives::FieldValue<primitives::YField>, _>(
             &mut flag_shares,
             &mut x_shares,
             &mut y_shares,
