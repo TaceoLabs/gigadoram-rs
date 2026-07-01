@@ -13,12 +13,15 @@ edition = "2024"
 rust-version = "1.92"
 authors = ["TACEO GmbH <hello@taceo.io>"]
 homepage = "https://www.taceo.io"
-repository = "https://github.com/TaceoLabs/co-snarks"
+repository = "https://github.com/TaceoLabs/gigadoram-rs"
 license = "MIT OR Apache-2.0"
 publish = false
 readme = "./README.md"
 
 [workspace.dependencies]
+ark-bn254 = "0.5"
+ark-ff = "0.5"
+ark-serialize = "0.5"
 circuits = { path = "crates/circuits" }
 data-structures = { path = "crates/data-structures" }
 clap = { version = "4.5", features = ["derive"] }
@@ -29,7 +32,6 @@ num-traits = "0.2"
 primitives = { path = "crates/primitives" }
 rand = "0.8"
 rand_chacha = "0.3"
-serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,5 +1,6 @@
 [package]
 name = "doram"
+description = "GigaDoram: a three-party distributed oblivious RAM, generic over the stored value type."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,7 +21,6 @@ mpc-net.workspace = true
 primitives.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
-serde.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

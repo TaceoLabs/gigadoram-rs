@@ -31,16 +31,6 @@ impl ArrayShuffler {
         }
     }
 
-    pub fn from_permutations(
-        prev_shared_perm: LocalPermutation,
-        next_shared_perm: LocalPermutation,
-    ) -> Self {
-        Self {
-            prev_shared_perm,
-            next_shared_perm,
-        }
-    }
-
     pub fn forward<T, N>(
         &self,
         rep_array: &mut [Rep3RingShare<T>],
@@ -53,21 +43,6 @@ impl ArrayShuffler {
         N: Network,
     {
         self.forward_many(&mut [rep_array], net, state)
-    }
-
-    pub fn forward_known_to_p_and_next<T, N>(
-        &self,
-        p: PartyID,
-        rep_array: &mut [Rep3RingShare<T>],
-        net: &N,
-        state: &mut Rep3State,
-    ) -> eyre::Result<()>
-    where
-        T: IntRing2k,
-        Standard: Distribution<T>,
-        N: Network,
-    {
-        self.apply_step_many(Some(p), None, &mut [rep_array], &mut [], net, state)
     }
 
     pub fn forward_many<T, N>(
@@ -97,20 +72,6 @@ impl ArrayShuffler {
         N: Network,
     {
         self.apply_step_many(Some(p), None, rep_arrays, &mut [], net, state)
-    }
-
-    pub fn inverse<T, N>(
-        &self,
-        rep_array: &mut [Rep3RingShare<T>],
-        net: &N,
-        state: &mut Rep3State,
-    ) -> eyre::Result<()>
-    where
-        T: IntRing2k,
-        Standard: Distribution<T>,
-        N: Network,
-    {
-        self.inverse_many(&mut [rep_array], net, state)
     }
 
     pub fn shuffle_many<T, N>(
@@ -154,20 +115,6 @@ impl ArrayShuffler {
             )?;
         }
         Ok(())
-    }
-
-    pub fn inverse_many<T, N>(
-        &self,
-        rep_arrays: &mut [&mut [Rep3RingShare<T>]],
-        net: &N,
-        state: &mut Rep3State,
-    ) -> eyre::Result<()>
-    where
-        T: IntRing2k,
-        Standard: Distribution<T>,
-        N: Network,
-    {
-        self.shuffle_many(&mut [], rep_arrays, net, state)
     }
 
     fn apply_step_many<T, N>(
