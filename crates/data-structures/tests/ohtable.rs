@@ -1,5 +1,7 @@
 use circuits::lowmc::ROUND_KEYS;
-use data_structures::{OHTableParams, OhTable, cht};
+use data_structures::{OHTableParams, cht};
+
+type OhTable = data_structures::OhTable<primitives::FieldValue<primitives::YField>>;
 use mpc_core::protocols::{
     rep3::{Rep3State, conversion::A2BType, id::PartyID},
     rep3_ring::{
@@ -9,9 +11,10 @@ use mpc_core::protocols::{
 };
 use mpc_net::Network;
 use primitives::{
-    Block, X, Y, YShare, low_u32, promote_public_values, run_parties, run_parties_may_panic,
+    Block, X, YField, YRecord, low_u32, promote_public_values, promote_public_y_values,
+    random_bigints, run_parties, run_parties_may_panic,
 };
-use rand::Rng;
+use rand::{Rng, thread_rng};
 
 const NUM_ELEMENTS: usize = 10;
 const STASH_SIZE: usize = 2;
@@ -130,7 +133,7 @@ impl TestData {
         use_dummy: bool,
         net: &N,
         state: &mut Rep3State,
-    ) -> (YShare, bool) {
+    ) -> (YRecord, bool) {
         let q = table.qs_builder_order[builder_index];
         let use_dummy =
             binary::promote_to_trivial_share(state.id, &RingElement(Bit::new(use_dummy)));
@@ -384,7 +387,7 @@ fn setup(num_dummies: usize) -> TestData {
     let mut table_0 = None;
     let mut table_1 = None;
     let mut table_2 = None;
-    let mut rng = rand::thread_rng();
+    let mut rng = thread_rng();
     let key = (0..ROUND_KEYS).map(|_| rng.r#gen()).collect::<Vec<_>>();
 
     let tables = run_parties(|net| {
@@ -418,9 +421,13 @@ fn build_table<N: Network>(
 ) -> OhTable {
     let params = OHTableParams::new(NUM_ELEMENTS, num_dummies, STASH_SIZE, 4, 5);
     let xs_clear = (0..NUM_ELEMENTS).map(|i| 10 + i as X).collect::<Vec<_>>();
-    let ys_clear = (0..NUM_ELEMENTS).map(|i| 1000 + i as Y).collect::<Vec<_>>();
+    let mut rng = thread_rng();
+    let ys_clear = random_bigints::<YField, _>(&mut rng, NUM_ELEMENTS);
     let xs = promote_public_values(state.id, &xs_clear);
-    let ys = promote_public_values(state.id, &ys_clear);
+    let ys = promote_public_y_values(state.id, &ys_clear)
+        .into_iter()
+        .map(YRecord::from_value)
+        .collect();
     let key = promote_public_values(state.id, clear_key);
 
     OhTable::new(params, xs, ys, key, net, state, None)

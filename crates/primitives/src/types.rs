@@ -8,14 +8,22 @@ use mpc_core::protocols::{
 use mpc_net::Network;
 use rand::distributions::{Distribution, Standard};
 
+use crate::bigintshare::Rep3BigIntShare;
+
 pub type X = u32;
-pub type Y = u64;
+pub type YField = ark_bn254::Fr;
+pub type Y = <YField as ark_ff::PrimeField>::BigInt;
 pub type Block = u128;
+pub const Y_BITS: usize = 254;
 
 pub type XShare = Rep3RingShare<X>;
-pub type YShare = Rep3RingShare<Y>;
+pub type YShare = Rep3BigIntShare<YField>;
 pub type BlockShare = Rep3RingShare<Block>;
 pub type BitShare = Rep3RingShare<Bit>;
+
+pub type AlibiShare = Rep3RingShare<u8>;
+
+pub type YRecord = crate::value::Record<crate::value::FieldValue<YField>>;
 
 pub fn promote_public<T: IntRing2k>(id: PartyID, value: T) -> Rep3RingShare<T> {
     binary::promote_to_trivial_share(id, &RingElement(value))
@@ -34,6 +42,37 @@ pub fn promote_public_values<T: IntRing2k>(id: PartyID, values: &[T]) -> Vec<Rep
         .collect()
 }
 
+pub fn y_low_mask(bits: usize) -> Y {
+    let mut y = Y::default();
+    for (i, limb) in y.as_mut().iter_mut().enumerate() {
+        let covered = i * 64;
+        *limb = if bits >= covered + 64 {
+            u64::MAX
+        } else if bits > covered {
+            (1u64 << (bits - covered)) - 1
+        } else {
+            0
+        };
+    }
+    y
+}
+
+pub fn promote_public_y(id: PartyID, value: Y) -> YShare {
+    match id {
+        PartyID::ID0 => YShare::new(value, Y::default()),
+        PartyID::ID1 => YShare::new(Y::default(), value),
+        PartyID::ID2 => YShare::new(Y::default(), Y::default()),
+    }
+}
+
+pub fn promote_public_y_values(id: PartyID, values: &[Y]) -> Vec<YShare> {
+    values
+        .iter()
+        .copied()
+        .map(|value| promote_public_y(id, value))
+        .collect()
+}
+
 pub fn open_many<T, N>(shares: &[Rep3RingShare<T>], net: &N) -> Vec<T>
 where
     T: IntRing2k,
@@ -45,6 +84,19 @@ where
         .zip(net.reshare_many(&bs).unwrap())
         .map(|(share, next)| (share.a ^ share.b ^ next).0)
         .collect()
+}
+
+pub fn open_many_y<N: Network>(shares: &[YShare], net: &N) -> Vec<Y> {
+    let bs = shares.iter().map(|share| share.b).collect::<Vec<_>>();
+    shares
+        .iter()
+        .zip(net.reshare_many(&bs).unwrap())
+        .map(|(share, next)| share.a ^ share.b ^ next)
+        .collect()
+}
+
+pub fn open_y<N: Network>(share: &YShare, net: &N) -> Y {
+    open_many_y(&[*share], net).remove(0)
 }
 
 pub fn bit_to_binary_mask<T: IntRing2k>(bit: &BitShare) -> Rep3RingShare<T> {

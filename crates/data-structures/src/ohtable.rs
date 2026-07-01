@@ -13,15 +13,16 @@ use mpc_core::protocols::{
 };
 use mpc_net::Network;
 use primitives::{
-    ArrayShuffler, Block, BlockShare, LocalPermutation, XShare, YShare, bit_to_binary_mask,
-    downcast_many, dummy_x, reshare_3_to_2, reveal_to_party, set_low_u32,
+    ArrayShuffler, Block, BlockShare, DoramValue, LocalPermutation, Record, XShare,
+    alibi_from_blocks, alibi_to_blocks, bit_to_binary_mask, downcast_many, dummy_x, reshare_3_to_2,
+    reveal_to_party, set_low_u32,
     types::{BitShare, input},
-    upcast_x_to_block_many, upcast_y_to_block_many,
+    upcast_x_to_block_many,
 };
 
 use crate::cht;
 pub type OhTableParams = OHTableParams;
-pub type ObliviousHashTable = OhTable;
+pub type ObliviousHashTable<V> = OhTable<V>;
 
 pub const BUILDER_ID: PartyID = PartyID::ID0;
 
@@ -74,18 +75,18 @@ impl OHTableParams {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OhTable {
+pub struct OhTable<V: DoramValue> {
     pub params: OHTableParams,
     pub key: Vec<BlockShare>,
     pub stash_xs: Vec<XShare>,
-    pub stash_ys: Vec<YShare>,
+    pub stash_ys: Vec<Record<V>>,
     pub builder_stash_indices: Vec<usize>,
     pub qs_builder_order: Vec<BlockShare>,
     pub xs_builder_order: Vec<XShare>,
-    pub ys_builder_order: Vec<YShare>,
+    pub ys_builder_order: Vec<Record<V>>,
     pub dummy_indices: Vec<XShare>,
     pub xs_receiver_order: Vec<XShare>,
-    pub ys_receiver_order: Vec<YShare>,
+    pub ys_receiver_order: Vec<Record<V>>,
     pub cht_2shares: Option<Vec<Block>>,
     pub receiver_shuffle: Option<LocalPermutation>,
     pub query_count: usize,
@@ -124,11 +125,11 @@ impl OhTableQueryTiming {
     }
 }
 
-impl OhTable {
+impl<V: DoramValue> OhTable<V> {
     pub fn new<N: Network>(
         params: OHTableParams,
         xs: Vec<XShare>,
-        ys: Vec<YShare>,
+        ys: Vec<Record<V>>,
         key: Vec<BlockShare>,
         net: &N,
         state: &mut Rep3State,
@@ -144,14 +145,14 @@ impl OhTable {
             params,
             key,
             stash_xs: vec![XShare::zero_share(); params.stash_size],
-            stash_ys: vec![YShare::zero_share(); params.stash_size],
+            stash_ys: vec![Record::zero_share(); params.stash_size],
             builder_stash_indices: vec![0; params.stash_size],
             qs_builder_order: vec![BlockShare::zero_share(); params.total_size()],
             xs_builder_order: vec![dummy; params.total_size()],
-            ys_builder_order: vec![YShare::zero_share(); params.total_size()],
+            ys_builder_order: vec![Record::zero_share(); params.total_size()],
             dummy_indices: vec![XShare::zero_share(); params.num_dummies],
             xs_receiver_order: vec![XShare::zero_share(); params.total_size()],
-            ys_receiver_order: vec![YShare::zero_share(); params.total_size()],
+            ys_receiver_order: vec![Record::zero_share(); params.total_size()],
             cht_2shares: None,
             receiver_shuffle: None,
             query_count: 0,
@@ -168,7 +169,7 @@ impl OhTable {
     pub fn build<N: Network>(
         &mut self,
         xs: Vec<XShare>,
-        ys: Vec<YShare>,
+        ys: Vec<Record<V>>,
         net: &N,
         state: &mut Rep3State,
         mut timing: Option<&mut OhTableTiming>,
@@ -205,7 +206,7 @@ impl OhTable {
         net: &N,
         state: &mut Rep3State,
         mut timing: Option<&mut OhTableQueryTiming>,
-    ) -> eyre::Result<(YShare, BitShare)> {
+    ) -> eyre::Result<(Record<V>, BitShare)> {
         assert!(self.query_count < self.params.num_dummies);
 
         // TODO: Maybe just pass dummy as a Block
@@ -280,7 +281,7 @@ impl OhTable {
         ))
     }
 
-    pub fn extract(&self, extract_xs: &mut Vec<XShare>, extract_ys: &mut Vec<YShare>) {
+    pub fn extract(&self, extract_xs: &mut Vec<XShare>, extract_ys: &mut Vec<Record<V>>) {
         assert_eq!(self.query_count, self.params.num_dummies);
 
         extract_xs.clear();
@@ -322,32 +323,40 @@ impl OhTable {
     fn shuffle_builder_order<N: Network>(
         &mut self,
         xs: Vec<XShare>,
-        ys: Vec<YShare>,
+        ys: Vec<Record<V>>,
         net: &N,
         state: &mut Rep3State,
     ) -> eyre::Result<()> {
         self.xs_builder_order[..self.params.num_elements].clone_from_slice(&xs);
         self.ys_builder_order[..self.params.num_elements].clone_from_slice(&ys);
 
+        let values = Record::<V>::get_y_values(&self.ys_builder_order);
+        let alibis = Record::<V>::get_alibis(&self.ys_builder_order);
         let mut xs_blocks = upcast_x_to_block_many(&self.xs_builder_order);
-        let mut ys_blocks = upcast_y_to_block_many(&self.ys_builder_order);
+        let mut value_blocks = V::to_blocks(&values);
+        let mut alibi_blocks = alibi_to_blocks(&alibis);
         let mut indices = (0..self.params.total_size())
             .map(|i| binary::promote_to_trivial_share(state.id, &RingElement(i as Block)))
             .collect::<Vec<_>>();
 
+        let mut columns: Vec<&mut [BlockShare]> = Vec::with_capacity(3 + value_blocks.len());
+        columns.push(self.qs_builder_order.as_mut_slice());
+        columns.push(xs_blocks.as_mut_slice());
+        columns.extend(value_blocks.iter_mut().map(Vec::as_mut_slice));
+        columns.push(alibi_blocks.as_mut_slice());
+
         ArrayShuffler::new(self.params.total_size(), state).shuffle_many(
-            &mut [
-                self.qs_builder_order.as_mut_slice(),
-                xs_blocks.as_mut_slice(),
-                ys_blocks.as_mut_slice(),
-            ],
+            &mut columns,
             &mut [indices.as_mut_slice()],
             net,
             state,
         )?;
 
         self.xs_builder_order = downcast_many(xs_blocks);
-        self.ys_builder_order = downcast_many(ys_blocks);
+        self.ys_builder_order = Record::<V>::from_columns(
+            V::from_blocks(value_blocks),
+            alibi_from_blocks(alibi_blocks),
+        );
         self.dummy_indices = downcast_many(indices[self.params.num_elements..].to_vec());
         Ok(())
     }
@@ -403,19 +412,30 @@ impl OhTable {
         self.ys_receiver_order
             .clone_from_slice(&self.ys_builder_order);
 
+        let values = Record::<V>::get_y_values(&self.ys_receiver_order);
+        let alibis = Record::<V>::get_alibis(&self.ys_receiver_order);
         let mut xs_blocks = upcast_x_to_block_many(&self.xs_receiver_order);
-        let mut ys_blocks = upcast_y_to_block_many(&self.ys_receiver_order);
+        let mut value_blocks = V::to_blocks(&values);
+        let mut alibi_blocks = alibi_to_blocks(&alibis);
         let receiver_shuffler = ArrayShuffler::new(self.params.total_size(), state);
+
+        let mut columns: Vec<&mut [BlockShare]> = Vec::with_capacity(2 + value_blocks.len());
+        columns.push(xs_blocks.as_mut_slice());
+        columns.extend(value_blocks.iter_mut().map(Vec::as_mut_slice));
+        columns.push(alibi_blocks.as_mut_slice());
 
         receiver_shuffler.forward_many_known_to_p_and_next(
             self.params.builder.next(),
-            &mut [xs_blocks.as_mut_slice(), ys_blocks.as_mut_slice()],
+            &mut columns,
             net,
             state,
         )?;
 
         self.xs_receiver_order = downcast_many(xs_blocks);
-        self.ys_receiver_order = downcast_many(ys_blocks);
+        self.ys_receiver_order = Record::<V>::from_columns(
+            V::from_blocks(value_blocks),
+            alibi_from_blocks(alibi_blocks),
+        );
 
         Ok(if state.id == self.params.builder {
             None

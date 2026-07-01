@@ -3,7 +3,10 @@ use mpc_core::protocols::{
     rep3_ring::{Rep3RingShare, binary, ring::ring_impl::RingElement},
 };
 use mpc_net::Network;
-use primitives::{BitShare, BlockShare, X, XShare, YShare, bit_to_binary_mask};
+use primitives::{
+    BitShare, BlockShare, DoramValue, Record, X, XShare, alibi_from_blocks, alibi_to_blocks,
+    bit_to_binary_mask,
+};
 
 use crate::lowmc::{
     common::{BLOCK_SIZE, N_ROUNDS, N_SBOXES},
@@ -16,15 +19,22 @@ use crate::lowmc::{
 const ZERO_CHECK_ROUNDS: usize = X::BITS.ilog2() as usize;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SpeedCachePrecomputeData {
-    query_addr: XShare,
-    addrs: Vec<XShare>,
-    data: Vec<YShare>,
-    result: Option<(Vec<XShare>, Vec<YShare>, Vec<BitShare>)>,
+pub struct SpeedCacheQueryResult<V: DoramValue> {
+    pub x_if_found: Vec<XShare>,
+    pub y_if_found: Vec<Record<V>>,
+    pub found: Vec<BitShare>,
 }
 
-impl SpeedCachePrecomputeData {
-    pub fn new(query_addr: XShare, addrs: Vec<XShare>, data: Vec<YShare>) -> Self {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpeedCachePrecomputeData<V: DoramValue> {
+    query_addr: XShare,
+    addrs: Vec<XShare>,
+    data: Vec<Record<V>>,
+    result: Option<SpeedCacheQueryResult<V>>,
+}
+
+impl<V: DoramValue> SpeedCachePrecomputeData<V> {
+    pub fn new(query_addr: XShare, addrs: Vec<XShare>, data: Vec<Record<V>>) -> Self {
         assert_eq!(addrs.len(), data.len());
         Self {
             query_addr,
@@ -42,7 +52,7 @@ impl SpeedCachePrecomputeData {
         self.addrs.is_empty()
     }
 
-    pub fn take_result(&mut self) -> Option<(Vec<XShare>, Vec<YShare>, Vec<BitShare>)> {
+    pub fn take_result(&mut self) -> Option<SpeedCacheQueryResult<V>> {
         self.result.take()
     }
 
@@ -54,15 +64,15 @@ impl SpeedCachePrecomputeData {
             .collect()
     }
 
-    fn set_result(&mut self, result: (Vec<XShare>, Vec<YShare>, Vec<BitShare>)) {
+    fn set_result(&mut self, result: SpeedCacheQueryResult<V>) {
         self.result = Some(result);
     }
 }
 
-pub fn encrypt_many_with_repeated_input<N: Network>(
+pub fn encrypt_many_with_repeated_input<V: DoramValue, N: Network>(
     expanded_keys: &[&[BlockShare]],
     input: BlockShare,
-    mut speed_cache: Option<&mut SpeedCachePrecomputeData>,
+    mut speed_cache: Option<&mut SpeedCachePrecomputeData<V>>,
     net: &N,
     state: &mut Rep3State,
 ) -> eyre::Result<Vec<BlockShare>> {
@@ -84,10 +94,10 @@ pub fn encrypt_many_with_repeated_input<N: Network>(
     Ok(outputs)
 }
 
-pub fn encrypt_few_with_repeated_input<N: Network>(
+pub(crate) fn encrypt_few_with_repeated_input<V: DoramValue, N: Network>(
     round_keys: &[&PackedU8RoundKeys],
     input: BlockShare,
-    speed_cache: Option<&mut SpeedCachePrecomputeData>,
+    speed_cache: Option<&mut SpeedCachePrecomputeData<V>>,
     net: &N,
     state: &mut Rep3State,
 ) -> eyre::Result<Vec<BlockShare>> {
@@ -137,15 +147,20 @@ pub fn encrypt_few_with_repeated_input<N: Network>(
                     .collect::<Vec<_>>();
                 let masks_y = found
                     .iter()
-                    .map(bit_to_binary_mask::<u64>)
+                    .map(bit_to_binary_mask::<u128>)
                     .collect::<Vec<_>>();
-                let (x_if_found, y_if_found) = sbox_layer_one_with_cmux_into(
+                let values = Record::<V>::get_y_values(&speed_cache.target.data);
+                let alibis = Record::<V>::get_alibis(&speed_cache.target.data);
+                let value_blocks = V::to_blocks(&values);
+                let alibis = alibi_to_blocks(&alibis);
+                let selected = sbox_layer_one_with_cmux_into(
                     &state_bits,
                     CmuxAnds {
                         masks_x: &masks_x,
                         x: &speed_cache.target.addrs,
                         masks_y: &masks_y,
-                        y: &speed_cache.target.data,
+                        value_blocks: &value_blocks,
+                        alibi: &alibis,
                     },
                     net,
                     state,
@@ -155,9 +170,16 @@ pub fn encrypt_few_with_repeated_input<N: Network>(
                         output: &mut sboxed,
                     },
                 )?;
-                speed_cache
-                    .target
-                    .set_result((x_if_found, y_if_found, found));
+                let x_if_found = selected.x_if_found;
+                let y_if_found = Record::<V>::from_columns(
+                    V::from_blocks(selected.value_blocks),
+                    alibi_from_blocks(selected.alibi),
+                );
+                speed_cache.target.set_result(SpeedCacheQueryResult {
+                    x_if_found,
+                    y_if_found,
+                    found,
+                });
             }
             _ => {
                 sbox_layer_one_with_extra_into(
@@ -184,13 +206,13 @@ pub fn encrypt_few_with_repeated_input<N: Network>(
     Ok(pack_lanes(&state_bits, num_lanes))
 }
 
-struct SpeedCacheRoundData<'a> {
-    target: &'a mut SpeedCachePrecomputeData,
+struct SpeedCacheRoundData<'a, V: DoramValue> {
+    target: &'a mut SpeedCachePrecomputeData<V>,
     zero_values: ZeroU8Values,
 }
 
-impl<'a> SpeedCacheRoundData<'a> {
-    fn new(target: &'a mut SpeedCachePrecomputeData) -> Self {
+impl<'a, V: DoramValue> SpeedCacheRoundData<'a, V> {
+    fn new(target: &'a mut SpeedCachePrecomputeData<V>) -> Self {
         let zero_inputs = target.zero_inputs();
         Self {
             target,
@@ -289,8 +311,15 @@ struct AndBatch<'a, T> {
 struct CmuxAnds<'a> {
     masks_x: &'a [XShare],
     x: &'a [XShare],
-    masks_y: &'a [YShare],
-    y: &'a [YShare],
+    masks_y: &'a [BlockShare],
+    value_blocks: &'a [Vec<BlockShare>],
+    alibi: &'a [BlockShare],
+}
+
+struct SelectedCacheChunks {
+    x_if_found: Vec<XShare>,
+    value_blocks: Vec<Vec<BlockShare>>,
+    alibi: Vec<BlockShare>,
 }
 
 fn sbox_layer_one_with_extra_into<N: Network>(
@@ -322,7 +351,13 @@ fn sbox_layer_one_with_cmux_into<N: Network>(
     net: &N,
     state: &mut Rep3State,
     scratch: SboxScratch<'_>,
-) -> eyre::Result<(Vec<XShare>, Vec<YShare>)> {
+) -> eyre::Result<SelectedCacheChunks> {
+    let num_values = cmux.x.len();
+    for col in cmux.value_blocks {
+        assert_eq!(num_values, col.len());
+    }
+    assert_eq!(num_values, cmux.alibi.len());
+
     let ands_per_block = 3 * N_SBOXES;
     scratch.and_lhs.clear();
     scratch.and_rhs.clear();
@@ -330,7 +365,18 @@ fn sbox_layer_one_with_cmux_into<N: Network>(
     scratch.and_rhs.reserve(ands_per_block);
     collect_sbox_ands(input, scratch.and_lhs, scratch.and_rhs);
 
-    let (ands, x_if_found, y_if_found) = and_vec_mixed_u8_x_y(
+    // One masked AND per value block-column plus the alibi column.
+    let num_block_cols = cmux.value_blocks.len() + 1;
+    let mut block_lhs = Vec::with_capacity(num_block_cols * num_values);
+    let mut block_rhs = Vec::with_capacity(num_block_cols * num_values);
+    for col in cmux.value_blocks {
+        block_lhs.extend_from_slice(cmux.masks_y);
+        block_rhs.extend_from_slice(col);
+    }
+    block_lhs.extend_from_slice(cmux.masks_y);
+    block_rhs.extend_from_slice(cmux.alibi);
+
+    let (ands, x_if_found, block_outputs) = and_vec_mixed_u8_x_block(
         AndBatch {
             lhs: scratch.and_lhs,
             rhs: scratch.and_rhs,
@@ -340,14 +386,26 @@ fn sbox_layer_one_with_cmux_into<N: Network>(
             rhs: cmux.x,
         },
         AndBatch {
-            lhs: cmux.masks_y,
-            rhs: cmux.y,
+            lhs: &block_lhs,
+            rhs: &block_rhs,
         },
         net,
         state,
     )?;
     apply_sbox_ands(input, &ands, scratch.output);
-    Ok((x_if_found, y_if_found))
+
+    let mut selected_value_blocks = Vec::with_capacity(cmux.value_blocks.len());
+    let mut offset = 0;
+    for _ in 0..cmux.value_blocks.len() {
+        selected_value_blocks.push(block_outputs[offset..offset + num_values].to_vec());
+        offset += num_values;
+    }
+    let selected_alibi = block_outputs[offset..offset + num_values].to_vec();
+    Ok(SelectedCacheChunks {
+        x_if_found,
+        value_blocks: selected_value_blocks,
+        alibi: selected_alibi,
+    })
 }
 
 macro_rules! local_ands {
@@ -363,27 +421,27 @@ macro_rules! local_ands {
     };
 }
 
-fn and_vec_mixed_u8_x_y<N: Network>(
+fn and_vec_mixed_u8_x_block<N: Network>(
     u8s: AndBatch<'_, Share>,
     xs: AndBatch<'_, XShare>,
-    ys: AndBatch<'_, YShare>,
+    blocks: AndBatch<'_, BlockShare>,
     net: &N,
     state: &mut Rep3State,
-) -> eyre::Result<(Vec<Share>, Vec<XShare>, Vec<YShare>)> {
+) -> eyre::Result<(Vec<Share>, Vec<XShare>, Vec<BlockShare>)> {
     assert_eq!(u8s.lhs.len(), u8s.rhs.len());
     assert_eq!(xs.lhs.len(), xs.rhs.len());
-    assert_eq!(ys.lhs.len(), ys.rhs.len());
+    assert_eq!(blocks.lhs.len(), blocks.rhs.len());
 
     let local8 = local_ands!(u8s.lhs, u8s.rhs, state, u8);
     let local_x = local_ands!(xs.lhs, xs.rhs, state, u32);
-    let local_y = local_ands!(ys.lhs, ys.rhs, state, u64);
+    let local_block = local_ands!(blocks.lhs, blocks.rhs, state, u128);
 
-    let (recv8, recv_x, recv_y) =
-        net.reshare((local8.clone(), local_x.clone(), local_y.clone()))?;
+    let (recv8, recv_x, recv_block) =
+        net.reshare((local8.clone(), local_x.clone(), local_block.clone()))?;
     eyre::ensure!(
         recv8.len() == local8.len()
             && recv_x.len() == local_x.len()
-            && recv_y.len() == local_y.len(),
+            && recv_block.len() == local_block.len(),
         "mixed AND reshare received wrong lengths"
     );
 
@@ -398,9 +456,9 @@ fn and_vec_mixed_u8_x_y<N: Network>(
             .zip(recv_x)
             .map(|(a, b)| Rep3RingShare::new_ring(a, b))
             .collect(),
-        local_y
+        local_block
             .into_iter()
-            .zip(recv_y)
+            .zip(recv_block)
             .map(|(a, b)| Rep3RingShare::new_ring(a, b))
             .collect(),
     ))

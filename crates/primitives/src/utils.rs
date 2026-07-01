@@ -3,7 +3,6 @@ use mpc_core::protocols::{
     rep3_ring::{
         Rep3RingShare,
         arithmetic::RingShare,
-        binary::and_vec,
         ring::{bit::Bit, int_ring::IntRing2k, ring_impl::RingElement},
     },
 };
@@ -17,26 +16,19 @@ use rand::{
 };
 use std::any::TypeId;
 
-use crate::{Block, XShare, YShare, upcast_x_to_y};
+use crate::{
+    AlibiShare, Block, X, XShare,
+    types::{BitShare, bit_to_binary_mask},
+    value::DoramValue,
+};
 
 pub fn run_parties<R, F>(f: F) -> std::thread::Result<[R; 3]>
 where
     R: Send,
     F: Fn(LocalNetwork) -> R + Sync,
 {
-    let [net0, net1, net2] = LocalNetwork::new_3_parties();
-
-    std::thread::scope(|scope| {
-        let f = &f;
-        let party_0 = scope.spawn(move || f(net0));
-        let party_1 = scope.spawn(move || f(net1));
-        let party_2 = scope.spawn(move || f(net2));
-
-        let r0 = party_0.join();
-        let r1 = party_1.join();
-        let r2 = party_2.join();
-        Ok([r0?, r1?, r2?])
-    })
+    let [r0, r1, r2] = run_parties_may_panic(f);
+    Ok([r0?, r1?, r2?])
 }
 
 pub fn run_parties_may_panic<R, F>(f: F) -> [std::thread::Result<R>; 3]
@@ -222,20 +214,72 @@ where
         .collect())
 }
 
-pub fn cmux_many_custom<N: Network>(
-    found: &[YShare],
+/// Obliviously selects `(x, y, alibi)` columns gated by the per-row `found`
+/// bits, masking each column in its native type. The three masked ANDs are
+/// batched into a single reshare round (the `x`/`alibi` rings and the value
+/// type are reshared together), matching the original single-round cost.
+#[expect(clippy::type_complexity)]
+pub fn cmux_many_custom<V: DoramValue, N: Network>(
+    found: &[BitShare],
     x: &[XShare],
-    y: &[YShare],
+    y: &[V::Share],
+    alibi: &[AlibiShare],
     net: &N,
     state: &mut Rep3State,
-) -> eyre::Result<Vec<YShare>> {
-    let mut masks = Vec::with_capacity(x.len() + y.len());
-    masks.extend_from_slice(found);
-    masks.extend_from_slice(found);
+) -> eyre::Result<(Vec<XShare>, Vec<V::Share>, Vec<AlibiShare>)> {
+    let mask_x = found
+        .iter()
+        .map(bit_to_binary_mask::<X>)
+        .collect::<Vec<_>>();
+    let mask_alibi = found
+        .iter()
+        .map(bit_to_binary_mask::<u8>)
+        .collect::<Vec<_>>();
+    let mask_y = found.iter().map(V::bit_to_mask).collect::<Vec<_>>();
 
-    let mut values = Vec::with_capacity(x.len() + y.len());
-    values.extend(x.iter().copied().map(upcast_x_to_y));
-    values.extend_from_slice(y);
+    let local_x = ring_local_and(&mask_x, x, state);
+    let local_alibi = ring_local_and(&mask_alibi, alibi, state);
+    let local_y = V::local_and(&mask_y, y, state);
 
-    and_vec(&masks, &values, net, state)
+    let (next_x, next_alibi, next_y) =
+        net.reshare((local_x.clone(), local_alibi.clone(), local_y.clone()))?;
+
+    let x_selected = ring_recombine(local_x, next_x);
+    let alibi_selected = ring_recombine(local_alibi, next_alibi);
+    let y_selected = V::recombine_and(local_y, next_y);
+
+    Ok((x_selected, y_selected, alibi_selected))
+}
+
+/// Local (pre-reshare) component of an element-wise binary AND of ring shares,
+/// masked with fresh correlated randomness.
+fn ring_local_and<T>(
+    lhs: &[Rep3RingShare<T>],
+    rhs: &[Rep3RingShare<T>],
+    state: &mut Rep3State,
+) -> Vec<RingElement<T>>
+where
+    T: IntRing2k,
+    Standard: Distribution<T>,
+{
+    lhs.iter()
+        .zip(rhs)
+        .map(|(lhs, rhs)| {
+            let (mut mask, mask_b) = state.rngs.rand.random_elements::<RingElement<T>>();
+            mask ^= mask_b;
+            (lhs & rhs) ^ mask
+        })
+        .collect()
+}
+
+/// Re-replicates ring local AND components with the reshared next components.
+fn ring_recombine<T: IntRing2k>(
+    local: Vec<RingElement<T>>,
+    next: Vec<RingElement<T>>,
+) -> Vec<Rep3RingShare<T>> {
+    local
+        .into_iter()
+        .zip(next)
+        .map(|(a, b)| Rep3RingShare::new_ring(a, b))
+        .collect()
 }
