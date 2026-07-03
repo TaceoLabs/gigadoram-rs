@@ -30,7 +30,7 @@ mpc-core = { git = "https://github.com/TaceoLabs/co-snarks", rev = "5d6bd19" }
 mpc-net = { git = "https://github.com/TaceoLabs/co-snarks", rev = "5d6bd19", features = ["local", "tcp"] }
 num-traits = "0.2"
 primitives = { path = "crates/primitives" }
-rand = "0.8"
+rand = "0.10"
 rand_chacha = "0.3"
 toml = "0.8"
 tracing = "0.1.43"
