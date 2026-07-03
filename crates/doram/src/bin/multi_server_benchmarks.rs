@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use eyre::{Context, Result};
-use mpc_net::tcp::{NetworkConfig, TcpNetwork};
+use mpc_net::{
+    config::{NetworkConfig, NetworkConfigFile},
+    tcp::TcpNetwork,
+};
 
 use common::{
     DoramBenchmarkConfig, doram_config, generate_queries, print_report, print_startup_config,
@@ -43,10 +46,11 @@ fn main() -> Result<()> {
 }
 
 fn read_network_config(path: &Path) -> Result<NetworkConfig> {
-    let config_file: NetworkConfig = toml::from_str(
+    let config_file: NetworkConfigFile = toml::from_str(
         &std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?,
     )
     .with_context(|| format!("failed to parse {}", path.display()))?;
-    Ok(config_file)
+    NetworkConfig::try_from(config_file)
+        .with_context(|| format!("failed to load network config from {}", path.display()))
 }
