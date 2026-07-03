@@ -8,7 +8,7 @@ use clap::{ArgAction, Args};
 use doram::{GigaDoramBn254 as GigaDoram, GigaDoramConfig, GigaDoramTiming};
 use eyre::{Result, ensure};
 use mpc_core::protocols::rep3::{Rep3State, conversion::A2BType, id::PartyID};
-use mpc_net::{Network, tcp::NetworkConfig};
+use mpc_net::{Network, config::NetworkConfig};
 use primitives::{X, Y, Y_BITS, YField, open_y, promote_public, promote_public_y, random_bigint};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
