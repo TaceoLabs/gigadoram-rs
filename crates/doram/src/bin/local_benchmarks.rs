@@ -26,7 +26,7 @@ fn main() -> Result<()> {
 
     let queries = generate_queries(&cli.doram);
     let reports = run_parties(|net| {
-        run_party(&cli.doram, doram_config, &queries, net).wrap_err("party failed")
+        run_party(&cli.doram, doram_config, &queries, net, true).wrap_err("party failed")
     })
     .map_err(|_| eyre!("party panicked"))?
     .into_iter()

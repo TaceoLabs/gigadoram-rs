@@ -16,6 +16,7 @@ circuits.workspace = true
 data-structures.workspace = true
 clap.workspace = true
 eyre.workspace = true
+indicatif.workspace = true
 mpc-core.workspace = true
 mpc-net.workspace = true
 primitives.workspace = true

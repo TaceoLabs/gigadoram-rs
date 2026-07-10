@@ -7,6 +7,7 @@ use std::{
 use clap::{ArgAction, Args};
 use doram::{GigaDoramBn254 as GigaDoram, GigaDoramConfig, GigaDoramTiming};
 use eyre::{Result, ensure};
+use indicatif::{ProgressBar, ProgressStyle};
 use mpc_core::protocols::rep3::{Rep3State, conversion::A2BType, id::PartyID};
 use mpc_net::{Network, config::NetworkConfig};
 use primitives::{X, Y, Y_BITS, YField, open_y, promote_public, promote_public_y, random_bigint};
@@ -153,6 +154,7 @@ pub fn run_party<N: Network>(
     doram_config: GigaDoramConfig,
     queries: &[BenchmarkQuery],
     net: N,
+    show_progress: bool,
 ) -> Result<PartyReport> {
     let mut state = Rep3State::new(&net, A2BType::Direct)?;
     let mut timing = GigaDoramTiming::default();
@@ -176,6 +178,12 @@ pub fn run_party<N: Network>(
         GigaDoram::new(doram_config, state.id)
     };
     let setup_time = setup_start.elapsed();
+
+    let progress = if show_progress && state.id == PartyID::ID0 {
+        query_progress_bar(queries.len())
+    } else {
+        ProgressBar::hidden()
+    };
 
     for query in queries {
         let initial_value = if config.build_bottom_level_at_startup {
@@ -206,7 +214,9 @@ pub fn run_party<N: Network>(
         if query.is_write {
             oracle.insert(query.x, query.y);
         }
+        progress.inc(1);
     }
+    progress.finish();
 
     let total_time = total_start.elapsed();
     let (bytes_sent, bytes_received) = net
@@ -224,6 +234,18 @@ pub fn run_party<N: Network>(
         bytes_sent,
         bytes_received,
     })
+}
+
+fn query_progress_bar(num_queries: usize) -> ProgressBar {
+    let bar = ProgressBar::new(num_queries as u64);
+    bar.set_style(
+        ProgressStyle::with_template(
+            "{percent:>3}%|{bar:40}| {human_pos}/{human_len} [{elapsed_precise}<{eta_precise}, {per_sec}]",
+        )
+        .expect("progress bar template should be valid")
+        .progress_chars("█▉▊▋▌▍▎▏ "),
+    );
+    bar
 }
 
 fn benchmark_y(seed: u64) -> Y {
