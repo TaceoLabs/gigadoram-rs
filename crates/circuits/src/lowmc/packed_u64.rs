@@ -7,9 +7,9 @@ use mpc_net::Network;
 use primitives::BlockShare;
 
 use crate::lowmc::common::{
-    LowMCParameters, ROUND_CONSTANTS, RoundKeys, join_block, m4r_lut, split_block,
+    LINEAR_TABLES, LowMCParameters, ROUND_CONSTANTS, RoundKeys, WINDOW_MASK, join_block,
+    split_block,
 };
-use crate::lowmc::parameters;
 
 pub use crate::lowmc::common::{BLOCK_SIZE, M4R_WINDOW_SIZE, N_ROUNDS, N_SBOXES, ROUND_KEYS};
 
@@ -55,6 +55,7 @@ fn mpc_encrypt_with_roundkeys<N: Network>(
 
     for round in 0..LowMCParameters::R {
         mpc_sbox(&mut state, net, rep3_state)?;
+
         for (state, key) in state.iter_mut().zip(keys.iter()) {
             mpc_linear_layer(state, round);
             mpc_add_rc(state, round, rep3_state.id);
@@ -65,6 +66,7 @@ fn mpc_encrypt_with_roundkeys<N: Network>(
     Ok(state)
 }
 
+#[inline]
 fn mpc_add_rc(state: &mut BlockShare, round: usize, id: PartyID) {
     let target = match id {
         PartyID::ID0 => &mut state.a,
@@ -75,6 +77,7 @@ fn mpc_add_rc(state: &mut BlockShare, round: usize, id: PartyID) {
     target.0 ^= ROUND_CONSTANTS[round];
 }
 
+#[inline]
 fn mpc_sbox<N: Network>(
     state: &mut [BlockShare],
     net: &N,
@@ -93,6 +96,7 @@ fn mpc_sbox<N: Network>(
     Ok(())
 }
 
+#[inline]
 fn mpc_sbox_local(state: BlockShare, mask: u128, rep3_state: &mut Rep3State) -> RingElement<u128> {
     let sa = split_block(state.a);
     let sb = split_block(state.b);
@@ -125,46 +129,27 @@ fn mpc_sbox_local(state: BlockShare, mask: u128, rep3_state: &mut Rep3State) -> 
     RingElement(tmp1.0 | tmp2.0 | tmp3.0 | abc.0)
 }
 
+#[inline]
 fn mpc_linear_layer(state: &mut BlockShare, round: usize) {
-    state.a = linear_layer_block(state.a, round);
-    state.b = linear_layer_block(state.b, round);
-}
+    let table = &LINEAR_TABLES[round];
 
-fn linear_layer_block(input: RingElement<u128>, round: usize) -> RingElement<u128> {
-    let mut state = split_block(input);
-    linear_layer_words(&mut state, round);
-    join_block(state)
-}
+    let mut a = state.a.0;
+    let mut b = state.b.0;
 
-fn linear_layer_words(state: &mut [RingElement<u64>; 2], round: usize) {
-    let mut output = [RingElement(0), RingElement(0)];
-    let luts = linear_layer_luts(state);
+    let mut output_a = 0u128;
+    let mut output_b = 0u128;
 
-    for bit in 0..LowMCParameters::N {
-        let mut a_bit = false;
-        for (window, lut) in luts.iter().enumerate() {
-            a_bit ^= lut[parameters::M4R_MASKS[round][window][bit] as usize];
-        }
-        if bit < 64 {
-            output[0] |= RingElement((a_bit as u64) << bit);
-        } else {
-            output[1] |= RingElement((a_bit as u64) << (bit - 64));
-        }
+    for window_table in table.iter() {
+        let index_a = (a & WINDOW_MASK) as usize;
+        let index_b = (b & WINDOW_MASK) as usize;
+
+        output_a ^= window_table[index_a];
+        output_b ^= window_table[index_b];
+
+        a >>= M4R_WINDOW_SIZE;
+        b >>= M4R_WINDOW_SIZE;
     }
 
-    *state = output;
-}
-
-fn linear_layer_luts(state: &[RingElement<u64>; 2]) -> Vec<[bool; 1 << M4R_WINDOW_SIZE]> {
-    (0..(LowMCParameters::N / M4R_WINDOW_SIZE))
-        .map(|window| {
-            let shift = M4R_WINDOW_SIZE * (window % 16);
-            let input = if window < 16 {
-                ((state[0].0 >> shift) & 0xf) as u8
-            } else {
-                ((state[1].0 >> shift) & 0xf) as u8
-            };
-            m4r_lut(input)
-        })
-        .collect()
+    state.a.0 = output_a;
+    state.b.0 = output_b;
 }

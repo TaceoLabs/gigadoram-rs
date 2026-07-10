@@ -1,11 +1,46 @@
+use std::sync::LazyLock;
+
 use mpc_core::protocols::rep3_ring::ring::ring_impl::RingElement;
 use primitives::BlockShare;
+
+use crate::lowmc::parameters;
 
 pub const BLOCK_SIZE: usize = 128;
 pub const N_ROUNDS: usize = 9;
 pub const N_SBOXES: usize = 42;
+pub const NUM_WINDOWS: usize = 32;
 pub const M4R_WINDOW_SIZE: usize = 4;
+pub const WINDOW_ENTRIES: usize = 1 << M4R_WINDOW_SIZE;
+pub const WINDOW_MASK: u128 = WINDOW_ENTRIES as u128 - 1;
 pub const ROUND_KEYS: usize = N_ROUNDS + 1;
+
+type LinearTables = [[[u128; WINDOW_ENTRIES]; NUM_WINDOWS]; N_ROUNDS];
+
+pub static LINEAR_TABLES: LazyLock<LinearTables> = LazyLock::new(build_linear_tables);
+
+fn build_linear_tables() -> LinearTables {
+    let mut tables = [[[0u128; WINDOW_ENTRIES]; NUM_WINDOWS]; N_ROUNDS];
+
+    for (round, round_table) in tables.iter_mut().enumerate() {
+        for (window, window_table) in round_table.iter_mut().enumerate() {
+            for (input, entry) in window_table.iter_mut().enumerate() {
+                let lut = m4r_lut(input as u8);
+
+                let mut output = 0u128;
+
+                for bit in 0..128 {
+                    let mask = parameters::M4R_MASKS[round][window][bit] as usize;
+
+                    output |= (lut[mask] as u128) << bit;
+                }
+
+                *entry = output;
+            }
+        }
+    }
+
+    tables
+}
 
 pub(crate) const ROUND_CONSTANTS: [u128; N_ROUNDS] =
     pack_round_constants(super::parameters::ROUND_CONSTANTS);
