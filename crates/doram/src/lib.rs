@@ -24,8 +24,9 @@ use mpc_core::protocols::{
 };
 use mpc_net::Network;
 use primitives::{
-    AlibiShare, ArrayShuffler, Block, BlockShare, DoramValue, Record, X, XShare, alibi_from_blocks,
-    alibi_to_blocks, dummy_x, open_many, promote_public, upcast_x_to_block,
+    AlibiShare, ArrayShuffler, Block, BlockShare, CommunicationTimer, DoramValue, Record,
+    TimingBreakdown, X, XShare, alibi_from_blocks, alibi_to_blocks, dummy_x, network_phase,
+    open_many, promote_public, upcast_x_to_block,
 };
 
 /// `GigaDoram` storing `u32` values.
@@ -201,17 +202,25 @@ pub struct GigaDoram<V: DoramValue> {
 #[derive(Clone, Debug, Default)]
 pub struct GigaDoramTiming {
     pub time_total_builds: Vec<Duration>,
-    pub time_total_build_prf: Duration,
+    pub time_total_build_prf: TimingBreakdown,
     pub time_total_batcher: Duration,
-    pub time_total_queries: Duration,
-    pub time_total_query_prf: Duration,
-    pub time_total_query_speed_cache: Duration,
+    pub time_total_queries: TimingBreakdown,
+    pub time_total_query_prf: TimingBreakdown,
+    pub time_total_query_speed_cache: TimingBreakdown,
     pub time_total_query_ohtable: Duration,
     pub time_total_query_ohtable_details: OhTableQueryTiming,
     pub time_total_query_writeback: Duration,
+    pub communication_timer: CommunicationTimer,
 }
 
 impl GigaDoramTiming {
+    pub fn with_communication_timer(communication_timer: CommunicationTimer) -> Self {
+        Self {
+            communication_timer,
+            ..Self::default()
+        }
+    }
+
     fn record_build(&mut self, level: usize, elapsed: Duration) {
         if self.time_total_builds.len() <= level {
             self.time_total_builds.resize(level + 1, Duration::ZERO);
@@ -324,6 +333,10 @@ impl<V: DoramValue> GigaDoram<V> {
         }
 
         let query_start = Instant::now();
+        let query_communication = timing
+            .as_ref()
+            .map(|timing| timing.communication_timer.elapsed())
+            .unwrap_or_default();
 
         // Compute PRFs for each live level
         let live_levels = self
@@ -333,26 +346,21 @@ impl<V: DoramValue> GigaDoram<V> {
             .filter_map(|(level, table)| table.as_ref().map(|_| level))
             .collect::<Vec<_>>();
         let mut speed_cache_precompute_data = self.speed_cache.precompute_query(query_x);
-        let start = Instant::now();
-        let qs = self.evaluate_prf_tags(
-            &live_levels,
-            query_x,
-            speed_cache_precompute_data.as_mut(),
-            net,
-            state,
-        )?;
-        if let Some(timing) = &mut timing {
-            timing.time_total_query_prf += start.elapsed();
-        }
+        let qs = network_phase!(timing, time_total_query_prf, {
+            self.evaluate_prf_tags(
+                &live_levels,
+                query_x,
+                speed_cache_precompute_data.as_mut(),
+                net,
+                state,
+            )?
+        });
 
         // Query the SpeedCache and extract alibi bits
-        let start = Instant::now();
-        let (mut y_accum, mut found) =
+        let (mut y_accum, mut found) = network_phase!(timing, time_total_query_speed_cache, {
             self.speed_cache
-                .query(query_x, speed_cache_precompute_data, net, state)?;
-        if let Some(timing) = &mut timing {
-            timing.time_total_query_speed_cache += start.elapsed();
-        }
+                .query(query_x, speed_cache_precompute_data, net, state)?
+        });
         let mut alibi_mask = y_accum.get_alibi_bits(self.config.num_levels);
 
         // Traverse each live level and query the corresponding table
@@ -362,7 +370,8 @@ impl<V: DoramValue> GigaDoram<V> {
             let table = self.levels[level]
                 .as_mut()
                 .expect("live level should still exist during query");
-            let mut ohtable_timing = OhTableQueryTiming::default();
+            let mut ohtable_timing =
+                OhTableQueryTiming::with_communication_timer(Self::timer(&timing));
             let table_timing = timing.is_some().then_some(&mut ohtable_timing);
             let (y_returned, found_returned) =
                 table.query(q, use_dummy, net, state, table_timing)?;
@@ -385,7 +394,11 @@ impl<V: DoramValue> GigaDoram<V> {
         self.speed_cache.write(vec![query_x], vec![value_to_write]);
         if let Some(timing) = &mut timing {
             timing.time_total_query_writeback += start.elapsed();
-            timing.time_total_queries += query_start.elapsed();
+            timing.time_total_queries.total += query_start.elapsed();
+            timing.time_total_queries.communication += timing
+                .communication_timer
+                .elapsed()
+                .saturating_sub(query_communication);
         }
 
         // Return the full-field value (alibi bits live separately now).
@@ -546,11 +559,12 @@ impl<V: DoramValue> GigaDoram<V> {
         );
         let key = Self::generate_prf_key(state);
         let start = Instant::now();
-        let mut ohtable_timing = OhTableTiming::default();
+        let mut ohtable_timing = OhTableTiming::with_communication_timer(Self::timer(&timing));
         let table_timing = timing.is_some().then_some(&mut ohtable_timing);
         let table = OhTable::new(params, xs, ys, key, net, state, table_timing);
         if let Some(timing) = &mut timing {
-            timing.time_total_build_prf += ohtable_timing.build_prf;
+            timing.time_total_build_prf.total += ohtable_timing.build_prf.total;
+            timing.time_total_build_prf.communication += ohtable_timing.build_prf.communication;
             timing.record_build(level, start.elapsed());
         }
         self.levels[level] = Some(table);
@@ -712,6 +726,13 @@ impl<V: DoramValue> GigaDoram<V> {
         (0..ROUND_KEYS)
             .map(|_| arithmetic::rand::<Block>(state))
             .collect()
+    }
+
+    fn timer(timing: &Option<&mut GigaDoramTiming>) -> CommunicationTimer {
+        timing
+            .as_ref()
+            .map(|timing| timing.communication_timer.clone())
+            .unwrap_or_default()
     }
 
     fn evaluate_prf_tags<N: Network>(
