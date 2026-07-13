@@ -20,7 +20,7 @@ readme = "./README.md"
 
 [workspace.dependencies]
 ark-bn254 = "0.5"
-ark-ff = "0.5"
+ark-ff = "0.6"
 ark-serialize = "0.5"
 circuits = { path = "crates/circuits" }
 data-structures = { path = "crates/data-structures" }
