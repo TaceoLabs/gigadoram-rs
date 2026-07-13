@@ -130,7 +130,7 @@ fn mpc_sbox_local(state: BlockShare, mask: u128, rep3_state: &mut Rep3State) -> 
 }
 
 #[inline]
-fn mpc_linear_layer(state: &mut BlockShare, round: usize) {
+pub(crate) fn mpc_linear_layer(state: &mut BlockShare, round: usize) {
     let table = &LINEAR_TABLES[round];
 
     let mut a = state.a.0;

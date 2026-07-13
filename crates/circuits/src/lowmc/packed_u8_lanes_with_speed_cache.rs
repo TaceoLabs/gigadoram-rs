@@ -1,6 +1,6 @@
 use mpc_core::protocols::{
     rep3::{Rep3State, network::Rep3NetworkExt},
-    rep3_ring::{Rep3RingShare, binary, ring::ring_impl::RingElement},
+    rep3_ring::{Rep3RingShare, ring::ring_impl::RingElement},
 };
 use mpc_net::Network;
 use primitives::{
@@ -11,8 +11,8 @@ use primitives::{
 use crate::lowmc::{
     common::{BLOCK_SIZE, N_ROUNDS, N_SBOXES},
     packed_u8_lanes::{
-        CombinedRoundKeys, Share, add_round_key, apply_sbox_ands, bit_slice, collect_sbox_ands,
-        four_russians_into, lane_mask, pack_lanes, xor_constants,
+        CombinedRoundKeys, Share, add_round_key, and_vec_u8, apply_sbox_ands, bit_slice,
+        collect_sbox_ands, four_russians_into, lane_mask, pack_lanes, xor_constants,
     },
 };
 const ZERO_CHECK_ROUNDS: usize = X::BITS.ilog2() as usize;
@@ -169,8 +169,7 @@ pub fn encrypt_with_combined_round_keys<V: DoramValue, N: Network>(
                 )?;
             }
         }
-
-        four_russians_into(round, &sboxed, &mut linear);
+        four_russians_into(round, &sboxed, &mut linear, num_lanes);
         std::mem::swap(&mut state_bits, &mut linear);
         xor_constants(round, &mut state_bits, active_mask, state.id);
         add_round_key(&mut state_bits, &round_keys[round + 1]);
@@ -312,9 +311,9 @@ fn sbox_layer_one_with_extra_into<N: Network>(
     scratch.and_lhs.extend_from_slice(extra_lhs);
     scratch.and_rhs.extend_from_slice(extra_rhs);
 
-    let mut ands = binary::and_vec(scratch.and_lhs, scratch.and_rhs, net, state)?;
-    let extra_ands = ands.split_off(ands_per_block);
-    apply_sbox_ands(input, &ands, scratch.output);
+    and_vec_u8(scratch.and_lhs, scratch.and_rhs, net, state)?;
+    let extra_ands = scratch.and_lhs.split_off(ands_per_block);
+    apply_sbox_ands(input, scratch.and_lhs, scratch.output);
     Ok(extra_ands)
 }
 
