@@ -1,18 +1,21 @@
 use mpc_core::protocols::{
     rep3::{Rep3State, network::Rep3NetworkExt},
-    rep3_ring::{Rep3RingShare, ring::ring_impl::RingElement},
+    rep3_ring::ring::ring_impl::RingElement,
 };
 use mpc_net::Network;
 use primitives::{
     BitShare, BlockShare, DoramValue, Record, X, XShare, alibi_from_blocks, alibi_to_blocks,
     bit_to_binary_mask,
+    utils::{ring_local_and, ring_recombine},
 };
 
 use crate::lowmc::{
-    common::{BLOCK_SIZE, N_ROUNDS, N_SBOXES},
+    common::{
+        BLOCK_SIZE, N_ROUNDS, N_SBOXES, add_round_key, apply_sbox_ands, collect_sbox_ands,
+        xor_constants,
+    },
     packed_u8_lanes::{
-        CombinedRoundKeys, Share, add_round_key, and_vec_u8, apply_sbox_ands, bit_slice,
-        collect_sbox_ands, four_russians_into, lane_mask, pack_lanes, xor_constants,
+        CombinedRoundKeys, Share, and_vec_u8, bit_slice, four_russians_into, lane_mask, pack_lanes,
     },
 };
 const ZERO_CHECK_ROUNDS: usize = X::BITS.ilog2() as usize;
@@ -54,18 +57,6 @@ impl<V: DoramValue> SpeedCachePrecomputeData<V> {
     pub fn take_result(&mut self) -> Option<SpeedCacheQueryResult<V>> {
         self.result.take()
     }
-
-    fn zero_inputs(&self) -> Vec<XShare> {
-        self.addrs
-            .iter()
-            .copied()
-            .map(|addr| addr ^ self.query_addr)
-            .collect()
-    }
-
-    fn set_result(&mut self, result: SpeedCacheQueryResult<V>) {
-        self.result = Some(result);
-    }
 }
 
 pub fn encrypt_with_combined_round_keys<V: DoramValue, N: Network>(
@@ -89,7 +80,17 @@ pub fn encrypt_with_combined_round_keys<V: DoramValue, N: Network>(
     let mut and_rhs = Vec::new();
     let mut extra_lhs = Vec::new();
     let mut extra_rhs = Vec::new();
-    let mut speed_cache = speed_cache.map(SpeedCacheRoundData::new);
+    let mut speed_cache = speed_cache.map(|target| {
+        let zero_inputs = target
+            .addrs
+            .iter()
+            .map(|&addr| addr ^ target.query_addr)
+            .collect::<Vec<_>>();
+        SpeedCacheRoundData {
+            zero_values: ZeroU8Values::new(&zero_inputs),
+            target,
+        }
+    });
 
     add_round_key(&mut state_bits, &round_keys[0]);
     for round in 0..N_ROUNDS {
@@ -148,7 +149,7 @@ pub fn encrypt_with_combined_round_keys<V: DoramValue, N: Network>(
                     V::from_blocks(selected.value_blocks),
                     alibi_from_blocks(selected.alibi),
                 );
-                speed_cache.target.set_result(SpeedCacheQueryResult {
+                speed_cache.target.result = Some(SpeedCacheQueryResult {
                     x_if_found,
                     y_if_found,
                     found,
@@ -181,16 +182,6 @@ pub fn encrypt_with_combined_round_keys<V: DoramValue, N: Network>(
 struct SpeedCacheRoundData<'a, V: DoramValue> {
     target: &'a mut SpeedCachePrecomputeData<V>,
     zero_values: ZeroU8Values,
-}
-
-impl<'a, V: DoramValue> SpeedCacheRoundData<'a, V> {
-    fn new(target: &'a mut SpeedCachePrecomputeData<V>) -> Self {
-        let zero_inputs = target.zero_inputs();
-        Self {
-            target,
-            zero_values: ZeroU8Values::new(&zero_inputs),
-        }
-    }
 }
 
 enum ZeroU8Values {
@@ -366,31 +357,18 @@ fn sbox_layer_one_with_cmux_into<N: Network>(
     )?;
     apply_sbox_ands(input, &ands, scratch.output);
 
-    let mut selected_value_blocks = Vec::with_capacity(cmux.value_blocks.len());
-    let mut offset = 0;
-    for _ in 0..cmux.value_blocks.len() {
-        selected_value_blocks.push(block_outputs[offset..offset + num_values].to_vec());
-        offset += num_values;
-    }
-    let selected_alibi = block_outputs[offset..offset + num_values].to_vec();
+    let mut outputs = block_outputs.chunks_exact(num_values);
+    let selected_value_blocks = outputs
+        .by_ref()
+        .take(cmux.value_blocks.len())
+        .map(<[BlockShare]>::to_vec)
+        .collect();
+    let selected_alibi = outputs.next().unwrap().to_vec();
     Ok(SelectedCacheChunks {
         x_if_found,
         value_blocks: selected_value_blocks,
         alibi: selected_alibi,
     })
-}
-
-macro_rules! local_ands {
-    ($lhs:expr, $rhs:expr, $state:expr, $ty:ty) => {
-        $lhs.iter()
-            .zip($rhs)
-            .map(|(lhs, rhs)| {
-                let (mut mask, mask_b) = $state.rngs.rand.random_elements::<RingElement<$ty>>();
-                mask ^= mask_b;
-                (lhs & rhs) ^ mask
-            })
-            .collect::<Vec<_>>()
-    };
 }
 
 fn and_vec_mixed_u8_x_block<N: Network>(
@@ -404,9 +382,9 @@ fn and_vec_mixed_u8_x_block<N: Network>(
     assert_eq!(xs.lhs.len(), xs.rhs.len());
     assert_eq!(blocks.lhs.len(), blocks.rhs.len());
 
-    let local8 = local_ands!(u8s.lhs, u8s.rhs, state, u8);
-    let local_x = local_ands!(xs.lhs, xs.rhs, state, u32);
-    let local_block = local_ands!(blocks.lhs, blocks.rhs, state, u128);
+    let local8 = ring_local_and(u8s.lhs, u8s.rhs, state);
+    let local_x = ring_local_and(xs.lhs, xs.rhs, state);
+    let local_block = ring_local_and(blocks.lhs, blocks.rhs, state);
 
     let (recv8, recv_x, recv_block) =
         net.reshare((local8.clone(), local_x.clone(), local_block.clone()))?;
@@ -418,20 +396,8 @@ fn and_vec_mixed_u8_x_block<N: Network>(
     );
 
     Ok((
-        local8
-            .into_iter()
-            .zip(recv8)
-            .map(|(a, b)| Share::new_ring(a, b))
-            .collect(),
-        local_x
-            .into_iter()
-            .zip(recv_x)
-            .map(|(a, b)| Rep3RingShare::new_ring(a, b))
-            .collect(),
-        local_block
-            .into_iter()
-            .zip(recv_block)
-            .map(|(a, b)| Rep3RingShare::new_ring(a, b))
-            .collect(),
+        ring_recombine(local8, recv8),
+        ring_recombine(local_x, recv_x),
+        ring_recombine(local_block, recv_block),
     ))
 }

@@ -116,7 +116,7 @@ fn encode_input<N: Network>(
         let (zero, evaluator) = garbler.encode_wire(((value >> bit) & 1) as u16);
         garbler_wires.push(zero);
         if send_to_evaluator {
-            evaluator_inputs.push(wire_to_bytes(&evaluator));
+            evaluator_inputs.push(evaluator.as_block().as_ref().try_into().unwrap());
         }
     }
 }
@@ -228,14 +228,9 @@ fn receive_input_bundle<N: Network>(
         eyre::bail!("invalid CHT lookup input label count");
     }
     Ok(BinaryBundle::new(
-        labels.into_iter().map(bytes_to_wire).collect(),
+        labels
+            .into_iter()
+            .map(|bytes| WireMod2::from_block(Block::from(bytes), 2))
+            .collect(),
     ))
-}
-
-fn wire_to_bytes(wire: &WireMod2) -> [u8; 16] {
-    wire.as_block().as_ref().try_into().unwrap()
-}
-
-fn bytes_to_wire(bytes: [u8; 16]) -> WireMod2 {
-    WireMod2::from_block(Block::from(bytes), 2)
 }

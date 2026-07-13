@@ -15,7 +15,6 @@ use circuits::{
     lowmc::{
         self, ROUND_KEYS,
         packed_u8_lanes::{CombinedRoundKeys, combine_round_keys},
-        packed_u8_lanes_with_speed_cache::SpeedCachePrecomputeData,
     },
     oblivious_sort::ObliviousSort,
     replace_if_dummy::replace_if_dummy_circuit,
@@ -28,9 +27,9 @@ use mpc_core::protocols::{
 };
 use mpc_net::Network;
 use primitives::{
-    AlibiShare, ArrayShuffler, Block, BlockShare, CommunicationTimer, DoramValue, Record,
-    TimingBreakdown, X, XShare, alibi_from_blocks, alibi_to_blocks, dummy_x, network_phase,
-    open_many, promote_public, upcast_x_to_block,
+    AlibiShare, ArrayShuffler, Block, CommunicationTimer, DoramValue, Record, TimingBreakdown, X,
+    XShare, alibi_from_blocks, alibi_to_blocks, dummy_x, network_phase, open_many, promote_public,
+    upcast_x_to_block,
 };
 
 /// `GigaDoram` storing `u32` values.
@@ -289,7 +288,7 @@ impl<V: DoramValue> GigaDoram<V> {
             .map(Record::<V>::from_value)
             .collect::<Vec<_>>();
 
-        doram.new_ohtable_of_level(bottom_level, xs, ys, net, state, timing)?;
+        doram.new_ohtable_of_level(bottom_level, xs, ys, net, state, timing);
         doram.insert_stash(bottom_level, state.id);
 
         Ok(doram)
@@ -361,9 +360,10 @@ impl<V: DoramValue> GigaDoram<V> {
         }
         let mut speed_cache_precompute_data = self.speed_cache.precompute_query(query_x);
         let qs = network_phase!(timing, time_total_query_prf, {
-            self.evaluate_prf_tags(
-                &live_levels,
-                query_x,
+            lowmc::packed_u8_lanes_with_speed_cache::encrypt_with_combined_round_keys(
+                self.packed_query_key.as_ref().unwrap(),
+                live_levels.len(),
+                upcast_x_to_block(query_x),
                 speed_cache_precompute_data.as_mut(),
                 net,
                 state,
@@ -463,7 +463,7 @@ impl<V: DoramValue> GigaDoram<V> {
             "rebuild extracted mismatched x/y lengths"
         );
 
-        for y in extracted_ys.iter_mut() {
+        for y in &mut extracted_ys {
             *y = y.clear_alibi();
         }
 
@@ -475,7 +475,7 @@ impl<V: DoramValue> GigaDoram<V> {
                 let mut value_blocks = V::to_blocks(&values);
                 let mut y_alibi = alibi_to_blocks(&alibis);
                 shuffler.forward(&mut extracted_xs, net, state)?;
-                for col in value_blocks.iter_mut() {
+                for col in &mut value_blocks {
                     shuffler.forward(col, net, state)?;
                 }
                 shuffler.forward(&mut y_alibi, net, state)?;
@@ -506,7 +506,7 @@ impl<V: DoramValue> GigaDoram<V> {
             self.delete_level(rebuild_to);
         }
 
-        self.new_ohtable_of_level(rebuild_to, extracted_xs, extracted_ys, net, state, timing)?;
+        self.new_ohtable_of_level(rebuild_to, extracted_xs, extracted_ys, net, state, timing);
         self.insert_stash(rebuild_to, state.id);
 
         Ok(())
@@ -541,7 +541,7 @@ impl<V: DoramValue> GigaDoram<V> {
         net: &N,
         state: &mut Rep3State,
         mut timing: Option<&mut GigaDoramTiming>,
-    ) -> Result<()> {
+    ) {
         assert!(level < self.config.num_levels);
         assert_eq!(xs.len(), ys.len());
         assert!(xs.len() >= self.config.stash_size);
@@ -571,7 +571,9 @@ impl<V: DoramValue> GigaDoram<V> {
             log_single_col_len as u32,
             self.config.log_address_space_size,
         );
-        let key = Self::generate_prf_key(state);
+        let key = (0..ROUND_KEYS)
+            .map(|_| arithmetic::rand::<Block>(state))
+            .collect();
         let start = Instant::now();
         let mut ohtable_timing = OhTableTiming::with_communication_timer(Self::timer(&timing));
         let table_timing = timing.is_some().then_some(&mut ohtable_timing);
@@ -583,8 +585,6 @@ impl<V: DoramValue> GigaDoram<V> {
         }
         self.levels[level] = Some(table);
         self.packed_query_key = None;
-
-        Ok(())
     }
 
     fn delete_level(&mut self, level: usize) {
@@ -738,34 +738,10 @@ impl<V: DoramValue> GigaDoram<V> {
         Ok((xs, ys))
     }
 
-    fn generate_prf_key(state: &mut Rep3State) -> Vec<BlockShare> {
-        (0..ROUND_KEYS)
-            .map(|_| arithmetic::rand::<Block>(state))
-            .collect()
-    }
-
     fn timer(timing: &Option<&mut GigaDoramTiming>) -> CommunicationTimer {
         timing
             .as_ref()
             .map(|timing| timing.communication_timer.clone())
             .unwrap_or_default()
-    }
-
-    fn evaluate_prf_tags<N: Network>(
-        &self,
-        levels: &[usize],
-        input: XShare,
-        speed_cache_precompute_data: Option<&mut SpeedCachePrecomputeData<V>>,
-        net: &N,
-        state: &mut Rep3State,
-    ) -> Result<Vec<BlockShare>> {
-        lowmc::packed_u8_lanes_with_speed_cache::encrypt_with_combined_round_keys(
-            self.packed_query_key.as_ref().unwrap(),
-            levels.len(),
-            upcast_x_to_block(input),
-            speed_cache_precompute_data,
-            net,
-            state,
-        )
     }
 }

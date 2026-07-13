@@ -60,7 +60,7 @@ fn assert_sort(
         (
             open_many(&flag_shares, &net)
                 .into_iter()
-                .map(|bit| bit.convert())
+                .map(Bit::convert)
                 .collect::<Vec<_>>(),
             open_many(&x_shares, &net),
             open_many_y(&y_shares, &net),

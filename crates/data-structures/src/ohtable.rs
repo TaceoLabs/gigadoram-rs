@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use circuits::lowmc::{self, ROUND_KEYS, packed_u8_lanes};
-use eyre::Ok;
 use mpc_core::protocols::{
     rep3::{Rep3State, id::PartyID, network::Rep3NetworkExt},
     rep3_ring::{
@@ -256,7 +255,9 @@ impl<V: DoramValue> OhTable<V> {
         });
 
         let index_receiver_order = local_phase!(timing, receiver_index, {
-            if state.id != self.params.builder {
+            if state.id == self.params.builder {
+                net.recv_prev()?
+            } else {
                 let receiver_shuffle = self
                     .receiver_shuffle
                     .as_mut()
@@ -268,8 +269,6 @@ impl<V: DoramValue> OhTable<V> {
                         .expect("should send index to receiver");
                 }
                 index_receiver_order
-            } else {
-                net.recv_prev()?
             }
         });
 
@@ -508,14 +507,15 @@ impl<V: DoramValue> OhTable<V> {
     ) -> eyre::Result<Option<Vec<Block>>> {
         if state.id == self.params.builder {
             let prev_b = net.recv_from::<Vec<RingElement<Block>>>(self.params.builder.prev())?;
-            Ok(Some(
+            return Ok(Some(
                 self.qs_builder_order
                     .iter()
                     .zip(prev_b.iter())
                     .map(|(own, prev_b)| (own.a ^ own.b ^ *prev_b).0)
                     .collect(),
-            ))
-        } else if state.id == self.params.builder.prev() {
+            ));
+        }
+        if state.id == self.params.builder.prev() {
             net.send_to(
                 self.params.builder,
                 self.qs_builder_order
@@ -523,10 +523,8 @@ impl<V: DoramValue> OhTable<V> {
                     .map(|q| q.b)
                     .collect::<Vec<_>>(),
             )?;
-            Ok(None)
-        } else {
-            Ok(None)
         }
+        Ok(None)
     }
 }
 

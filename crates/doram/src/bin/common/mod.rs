@@ -72,12 +72,12 @@ pub fn install_tracing() {
         .try_init();
 }
 
-pub fn doram_config(config: &DoramBenchmarkConfig) -> Result<GigaDoramConfig> {
-    Ok(GigaDoramConfig::new(
+pub fn doram_config(config: &DoramBenchmarkConfig) -> GigaDoramConfig {
+    GigaDoramConfig::new(
         config.log_address_space,
         config.num_levels,
         config.log_amp_factor,
-    ))
+    )
 }
 
 pub fn generate_queries(config: &DoramBenchmarkConfig) -> Vec<BenchmarkQuery> {
@@ -187,7 +187,13 @@ pub fn run_party<N: Network>(
     let setup_time = setup_start.elapsed();
 
     let progress = if show_progress && state.id == PartyID::ID0 {
-        query_progress_bar(queries.len())
+        ProgressBar::new(queries.len() as u64).with_style(
+            ProgressStyle::with_template(
+                "{percent:>3}%|{bar:40}| {human_pos}/{human_len} [{elapsed_precise}<{eta_precise}, {per_sec}]",
+            )
+            .expect("progress bar template should be valid")
+            .progress_chars("█▉▊▋▌▍▎▏ "),
+        )
     } else {
         ProgressBar::hidden()
     };
@@ -247,46 +253,30 @@ pub fn run_party<N: Network>(
     })
 }
 
-fn query_progress_bar(num_queries: usize) -> ProgressBar {
-    let bar = ProgressBar::new(num_queries as u64);
-    bar.set_style(
-        ProgressStyle::with_template(
-            "{percent:>3}%|{bar:40}| {human_pos}/{human_len} [{elapsed_precise}<{eta_precise}, {per_sec}]",
-        )
-        .expect("progress bar template should be valid")
-        .progress_chars("█▉▊▋▌▍▎▏ "),
-    );
-    bar
-}
-
 fn benchmark_y(seed: u64) -> Y {
     let mut rng = ChaCha20Rng::seed_from_u64(seed);
     random_bigint::<YField, _>(&mut rng)
 }
 
 pub fn print_report(config: &DoramBenchmarkConfig, report: &PartyReport) {
-    let bottom_level = config.num_levels - 1;
-    let bottom_build = report
-        .timing
+    let timing = &report.timing;
+    let details = &timing.time_total_query_ohtable_details;
+    let bottom_build = timing
         .time_total_builds
-        .get(bottom_level)
+        .get(config.num_levels - 1)
         .copied()
         .unwrap_or(Duration::ZERO);
-    let other_builds = report
-        .timing
+    let other_builds = timing
         .time_total_builds
         .iter()
-        .enumerate()
-        .filter_map(|(level, duration)| (level != bottom_level).then_some(*duration))
-        .sum::<Duration>();
+        .sum::<Duration>()
+        .saturating_sub(bottom_build);
     let queries_per_sec = config.num_queries as f64 / report.total_time.as_secs_f64();
-    let bytes_total = report.bytes_sent + report.bytes_received;
-    let query_accounted = report.timing.time_total_query_prf.total
-        + report.timing.time_total_query_speed_cache.total
-        + report.timing.time_total_query_ohtable
-        + report.timing.time_total_query_writeback;
-    let query_other = report
-        .timing
+    let query_accounted = timing.time_total_query_prf.total
+        + timing.time_total_query_speed_cache.total
+        + timing.time_total_query_ohtable
+        + timing.time_total_query_writeback;
+    let query_other = timing
         .time_total_queries
         .total
         .saturating_sub(query_accounted);
@@ -338,33 +328,25 @@ pub fn print_report(config: &DoramBenchmarkConfig, report: &PartyReport) {
         Y_BITS,
         format_timing(report.total_time, report.total_communication, "|  |  "),
         format_duration(report.setup_time),
-        format_breakdown(&report.timing.time_total_build_prf, "|  |  |  "),
-        format_duration(report.timing.time_total_batcher),
+        format_breakdown(&timing.time_total_build_prf, "|  |  |  "),
+        format_duration(timing.time_total_batcher),
         format_duration(bottom_build),
         format_duration(other_builds),
-        format_breakdown(&report.timing.time_total_queries, "|     |  "),
-        format_breakdown(&report.timing.time_total_query_prf, "|     |  "),
-        format_breakdown(&report.timing.time_total_query_speed_cache, "|     |  "),
-        format_duration(report.timing.time_total_query_ohtable),
-        format_duration(report.timing.time_total_query_ohtable_details.dummy_cmux),
-        format_duration(report.timing.time_total_query_ohtable_details.tag_reveal),
-        format_breakdown(
-            &report.timing.time_total_query_ohtable_details.cht_lookup,
-            "|     |  |  ",
-        ),
-        format_duration(
-            report
-                .timing
-                .time_total_query_ohtable_details
-                .receiver_index
-        ),
-        format_duration(report.timing.time_total_query_ohtable_details.bookkeeping),
-        format_duration(report.timing.time_total_query_writeback),
+        format_breakdown(&timing.time_total_queries, "|     |  "),
+        format_breakdown(&timing.time_total_query_prf, "|     |  "),
+        format_breakdown(&timing.time_total_query_speed_cache, "|     |  "),
+        format_duration(timing.time_total_query_ohtable),
+        format_duration(details.dummy_cmux),
+        format_duration(details.tag_reveal),
+        format_breakdown(&details.cht_lookup, "|     |  |  "),
+        format_duration(details.receiver_index),
+        format_duration(details.bookkeeping),
+        format_duration(timing.time_total_query_writeback),
         format_duration(query_other),
         queries_per_sec,
         report.bytes_sent,
         report.bytes_received,
-        bytes_total,
+        report.bytes_sent + report.bytes_received,
     );
 }
 

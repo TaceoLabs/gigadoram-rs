@@ -149,7 +149,7 @@ impl<V: DoramValue> Record<V> {
 }
 
 impl<V: DoramValue> std::ops::BitXor for Record<V> {
-    type Output = Record<V>;
+    type Output = Self;
     fn bitxor(self, rhs: Self) -> Self {
         Self {
             value: self.value ^ rhs.value,
@@ -215,26 +215,14 @@ macro_rules! impl_ring_value {
                 rhs: &[Self::Share],
                 state: &mut Rep3State,
             ) -> Vec<Self::AndLocal> {
-                lhs.iter()
-                    .zip(rhs)
-                    .map(|(lhs, rhs)| {
-                        let (mut mask, mask_b) =
-                            state.rngs.rand.random_elements::<RingElement<$t>>();
-                        mask ^= mask_b;
-                        (lhs & rhs) ^ mask
-                    })
-                    .collect()
+                crate::utils::ring_local_and(lhs, rhs, state)
             }
 
             fn recombine_and(
                 local: Vec<Self::AndLocal>,
                 next: Vec<Self::AndLocal>,
             ) -> Vec<Self::Share> {
-                local
-                    .into_iter()
-                    .zip(next)
-                    .map(|(a, b)| Rep3RingShare::new_ring(a, b))
-                    .collect()
+                crate::utils::ring_recombine(local, next)
             }
 
             fn promote_public(id: PartyID, value: Self) -> Self::Share {
@@ -262,29 +250,14 @@ impl_ring_value!(u128);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FieldValue<F: PrimeField>(pub F::BigInt);
 
-/// All-ones mask covering the field modulus' bit width.
-fn field_all_ones<F: PrimeField>() -> F::BigInt {
-    let bits = F::MODULUS_BIT_SIZE as usize;
-    let mut value = F::BigInt::default();
-    for (i, limb) in value.as_mut().iter_mut().enumerate() {
-        let covered = i * 64;
-        *limb = if bits >= covered + 64 {
-            u64::MAX
-        } else if bits > covered {
-            (1u64 << (bits - covered)) - 1
-        } else {
-            0
-        };
-    }
-    value
-}
-
 /// Limb `index` of a `BigInt`, or 0 if the `BigInt` has fewer limbs.
+#[inline]
 fn get_limb<B: AsRef<[u64]>>(limbs: &B, index: usize) -> u64 {
     limbs.as_ref().get(index).copied().unwrap_or(0)
 }
 
 /// Set limb `index` of a `BigInt`, ignoring out-of-range indices.
+#[inline]
 fn set_limb<B: AsMut<[u64]>>(limbs: &mut B, index: usize, value: u64) {
     if let Some(limb) = limbs.as_mut().get_mut(index) {
         *limb = value;
@@ -337,7 +310,18 @@ impl<F: PrimeField> DoramValue for FieldValue<F> {
     }
 
     fn bit_to_mask(bit: &BitShare) -> Self::Share {
-        let all_ones = field_all_ones::<F>();
+        let bits = F::MODULUS_BIT_SIZE as usize;
+        let mut all_ones = F::BigInt::default();
+        for (i, limb) in all_ones.as_mut().iter_mut().enumerate() {
+            let covered = i * 64;
+            *limb = if bits >= covered + 64 {
+                u64::MAX
+            } else if bits > covered {
+                (1u64 << (bits - covered)) - 1
+            } else {
+                0
+            };
+        }
         Rep3BigIntShare::new(
             if bit.a.0.convert() {
                 all_ones
@@ -386,11 +370,11 @@ impl<F: PrimeField> DoramValue for FieldValue<F> {
         shares
             .iter()
             .zip(net.reshare_many(&bs).unwrap())
-            .map(|(share, next)| FieldValue(share.a ^ share.b ^ next))
+            .map(|(share, next)| Self(share.a ^ share.b ^ next))
             .collect()
     }
 
     fn random<R: Rng + CryptoRng>(rng: &mut R) -> Self {
-        FieldValue(crate::bigintshare::random_bigint::<F, _>(rng))
+        Self(crate::bigintshare::random_bigint::<F, _>(rng))
     }
 }

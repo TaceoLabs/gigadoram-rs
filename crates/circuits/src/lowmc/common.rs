@@ -1,6 +1,12 @@
 use std::sync::LazyLock;
 
-use mpc_core::protocols::rep3_ring::ring::ring_impl::RingElement;
+use mpc_core::protocols::{
+    rep3::id::PartyID,
+    rep3_ring::{
+        Rep3RingShare, binary,
+        ring::{int_ring::IntRing2k, ring_impl::RingElement},
+    },
+};
 use primitives::BlockShare;
 
 use crate::lowmc::parameters;
@@ -75,6 +81,7 @@ pub struct RoundKeys {
 }
 
 impl RoundKeys {
+    #[inline]
     pub fn get(&self, round: usize) -> BlockShare {
         self.keys[round]
     }
@@ -82,20 +89,9 @@ impl RoundKeys {
     pub fn from_expanded_key(key: &[BlockShare]) -> Self {
         assert_eq!(key.len(), ROUND_KEYS);
         Self {
-            keys: std::array::from_fn(|round| key[round]),
+            keys: key.try_into().unwrap(),
         }
     }
-}
-
-pub(crate) fn split_block(block: RingElement<u128>) -> [RingElement<u64>; 2] {
-    [
-        RingElement(block.0 as u64),
-        RingElement((block.0 >> 64) as u64),
-    ]
-}
-
-pub(crate) fn join_block(block: [RingElement<u64>; 2]) -> RingElement<u128> {
-    RingElement(block[0].0 as u128 | ((block[1].0 as u128) << 64))
 }
 
 pub(crate) fn m4r_lut(input: u8) -> [bool; 1 << M4R_WINDOW_SIZE] {
@@ -104,4 +100,66 @@ pub(crate) fn m4r_lut(input: u8) -> [bool; 1 << M4R_WINDOW_SIZE] {
         lut[i] = lut[i - 1] ^ ((input >> i.trailing_zeros()) & 1 == 1);
     }
     lut
+}
+
+#[inline]
+pub(crate) fn collect_sbox_ands<T: IntRing2k>(
+    input: &[Rep3RingShare<T>],
+    lhs: &mut Vec<Rep3RingShare<T>>,
+    rhs: &mut Vec<Rep3RingShare<T>>,
+) {
+    for i in 0..N_SBOXES {
+        let a = input[3 * i];
+        let b = input[3 * i + 1];
+        let c = input[3 * i + 2];
+        lhs.extend([b, c, a]);
+        rhs.extend([c, a, b]);
+    }
+}
+
+#[inline]
+pub(crate) fn apply_sbox_ands<T: IntRing2k>(
+    input: &[Rep3RingShare<T>],
+    ands: &[Rep3RingShare<T>],
+    output: &mut [Rep3RingShare<T>],
+) {
+    for i in 0..N_SBOXES {
+        let a = input[3 * i];
+        let b = input[3 * i + 1];
+        let c = input[3 * i + 2];
+        let bc = ands[3 * i];
+        let ca = ands[3 * i + 1];
+        let ab = ands[3 * i + 2];
+        output[3 * i] = bc ^ a;
+        output[3 * i + 1] = ca ^ a ^ b;
+        output[3 * i + 2] = ab ^ a ^ b ^ c;
+    }
+    output[(3 * N_SBOXES)..BLOCK_SIZE].copy_from_slice(&input[(3 * N_SBOXES)..BLOCK_SIZE]);
+}
+
+#[inline]
+pub(crate) fn xor_constants<T: IntRing2k>(
+    round: usize,
+    state: &mut [Rep3RingShare<T>],
+    active_mask: T,
+    party_id: PartyID,
+) {
+    for (bit, constant) in state
+        .iter_mut()
+        .zip(parameters::ROUND_CONSTANTS[round].iter().copied())
+    {
+        if constant {
+            *bit = binary::xor_public(bit, &RingElement(active_mask), party_id);
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn add_round_key<T: IntRing2k>(
+    state: &mut [Rep3RingShare<T>],
+    round_key: &[Rep3RingShare<T>],
+) {
+    for (state, key) in state.iter_mut().zip(round_key) {
+        *state ^= key;
+    }
 }

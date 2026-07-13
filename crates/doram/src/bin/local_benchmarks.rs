@@ -21,7 +21,7 @@ fn main() -> Result<()> {
     common::install_tracing();
 
     let cli = Cli::parse();
-    let doram_config = doram_config(&cli.doram)?;
+    let doram_config = doram_config(&cli.doram);
     print_startup_config(&cli.doram, doram_config, "local", None);
 
     let queries = generate_queries(&cli.doram);

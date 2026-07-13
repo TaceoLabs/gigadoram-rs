@@ -25,11 +25,9 @@ pub struct TimingBreakdown {
 impl CommunicationTimer {
     pub fn elapsed(&self) -> Duration {
         let state = self.0.lock().expect("communication timer poisoned");
-        state.elapsed
-            + state
-                .started
-                .map(|start| start.elapsed())
-                .unwrap_or_default()
+        state
+            .started
+            .map_or(state.elapsed, |start| state.elapsed + start.elapsed())
     }
 
     fn start(&self) {

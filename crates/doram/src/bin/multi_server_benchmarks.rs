@@ -31,7 +31,7 @@ fn main() -> Result<()> {
     common::install_tracing();
 
     let cli = Cli::parse();
-    let doram_config = doram_config(&cli.doram)?;
+    let doram_config = doram_config(&cli.doram);
     let network_config = read_network_config(&cli.network)?;
     print_startup_config(
         &cli.doram,
