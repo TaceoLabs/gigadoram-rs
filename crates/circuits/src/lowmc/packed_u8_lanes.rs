@@ -12,6 +12,7 @@ use crate::lowmc::common::{BLOCK_SIZE, M4R_WINDOW_SIZE, N_ROUNDS, N_SBOXES, ROUN
 use crate::lowmc::parameters;
 
 pub(crate) type Share = Rep3RingShare<u8>;
+pub type CombinedRoundKeys = [[Rep3RingShare<u8>; BLOCK_SIZE]; ROUND_KEYS];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackedU8RoundKeys {
@@ -88,7 +89,7 @@ pub fn encrypt_few_with_repeated_input<N: Network>(
     Ok(pack_lanes(&state_bits, round_keys_len(active_mask)))
 }
 
-pub(crate) fn combine_round_keys(keys: &[&PackedU8RoundKeys]) -> [[Share; BLOCK_SIZE]; ROUND_KEYS] {
+pub fn combine_round_keys(keys: &[&PackedU8RoundKeys]) -> CombinedRoundKeys {
     std::array::from_fn(|round| {
         let mut wires = [Share::zero_share(); BLOCK_SIZE];
         for (lane, key) in keys.iter().enumerate() {

@@ -12,7 +12,11 @@
 use std::time::{Duration, Instant};
 
 use circuits::{
-    lowmc::{self, ROUND_KEYS, packed_u8_lanes_with_speed_cache::SpeedCachePrecomputeData},
+    lowmc::{
+        self, ROUND_KEYS,
+        packed_u8_lanes::{CombinedRoundKeys, combine_round_keys},
+        packed_u8_lanes_with_speed_cache::SpeedCachePrecomputeData,
+    },
     oblivious_sort::ObliviousSort,
     replace_if_dummy::replace_if_dummy_circuit,
 };
@@ -196,6 +200,7 @@ pub struct GigaDoram<V: DoramValue> {
     pub speed_cache: SpeedCache<V>,
     pub levels: Vec<Option<OhTable<V>>>,
     pub base_b_state_vec: Vec<usize>,
+    packed_query_key: Option<CombinedRoundKeys>,
     had_initial_bottom_level: bool,
 }
 
@@ -242,6 +247,7 @@ impl<V: DoramValue> GigaDoram<V> {
             speed_cache,
             levels: vec![None; config.num_levels],
             base_b_state_vec: vec![0; config.num_levels],
+            packed_query_key: None,
             had_initial_bottom_level: false,
         }
     }
@@ -270,6 +276,7 @@ impl<V: DoramValue> GigaDoram<V> {
             ),
             levels: vec![None; config.num_levels],
             base_b_state_vec: vec![0; config.num_levels],
+            packed_query_key: None,
             had_initial_bottom_level: true,
         };
 
@@ -345,6 +352,13 @@ impl<V: DoramValue> GigaDoram<V> {
             .enumerate()
             .filter_map(|(level, table)| table.as_ref().map(|_| level))
             .collect::<Vec<_>>();
+        if self.packed_query_key.is_none() {
+            let keys = live_levels
+                .iter()
+                .map(|&level| &self.levels[level].as_ref().unwrap().packed_key)
+                .collect::<Vec<_>>();
+            self.packed_query_key = Some(combine_round_keys(&keys));
+        }
         let mut speed_cache_precompute_data = self.speed_cache.precompute_query(query_x);
         let qs = network_phase!(timing, time_total_query_prf, {
             self.evaluate_prf_tags(
@@ -568,12 +582,14 @@ impl<V: DoramValue> GigaDoram<V> {
             timing.record_build(level, start.elapsed());
         }
         self.levels[level] = Some(table);
+        self.packed_query_key = None;
 
         Ok(())
     }
 
     fn delete_level(&mut self, level: usize) {
         self.levels[level] = None;
+        self.packed_query_key = None;
         if level < self.config.num_levels - 1
             && self.base_b_state_vec[level] == self.config.amp_factor() - 1
         {
@@ -743,18 +759,9 @@ impl<V: DoramValue> GigaDoram<V> {
         net: &N,
         state: &mut Rep3State,
     ) -> Result<Vec<BlockShare>> {
-        let keys = levels
-            .iter()
-            .map(|&level| {
-                let table = self.levels[level]
-                    .as_ref()
-                    .expect("live level should have an OHTable");
-                assert_eq!(table.key.len(), ROUND_KEYS);
-                table.key.as_slice()
-            })
-            .collect::<Vec<_>>();
-        lowmc::packed_u8_lanes_with_speed_cache::encrypt_many_with_repeated_input(
-            &keys,
+        lowmc::packed_u8_lanes_with_speed_cache::encrypt_with_combined_round_keys(
+            self.packed_query_key.as_ref().unwrap(),
+            levels.len(),
             upcast_x_to_block(input),
             speed_cache_precompute_data,
             net,

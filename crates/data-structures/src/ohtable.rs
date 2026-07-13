@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use circuits::lowmc::{self, ROUND_KEYS};
+use circuits::lowmc::{self, ROUND_KEYS, packed_u8_lanes};
 use eyre::Ok;
 use mpc_core::protocols::{
     rep3::{Rep3State, id::PartyID, network::Rep3NetworkExt},
@@ -78,6 +78,7 @@ impl OHTableParams {
 pub struct OhTable<V: DoramValue> {
     pub params: OHTableParams,
     pub key: Vec<BlockShare>,
+    pub packed_key: packed_u8_lanes::PackedU8RoundKeys,
     pub stash_xs: Vec<XShare>,
     pub stash_ys: Vec<Record<V>>,
     pub builder_stash_indices: Vec<usize>,
@@ -160,9 +161,11 @@ impl<V: DoramValue> OhTable<V> {
         assert_eq!(key.len(), ROUND_KEYS);
 
         let dummy = dummy_x(state.id, params.log_address_space_size);
+        let packed_key = packed_u8_lanes::precompute_round_keys(&key);
         let mut table = Self {
             params,
             key,
+            packed_key,
             stash_xs: vec![XShare::zero_share(); params.stash_size],
             stash_ys: vec![Record::zero_share(); params.stash_size],
             builder_stash_indices: vec![0; params.stash_size],

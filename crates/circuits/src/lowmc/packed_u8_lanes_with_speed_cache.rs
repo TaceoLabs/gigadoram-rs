@@ -11,9 +11,8 @@ use primitives::{
 use crate::lowmc::{
     common::{BLOCK_SIZE, N_ROUNDS, N_SBOXES},
     packed_u8_lanes::{
-        PackedU8RoundKeys, Share, add_round_key, apply_sbox_ands, bit_slice, collect_sbox_ands,
-        combine_round_keys, four_russians_into, lane_mask, pack_lanes, precompute_round_keys,
-        xor_constants,
+        CombinedRoundKeys, Share, add_round_key, apply_sbox_ands, bit_slice, collect_sbox_ands,
+        four_russians_into, lane_mask, pack_lanes, xor_constants,
     },
 };
 const ZERO_CHECK_ROUNDS: usize = X::BITS.ilog2() as usize;
@@ -69,46 +68,20 @@ impl<V: DoramValue> SpeedCachePrecomputeData<V> {
     }
 }
 
-pub fn encrypt_many_with_repeated_input<V: DoramValue, N: Network>(
-    expanded_keys: &[&[BlockShare]],
-    input: BlockShare,
-    mut speed_cache: Option<&mut SpeedCachePrecomputeData<V>>,
-    net: &N,
-    state: &mut Rep3State,
-) -> eyre::Result<Vec<BlockShare>> {
-    let mut outputs = Vec::with_capacity(expanded_keys.len());
-    for keys in expanded_keys.chunks(8) {
-        let round_keys = keys
-            .iter()
-            .map(|key| precompute_round_keys(key))
-            .collect::<Vec<_>>();
-        let round_key_refs = round_keys.iter().collect::<Vec<_>>();
-        outputs.extend(encrypt_few_with_repeated_input(
-            &round_key_refs,
-            input,
-            speed_cache.take(),
-            net,
-            state,
-        )?);
-    }
-    Ok(outputs)
-}
-
-pub(crate) fn encrypt_few_with_repeated_input<V: DoramValue, N: Network>(
-    round_keys: &[&PackedU8RoundKeys],
+pub fn encrypt_with_combined_round_keys<V: DoramValue, N: Network>(
+    round_keys: &CombinedRoundKeys,
+    num_lanes: usize,
     input: BlockShare,
     speed_cache: Option<&mut SpeedCachePrecomputeData<V>>,
     net: &N,
     state: &mut Rep3State,
 ) -> eyre::Result<Vec<BlockShare>> {
-    if round_keys.is_empty() {
+    if num_lanes == 0 {
         return Ok(Vec::new());
     }
-    assert!(round_keys.len() <= 8);
+    assert!(num_lanes <= 8);
 
-    let num_lanes = round_keys.len();
     let active_mask = lane_mask(num_lanes);
-    let round_keys = combine_round_keys(round_keys);
     let mut state_bits = bit_slice([(input, active_mask)]);
     let mut sboxed = vec![Share::zero_share(); BLOCK_SIZE];
     let mut linear = vec![Share::zero_share(); BLOCK_SIZE];
