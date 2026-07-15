@@ -51,6 +51,115 @@ fn test_multiple_writes() {
     assert_trace(get_standard_config(), &trace, &[0, 0, 10, 20]);
 }
 
+#[test]
+fn test_batched_double_accesses() {
+    run_parties(|net| {
+        let mut state = Rep3State::new(&net, A2BType::Direct).unwrap();
+        let mut doram = GigaDoram::new(get_standard_config(), state.id);
+        for pair in 0..12 {
+            let addresses = [2 * pair + 1, 2 * pair + 2].map(|x| x as X);
+            let old = doram
+                .batch_write(
+                    &addresses.map(|x| {
+                        (
+                            promote_public(state.id, x),
+                            promote_public_y(state.id, random_y(x as u64 * 10)),
+                        )
+                    }),
+                    &net,
+                    &mut state,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(open_many_y(&old, &net), [Y::default(); 2]);
+        }
+        for pair in 0..12 {
+            let addresses = [2 * pair + 1, 2 * pair + 2].map(|x| x as X);
+            let values = doram
+                .batch_read(
+                    &addresses.map(|x| promote_public(state.id, x)),
+                    &net,
+                    &mut state,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                open_many_y(&values, &net),
+                addresses.map(|x| random_y(x as u64 * 10))
+            );
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+fn test_batch_accesses() {
+    run_parties(|net| {
+        let mut state = Rep3State::new(&net, A2BType::Direct).unwrap();
+        let id = state.id;
+        let mut doram = GigaDoram::new(get_standard_config(), id);
+        let x = move |v: X| promote_public(id, v);
+        let y = move |seed: u64| promote_public_y(id, random_y(seed));
+
+        let old = doram
+            .batch_write(
+                &[(x(1), y(10)), (x(2), y(20)), (x(3), y(30))],
+                &net,
+                &mut state,
+                None,
+            )
+            .unwrap();
+        assert_eq!(open_many_y(&old, &net), [Y::default(); 3]);
+        let old = doram
+            .batch_write(
+                &[(x(2), y(21)), (x(4), y(40)), (x(5), y(50))],
+                &net,
+                &mut state,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            open_many_y(&old, &net),
+            [random_y(20), Y::default(), Y::default()]
+        );
+
+        // Mixed reads and writes in one batch.
+        let outputs = doram
+            .batch_access(
+                &[(x(2), Some(y(22))), (x(4), None), (x(7), Some(y(100)))],
+                &net,
+                &mut state,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            open_many_y(&outputs, &net),
+            [random_y(21), random_y(40), Y::default()]
+        );
+
+        // Push the entries through rebuilds and read everything back.
+        for round in 0..8 {
+            let base = 20 + 2 * round as X;
+            doram
+                .batch_write(
+                    &[(x(base), y(base as u64)), (x(base + 1), y(base as u64 + 1))],
+                    &net,
+                    &mut state,
+                    None,
+                )
+                .unwrap();
+        }
+        let values = doram
+            .batch_read(&[x(1), x(2), x(3), x(7)], &net, &mut state, None)
+            .unwrap();
+        assert_eq!(
+            open_many_y(&values, &net),
+            [random_y(10), random_y(22), random_y(30), random_y(100)]
+        );
+    })
+    .unwrap();
+}
+
 // Reading a value should reinsert it so it can be read again.
 #[test]
 fn test_double_read() {

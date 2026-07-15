@@ -34,6 +34,9 @@ pub struct DoramBenchmarkConfig {
     #[arg(long, action = ArgAction::Set, default_value_t = false)]
     pub build_bottom_level_at_startup: bool,
 
+    #[arg(long, default_value = "1")]
+    pub batch_size: usize,
+
     #[arg(long, default_value = "42")]
     pub seed: u64,
 }
@@ -83,13 +86,30 @@ pub fn doram_config(config: &DoramBenchmarkConfig) -> GigaDoramConfig {
 pub fn generate_queries(config: &DoramBenchmarkConfig) -> Vec<BenchmarkQuery> {
     let mut rng = ChaCha20Rng::seed_from_u64(config.seed);
     let address_space_size = 1usize << config.log_address_space;
-    (0..config.num_queries)
+    assert!(config.batch_size >= 1, "batch size must be at least 1");
+    assert!(
+        config.batch_size <= address_space_size,
+        "batch size cannot exceed the address space"
+    );
+    let mut queries = (0..config.num_queries)
         .map(|_| BenchmarkQuery {
             x: rng.gen_range(0..address_space_size) as X,
             y: benchmark_y(rng.r#gen()),
             is_write: rng.gen_bool(0.5),
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if config.batch_size > 1 {
+        for batch in queries.chunks_exact_mut(config.batch_size) {
+            let is_write = batch[0].is_write;
+            for i in 1..batch.len() {
+                batch[i].is_write = is_write;
+                while batch[..i].iter().any(|query| query.x == batch[i].x) {
+                    batch[i].x = ((batch[i].x as usize + 1) % address_space_size) as X;
+                }
+            }
+        }
+    }
+    queries
 }
 
 pub fn print_startup_config(
@@ -121,6 +141,7 @@ pub fn print_startup_config(
             "\nStarting DORAM benchmark\n",
             "|- mode: {}\n",
             "|- queries: {}\n",
+            "|- batch_size: {}\n",
             "|- seed: {}\n",
             "|- build_bottom_level_at_startup: {}\n",
             "|- log_address_space: {}\n",
@@ -137,6 +158,7 @@ pub fn print_startup_config(
         ),
         transport,
         config.num_queries,
+        config.batch_size,
         config.seed,
         config.build_bottom_level_at_startup,
         config.log_address_space,
@@ -198,36 +220,81 @@ pub fn run_party<N: Network>(
         ProgressBar::hidden()
     };
 
-    for query in queries {
-        let initial_value = if config.build_bottom_level_at_startup {
-            benchmark_y(query.x as u64)
-        } else {
-            Y::default()
-        };
-        let expected = oracle.get(&query.x).copied().unwrap_or(initial_value);
-        let x = promote_public(state.id, query.x);
-
-        let result = if query.is_write {
-            let y = promote_public_y(state.id, query.y);
-            doram.write(x, y, &net, &mut state, Some(&mut timing))?
-        } else {
-            doram.read(x, &net, &mut state, Some(&mut timing))?
-        };
-
-        let opened = open_y(&result, &net);
+    if config.batch_size > 1 {
         ensure!(
-            opened == expected,
-            "party {:?}: query for x={} returned {:?}, expected {:?}",
-            state.id,
-            query.x,
-            opened,
-            expected
+            config.batch_size <= doram_config.fill_time(),
+            "batch size {} exceeds the speed cache fill time {}",
+            config.batch_size,
+            doram_config.fill_time()
         );
-
-        if query.is_write {
-            oracle.insert(query.x, query.y);
+        let mut batches = queries.chunks_exact(config.batch_size);
+        for batch in &mut batches {
+            let expected = batch
+                .iter()
+                .map(|query| {
+                    let initial = if config.build_bottom_level_at_startup {
+                        benchmark_y(query.x as u64)
+                    } else {
+                        Y::default()
+                    };
+                    oracle.get(&query.x).copied().unwrap_or(initial)
+                })
+                .collect::<Vec<_>>();
+            let xs = batch
+                .iter()
+                .map(|query| promote_public(state.id, query.x))
+                .collect::<Vec<_>>();
+            let results = if batch[0].is_write {
+                let writes = xs
+                    .iter()
+                    .zip(batch)
+                    .map(|(&x, query)| (x, promote_public_y(state.id, query.y)))
+                    .collect::<Vec<_>>();
+                doram.batch_write(&writes, &net, &mut state, Some(&mut timing))?
+            } else {
+                doram.batch_read(&xs, &net, &mut state, Some(&mut timing))?
+            };
+            for ((query, result), expected) in batch.iter().zip(results).zip(expected) {
+                let opened = open_y(&result, &net);
+                ensure!(
+                    opened == expected,
+                    "party {:?}: query for x={} returned {:?}, expected {:?}",
+                    state.id,
+                    query.x,
+                    opened,
+                    expected
+                );
+                if query.is_write {
+                    oracle.insert(query.x, query.y);
+                }
+            }
+            progress.inc(config.batch_size as u64);
         }
-        progress.inc(1);
+        for query in batches.remainder() {
+            run_single_query(
+                config,
+                &mut doram,
+                query,
+                &net,
+                &mut state,
+                &mut timing,
+                &mut oracle,
+            )?;
+            progress.inc(1);
+        }
+    } else {
+        for query in queries {
+            run_single_query(
+                config,
+                &mut doram,
+                query,
+                &net,
+                &mut state,
+                &mut timing,
+                &mut oracle,
+            )?;
+            progress.inc(1);
+        }
     }
     progress.finish();
 
@@ -251,6 +318,49 @@ pub fn run_party<N: Network>(
         bytes_sent,
         bytes_received,
     })
+}
+
+#[inline]
+fn run_single_query<N: Network>(
+    config: &DoramBenchmarkConfig,
+    doram: &mut GigaDoram,
+    query: &BenchmarkQuery,
+    net: &N,
+    state: &mut Rep3State,
+    timing: &mut GigaDoramTiming,
+    oracle: &mut HashMap<X, Y>,
+) -> Result<()> {
+    let initial = if config.build_bottom_level_at_startup {
+        benchmark_y(query.x as u64)
+    } else {
+        Y::default()
+    };
+    let expected = oracle.get(&query.x).copied().unwrap_or(initial);
+    let x = promote_public(state.id, query.x);
+    let result = if query.is_write {
+        doram.write(
+            x,
+            promote_public_y(state.id, query.y),
+            net,
+            state,
+            Some(timing),
+        )?
+    } else {
+        doram.read(x, net, state, Some(timing))?
+    };
+    let opened = open_y(&result, net);
+    ensure!(
+        opened == expected,
+        "party {:?}: query for x={} returned {:?}, expected {:?}",
+        state.id,
+        query.x,
+        opened,
+        expected
+    );
+    if query.is_write {
+        oracle.insert(query.x, query.y);
+    }
+    Ok(())
 }
 
 fn benchmark_y(seed: u64) -> Y {
