@@ -68,7 +68,14 @@ echo "applying tc: delay=$latency rate=$bandwidth" >&2
 sudo tc qdisc replace dev lo root netem delay "$latency" rate "$bandwidth"
 
 echo "running three local TCP parties..." >&2
-for party in 0 1 2; do
+# Party 0 shows a progress bar
+"$repo_root/target/release/multi_server_benchmarks" \
+    --network "$tmpdir/party0.toml" \
+    --progress \
+    "$@" >"$tmpdir/party0.log" &
+pids+=("$!")
+
+for party in 1 2; do
     "$repo_root/target/release/multi_server_benchmarks" \
         --network "$tmpdir/party${party}.toml" \
         "$@" >"$tmpdir/party${party}.log" 2>&1 &

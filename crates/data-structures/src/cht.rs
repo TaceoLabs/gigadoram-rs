@@ -31,7 +31,7 @@ pub enum StashState {
 impl StashState {
     pub fn unwrap_regular(&self) -> usize {
         match self {
-            StashState::Vertex(v) => *v,
+            Self::Vertex(v) => *v,
             _ => panic!("called unwrap_regular on a non-regular StashState"),
         }
     }
@@ -126,27 +126,24 @@ pub fn build(
         num_marked_stashed += usize::from(*edge_state == StashState::Stashed);
     }
 
-    let stash_length = stash_size;
-    assert!(num_marked_stashed <= stash_length);
-    let mut stash_deficit = stash_length - num_marked_stashed;
+    assert!(num_marked_stashed <= stash_size);
+    let mut stash_deficit = stash_size - num_marked_stashed;
 
     let mut stash_indices = vec![0; stash_size];
     let mut num_stashed = 0;
     for (edge, input) in input_array.iter().copied().enumerate() {
+        assert_ne!(state[edge], StashState::Unvisited);
         if state[edge] == StashState::Stashed {
             // The input block's low 32 bits contain the builder-order index.
             stash_indices[num_stashed] = low_u32(input) as usize;
             num_stashed += 1;
+        } else if stash_deficit > 0 {
+            stash_indices[num_stashed] = low_u32(input) as usize;
+            num_stashed += 1;
+            stash_deficit -= 1;
         } else {
-            assert_ne!(state[edge], StashState::Unvisited);
-            if stash_deficit > 0 {
-                stash_indices[num_stashed] = low_u32(input) as usize;
-                num_stashed += 1;
-                stash_deficit -= 1;
-            } else {
-                let value = state[edge].unwrap_regular();
-                table[value] = input;
-            }
+            let value = state[edge].unwrap_regular();
+            table[value] = input;
         }
     }
     assert_eq!(stash_deficit, 0);
@@ -186,11 +183,13 @@ pub fn lookup_from_2shares<N: Network>(
     Ok(ChtLookupResult { index, found })
 }
 
+#[inline]
 pub fn h0(block: Block, log_single_col_len: u32) -> usize {
     let hash_mask = (1usize << log_single_col_len) - 1;
     ((block >> 64) as usize) & hash_mask
 }
 
+#[inline]
 pub fn h1(block: Block, log_single_col_len: u32) -> usize {
     let hash_mask = (1usize << log_single_col_len) - 1;
     (((block >> 96) as usize) & hash_mask) | (1usize << log_single_col_len)

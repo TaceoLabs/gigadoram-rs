@@ -7,9 +7,13 @@ use std::{
 use clap::{ArgAction, Args};
 use doram::{GigaDoramBn254 as GigaDoram, GigaDoramConfig, GigaDoramTiming};
 use eyre::{Result, ensure};
+use indicatif::{ProgressBar, ProgressStyle};
 use mpc_core::protocols::rep3::{Rep3State, conversion::A2BType, id::PartyID};
 use mpc_net::{Network, config::NetworkConfig};
-use primitives::{X, Y, Y_BITS, YField, open_y, promote_public, promote_public_y, random_bigint};
+use primitives::{
+    CommunicationTimer, TimedNetwork, TimingBreakdown, X, Y, Y_BITS, YField, open_y,
+    promote_public, promote_public_y, random_bigint,
+};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -46,6 +50,7 @@ pub struct PartyReport {
     pub party: PartyID,
     pub setup_time: Duration,
     pub total_time: Duration,
+    pub total_communication: Duration,
     pub timing: GigaDoramTiming,
     pub bytes_sent: usize,
     pub bytes_received: usize,
@@ -67,12 +72,12 @@ pub fn install_tracing() {
         .try_init();
 }
 
-pub fn doram_config(config: &DoramBenchmarkConfig) -> Result<GigaDoramConfig> {
-    Ok(GigaDoramConfig::new(
+pub fn doram_config(config: &DoramBenchmarkConfig) -> GigaDoramConfig {
+    GigaDoramConfig::new(
         config.log_address_space,
         config.num_levels,
         config.log_amp_factor,
-    ))
+    )
 }
 
 pub fn generate_queries(config: &DoramBenchmarkConfig) -> Vec<BenchmarkQuery> {
@@ -153,12 +158,16 @@ pub fn run_party<N: Network>(
     doram_config: GigaDoramConfig,
     queries: &[BenchmarkQuery],
     net: N,
+    show_progress: bool,
 ) -> Result<PartyReport> {
+    let communication_timer = CommunicationTimer::default();
+    let net = TimedNetwork::new(net, communication_timer.clone());
     let mut state = Rep3State::new(&net, A2BType::Direct)?;
-    let mut timing = GigaDoramTiming::default();
+    let mut timing = GigaDoramTiming::with_communication_timer(communication_timer.clone());
     let mut oracle = HashMap::<X, Y>::new();
 
     let total_start = Instant::now();
+    let total_communication_start = communication_timer.elapsed();
     let setup_start = Instant::now();
     let mut doram = if config.build_bottom_level_at_startup {
         let bottom_num_elements = 1usize << config.log_address_space;
@@ -176,6 +185,18 @@ pub fn run_party<N: Network>(
         GigaDoram::new(doram_config, state.id)
     };
     let setup_time = setup_start.elapsed();
+
+    let progress = if show_progress && state.id == PartyID::ID0 {
+        ProgressBar::new(queries.len() as u64).with_style(
+            ProgressStyle::with_template(
+                "{percent:>3}%|{bar:40}| {human_pos}/{human_len} [{elapsed_precise}<{eta_precise}, {per_sec}]",
+            )
+            .expect("progress bar template should be valid")
+            .progress_chars("█▉▊▋▌▍▎▏ "),
+        )
+    } else {
+        ProgressBar::hidden()
+    };
 
     for query in queries {
         let initial_value = if config.build_bottom_level_at_startup {
@@ -206,9 +227,14 @@ pub fn run_party<N: Network>(
         if query.is_write {
             oracle.insert(query.x, query.y);
         }
+        progress.inc(1);
     }
+    progress.finish();
 
     let total_time = total_start.elapsed();
+    let total_communication = communication_timer
+        .elapsed()
+        .saturating_sub(total_communication_start);
     let (bytes_sent, bytes_received) = net
         .get_connection_stats()
         .iter()
@@ -220,6 +246,7 @@ pub fn run_party<N: Network>(
         party: state.id,
         setup_time,
         total_time,
+        total_communication,
         timing,
         bytes_sent,
         bytes_received,
@@ -232,29 +259,26 @@ fn benchmark_y(seed: u64) -> Y {
 }
 
 pub fn print_report(config: &DoramBenchmarkConfig, report: &PartyReport) {
-    let bottom_level = config.num_levels - 1;
-    let bottom_build = report
-        .timing
+    let timing = &report.timing;
+    let details = &timing.time_total_query_ohtable_details;
+    let bottom_build = timing
         .time_total_builds
-        .get(bottom_level)
+        .get(config.num_levels - 1)
         .copied()
         .unwrap_or(Duration::ZERO);
-    let other_builds = report
-        .timing
+    let other_builds = timing
         .time_total_builds
         .iter()
-        .enumerate()
-        .filter_map(|(level, duration)| (level != bottom_level).then_some(*duration))
-        .sum::<Duration>();
+        .sum::<Duration>()
+        .saturating_sub(bottom_build);
     let queries_per_sec = config.num_queries as f64 / report.total_time.as_secs_f64();
-    let bytes_total = report.bytes_sent + report.bytes_received;
-    let query_accounted = report.timing.time_total_query_prf
-        + report.timing.time_total_query_speed_cache
-        + report.timing.time_total_query_ohtable
-        + report.timing.time_total_query_writeback;
-    let query_other = report
-        .timing
+    let query_accounted = timing.time_total_query_prf.total
+        + timing.time_total_query_speed_cache.total
+        + timing.time_total_query_ohtable
+        + timing.time_total_query_writeback;
+    let query_other = timing
         .time_total_queries
+        .total
         .saturating_sub(query_accounted);
 
     tracing::info!(
@@ -302,35 +326,43 @@ pub fn print_report(config: &DoramBenchmarkConfig, report: &PartyReport) {
         config.log_amp_factor,
         config.num_levels,
         Y_BITS,
-        format_duration(report.total_time),
+        format_timing(report.total_time, report.total_communication, "|  |  "),
         format_duration(report.setup_time),
-        format_duration(report.timing.time_total_build_prf),
-        format_duration(report.timing.time_total_batcher),
+        format_breakdown(&timing.time_total_build_prf, "|  |  |  "),
+        format_duration(timing.time_total_batcher),
         format_duration(bottom_build),
         format_duration(other_builds),
-        format_duration(report.timing.time_total_queries),
-        format_duration(report.timing.time_total_query_prf),
-        format_duration(report.timing.time_total_query_speed_cache),
-        format_duration(report.timing.time_total_query_ohtable),
-        format_duration(report.timing.time_total_query_ohtable_details.dummy_cmux),
-        format_duration(report.timing.time_total_query_ohtable_details.tag_reveal),
-        format_duration(report.timing.time_total_query_ohtable_details.cht_lookup),
-        format_duration(
-            report
-                .timing
-                .time_total_query_ohtable_details
-                .receiver_index
-        ),
-        format_duration(report.timing.time_total_query_ohtable_details.bookkeeping),
-        format_duration(report.timing.time_total_query_writeback),
+        format_breakdown(&timing.time_total_queries, "|     |  "),
+        format_breakdown(&timing.time_total_query_prf, "|     |  "),
+        format_breakdown(&timing.time_total_query_speed_cache, "|     |  "),
+        format_duration(timing.time_total_query_ohtable),
+        format_duration(details.dummy_cmux),
+        format_duration(details.tag_reveal),
+        format_breakdown(&details.cht_lookup, "|     |  |  "),
+        format_duration(details.receiver_index),
+        format_duration(details.bookkeeping),
+        format_duration(timing.time_total_query_writeback),
         format_duration(query_other),
         queries_per_sec,
         report.bytes_sent,
         report.bytes_received,
-        bytes_total,
+        report.bytes_sent + report.bytes_received,
     );
 }
 
 fn format_duration(duration: Duration) -> String {
     format!("{:.3} ms", duration.as_secs_f64() * 1_000.0)
+}
+
+fn format_breakdown(timing: &TimingBreakdown, prefix: &str) -> String {
+    format_timing(timing.total, timing.communication, prefix)
+}
+
+fn format_timing(total: Duration, communication: Duration, prefix: &str) -> String {
+    format!(
+        "{}\n{prefix}|- compute: {}\n{prefix}`- communication: {}",
+        format_duration(total),
+        format_duration(total.saturating_sub(communication)),
+        format_duration(communication),
+    )
 }

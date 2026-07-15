@@ -49,31 +49,31 @@ impl<V: DoramValue> SpeedCache<V> {
         }
 
         let length_for_query = self.num_stored;
-        let result = precompute_data.and_then(|mut query| query.take_result());
-        let (x_if_found, y_if_found, found_out) = match result {
-            Some(result) => (result.x_if_found, result.y_if_found, result.found),
-            None => {
-                // circuit input:  x_query | x | (y, alibi)
-                // circuit output: x_mask | y | alibi | found
-                let query_addrs = vec![query_addr; length_for_query];
-                let ys = Record::<V>::get_y_values(&self.data[..length_for_query]);
-                let alibis = Record::<V>::get_alibis(&self.data[..length_for_query]);
-                let (x_if_found, y_if_found, alibi_if_found, found_out) =
-                    xy_if_xs_equal_circuit::<V>(
-                        &self.addrs[..length_for_query],
-                        &query_addrs,
-                        &ys,
-                        &alibis,
-                        net,
-                        state,
-                    )?;
-                (
-                    x_if_found,
-                    Record::<V>::from_columns(y_if_found, alibi_if_found),
-                    found_out,
-                )
-            }
-        };
+        let (x_if_found, y_if_found, found_out) =
+            match precompute_data.and_then(|mut query| query.take_result()) {
+                Some(result) => (result.x_if_found, result.y_if_found, result.found),
+                None => {
+                    // circuit input:  x_query | x | (y, alibi)
+                    // circuit output: x_mask | y | alibi | found
+                    let query_addrs = vec![query_addr; length_for_query];
+                    let ys = Record::<V>::get_y_values(&self.data[..length_for_query]);
+                    let alibis = Record::<V>::get_alibis(&self.data[..length_for_query]);
+                    let (x_if_found, y_if_found, alibi_if_found, found_out) =
+                        xy_if_xs_equal_circuit::<V>(
+                            &self.addrs[..length_for_query],
+                            &query_addrs,
+                            &ys,
+                            &alibis,
+                            net,
+                            state,
+                        )?;
+                    (
+                        x_if_found,
+                        Record::<V>::from_columns(y_if_found, alibi_if_found),
+                        found_out,
+                    )
+                }
+            };
 
         let sentinel = RingElement((1 as X) << self.log_address_space_size);
 

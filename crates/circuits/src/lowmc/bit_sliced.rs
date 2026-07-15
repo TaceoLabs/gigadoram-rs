@@ -5,13 +5,16 @@
 //! inputs use one key, so the bit-sliced round keys can be reused across chunks.
 
 use mpc_core::protocols::{
-    rep3::{Rep3State, id::PartyID},
+    rep3::Rep3State,
     rep3_ring::{binary, ring::ring_impl::RingElement},
 };
 use mpc_net::Network;
 use primitives::BlockShare;
 
-use crate::lowmc::common::{BLOCK_SIZE, M4R_WINDOW_SIZE, N_ROUNDS, N_SBOXES};
+use crate::lowmc::common::{
+    BLOCK_SIZE, M4R_WINDOW_SIZE, N_ROUNDS, N_SBOXES, add_round_key, apply_sbox_ands,
+    collect_sbox_ands, xor_constants,
+};
 use crate::lowmc::parameters;
 
 pub use crate::lowmc::common::{LowMCParameters, ROUND_KEYS, RoundKeys};
@@ -28,9 +31,8 @@ pub fn encrypt_many<N: Network>(
         .iter()
         .map(|key| RoundKeys::from_expanded_key(key))
         .collect::<Vec<_>>();
-    let key_refs = keys.iter().collect::<Vec<_>>();
     encrypt_many_inner(inputs, net, state, |chunk, len| {
-        bit_slice_round_keys(&key_refs, chunk * LANES, len)
+        bit_slice_round_keys(&keys, chunk * LANES, len)
     })
 }
 
@@ -117,28 +119,6 @@ fn four_russians_matrix_mult(round: usize, input: &[BlockShare]) -> Vec<BlockSha
     output
 }
 
-fn xor_constants(
-    round: usize,
-    state_bits: &mut [BlockShare],
-    active_mask: u128,
-    party_id: PartyID,
-) {
-    for (bit, constant) in state_bits
-        .iter_mut()
-        .zip(parameters::ROUND_CONSTANTS[round].iter().copied())
-    {
-        if constant {
-            *bit = binary::xor_public(bit, &RingElement(active_mask), party_id);
-        }
-    }
-}
-
-fn add_round_key(state: &mut [BlockShare], round_key: &[BlockShare]) {
-    for (state_bit, key_bit) in state.iter_mut().zip(round_key) {
-        *state_bit = binary::xor(state_bit, key_bit);
-    }
-}
-
 fn sbox_layer_many<N: Network>(
     inputs: &[Vec<BlockShare>],
     net: &N,
@@ -168,46 +148,7 @@ fn sbox_layer_many<N: Network>(
     Ok(outputs)
 }
 
-fn collect_sbox_ands(
-    input: &[BlockShare],
-    and_lhs: &mut Vec<BlockShare>,
-    and_rhs: &mut Vec<BlockShare>,
-) {
-    for i in 0..N_SBOXES {
-        let a = input[3 * i];
-        let b = input[3 * i + 1];
-        let c = input[3 * i + 2];
-
-        and_lhs.push(b);
-        and_rhs.push(c);
-        and_lhs.push(c);
-        and_rhs.push(a);
-        and_lhs.push(a);
-        and_rhs.push(b);
-    }
-}
-
-fn apply_sbox_ands(input: &[BlockShare], ands: &[BlockShare], output: &mut [BlockShare]) {
-    for i in 0..N_SBOXES {
-        let a = input[3 * i];
-        let b = input[3 * i + 1];
-        let c = input[3 * i + 2];
-
-        let bc = ands[3 * i];
-        let ca = ands[3 * i + 1];
-        let ab = ands[3 * i + 2];
-
-        output[3 * i] = binary::xor(&bc, &a);
-        let ca_a = binary::xor(&ca, &a);
-        output[3 * i + 1] = binary::xor(&ca_a, &b);
-        let ab_a = binary::xor(&ab, &a);
-        let ab_a_b = binary::xor(&ab_a, &b);
-        output[3 * i + 2] = binary::xor(&ab_a_b, &c);
-    }
-
-    output[(3 * N_SBOXES)..BLOCK_SIZE].copy_from_slice(&input[(3 * N_SBOXES)..BLOCK_SIZE]);
-}
-
+#[inline]
 fn fill_out_lut(input: &[BlockShare]) -> [BlockShare; 1 << M4R_WINDOW_SIZE] {
     let mut lut = [BlockShare::zero_share(); 1 << M4R_WINDOW_SIZE];
     for i in 1..(1 << M4R_WINDOW_SIZE) {
@@ -216,7 +157,7 @@ fn fill_out_lut(input: &[BlockShare]) -> [BlockShare; 1 << M4R_WINDOW_SIZE] {
     lut
 }
 
-fn bit_slice_round_keys(keys: &[&RoundKeys], start: usize, len: usize) -> Vec<Vec<BlockShare>> {
+fn bit_slice_round_keys(keys: &[RoundKeys], start: usize, len: usize) -> Vec<Vec<BlockShare>> {
     (0..ROUND_KEYS)
         .map(|round| {
             let round_keys = (start..(start + len))
@@ -230,14 +171,12 @@ fn bit_slice_round_keys(keys: &[&RoundKeys], start: usize, len: usize) -> Vec<Ve
 fn bit_slice_repeated_round_keys(key: &RoundKeys, len: usize) -> Vec<Vec<BlockShare>> {
     let active_mask = lane_mask(len);
     (0..ROUND_KEYS)
-        .map(|round| broadcast_block(key.get(round), active_mask))
+        .map(|round| {
+            let mut wires = vec![BlockShare::zero_share(); BLOCK_SIZE];
+            bit_slice_block_into(key.get(round), active_mask, &mut wires);
+            wires
+        })
         .collect()
-}
-
-fn broadcast_block(block: BlockShare, active_mask: u128) -> Vec<BlockShare> {
-    let mut wires = vec![BlockShare::zero_share(); BLOCK_SIZE];
-    bit_slice_block_into(block, active_mask, &mut wires);
-    wires
 }
 
 fn bit_slice_blocks(blocks: &[BlockShare]) -> Vec<BlockShare> {
@@ -248,6 +187,7 @@ fn bit_slice_blocks(blocks: &[BlockShare]) -> Vec<BlockShare> {
     wires
 }
 
+#[inline]
 fn bit_slice_block_into(block: BlockShare, active_mask: u128, wires: &mut [BlockShare]) {
     for (bit, wire) in wires.iter_mut().enumerate() {
         if ((block.a.0 >> bit) & 1) != 0 {
@@ -276,6 +216,7 @@ fn pack_bit_sliced_blocks(wires: &[BlockShare], len: usize) -> Vec<BlockShare> {
     blocks
 }
 
+#[inline]
 fn lane_mask(len: usize) -> u128 {
     if len == LANES {
         u128::MAX

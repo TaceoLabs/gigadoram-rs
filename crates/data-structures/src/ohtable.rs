@@ -1,7 +1,6 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use circuits::lowmc::{self, ROUND_KEYS};
-use eyre::Ok;
+use circuits::lowmc::{self, ROUND_KEYS, packed_u8_lanes};
 use mpc_core::protocols::{
     rep3::{Rep3State, id::PartyID, network::Rep3NetworkExt},
     rep3_ring::{
@@ -13,9 +12,9 @@ use mpc_core::protocols::{
 };
 use mpc_net::Network;
 use primitives::{
-    ArrayShuffler, Block, BlockShare, DoramValue, LocalPermutation, Record, XShare,
-    alibi_from_blocks, alibi_to_blocks, bit_to_binary_mask, downcast_many, dummy_x, reshare_3_to_2,
-    reveal_to_party, set_low_u32,
+    ArrayShuffler, Block, BlockShare, CommunicationTimer, DoramValue, LocalPermutation, Record,
+    TimingBreakdown, XShare, alibi_from_blocks, alibi_to_blocks, bit_to_binary_mask, downcast_many,
+    dummy_x, local_phase, network_phase, reshare_3_to_2, reveal_to_party, set_low_u32,
     types::{BitShare, input},
     upcast_x_to_block_many,
 };
@@ -78,6 +77,7 @@ impl OHTableParams {
 pub struct OhTable<V: DoramValue> {
     pub params: OHTableParams,
     pub key: Vec<BlockShare>,
+    pub packed_key: packed_u8_lanes::PackedU8RoundKeys,
     pub stash_xs: Vec<XShare>,
     pub stash_ys: Vec<Record<V>>,
     pub builder_stash_indices: Vec<usize>,
@@ -103,23 +103,42 @@ pub struct OhTableQueryTrace {
 
 #[derive(Clone, Debug, Default)]
 pub struct OhTableTiming {
-    pub build_prf: Duration,
+    pub build_prf: TimingBreakdown,
+    pub communication_timer: CommunicationTimer,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct OhTableQueryTiming {
     pub dummy_cmux: Duration,
     pub tag_reveal: Duration,
-    pub cht_lookup: Duration,
+    pub cht_lookup: TimingBreakdown,
     pub receiver_index: Duration,
     pub bookkeeping: Duration,
+    pub communication_timer: CommunicationTimer,
+}
+
+impl OhTableTiming {
+    pub fn with_communication_timer(communication_timer: CommunicationTimer) -> Self {
+        Self {
+            communication_timer,
+            ..Self::default()
+        }
+    }
 }
 
 impl OhTableQueryTiming {
+    pub fn with_communication_timer(communication_timer: CommunicationTimer) -> Self {
+        Self {
+            communication_timer,
+            ..Self::default()
+        }
+    }
+
     pub fn add_assign(&mut self, other: &Self) {
         self.dummy_cmux += other.dummy_cmux;
         self.tag_reveal += other.tag_reveal;
-        self.cht_lookup += other.cht_lookup;
+        self.cht_lookup.total += other.cht_lookup.total;
+        self.cht_lookup.communication += other.cht_lookup.communication;
         self.receiver_index += other.receiver_index;
         self.bookkeeping += other.bookkeeping;
     }
@@ -141,9 +160,11 @@ impl<V: DoramValue> OhTable<V> {
         assert_eq!(key.len(), ROUND_KEYS);
 
         let dummy = dummy_x(state.id, params.log_address_space_size);
+        let packed_key = packed_u8_lanes::precompute_round_keys(&key);
         let mut table = Self {
             params,
             key,
+            packed_key,
             stash_xs: vec![XShare::zero_share(); params.stash_size],
             stash_ys: vec![Record::zero_share(); params.stash_size],
             builder_stash_indices: vec![0; params.stash_size],
@@ -178,11 +199,7 @@ impl<V: DoramValue> OhTable<V> {
         assert_eq!(ys.len(), self.params.num_elements);
 
         // Evaluate PRF tags.
-        let start = Instant::now();
-        self.fill_prf_tags(&xs, net, state)?;
-        if let Some(timing) = &mut timing {
-            timing.build_prf += start.elapsed();
-        }
+        network_phase!(timing, build_prf, { self.fill_prf_tags(&xs, net, state)? });
 
         // Shuffle tags, payloads, and source indices into builder order.
         self.shuffle_builder_order(xs, ys, net, state)?;
@@ -210,70 +227,62 @@ impl<V: DoramValue> OhTable<V> {
         assert!(self.query_count < self.params.num_dummies);
 
         // TODO: Maybe just pass dummy as a Block
-        let start = Instant::now();
         let use_dummy = bit_to_binary_mask(&use_dummy);
-        let q_or_dummy = binary::cmux(&use_dummy, &arithmetic::rand(state), &q, net, state)?;
-        if let Some(timing) = &mut timing {
-            timing.dummy_cmux += start.elapsed();
-        }
+        let q_or_dummy = local_phase!(
+            timing,
+            dummy_cmux,
+            binary::cmux(&use_dummy, &arithmetic::rand(state), &q, net, state)?
+        );
 
-        let start = Instant::now();
-        let q_clear = reveal_to_receivers(&q_or_dummy, self.params.builder, net, state)?;
-        if let Some(timing) = &mut timing {
-            timing.tag_reveal += start.elapsed();
-        }
+        let q_clear = local_phase!(
+            timing,
+            tag_reveal,
+            reveal_to_receivers(&q_or_dummy, self.params.builder, net, state)?
+        );
 
-        let start = Instant::now();
         let old_query_count = self.query_count;
         let dummy_index = downcast(self.dummy_indices[old_query_count]);
-
-        let lookup_result = cht::lookup_from_2shares(
-            self.params.log_single_col_len,
-            self.cht_2shares.as_ref().unwrap(),
-            q_clear.0,
-            dummy_index,
-            self.params.builder,
-            net,
-            state,
-        )?;
-        if let Some(timing) = &mut timing {
-            timing.cht_lookup += start.elapsed();
-        }
-
-        let start = Instant::now();
-        let index_receiver_order = if state.id != self.params.builder {
-            let receiver_shuffle = self
-                .receiver_shuffle
-                .as_mut()
-                .expect("OHTable must be built before querying");
-            let index_receiver_order = receiver_shuffle.evaluate_at(lookup_result.index);
-
-            if state.id == self.params.builder.prev() {
-                net.send_next(index_receiver_order)
-                    .expect("should send index to receiver");
-            }
-            index_receiver_order
-        } else {
-            net.recv_prev()?
-        };
-        if let Some(timing) = &mut timing {
-            timing.receiver_index += start.elapsed();
-        }
-
-        let start = Instant::now();
-        let was_touched_before = self.touched[index_receiver_order];
-        assert!(!was_touched_before);
-        self.touched[index_receiver_order] = true;
-
-        self.query_count += 1;
-        self.last_query_trace = Some(OhTableQueryTrace {
-            old_query_count,
-            selected_receiver_index: index_receiver_order,
-            was_touched_before,
+        let lookup_result = network_phase!(timing, cht_lookup, {
+            cht::lookup_from_2shares(
+                self.params.log_single_col_len,
+                self.cht_2shares.as_ref().unwrap(),
+                q_clear.0,
+                dummy_index,
+                self.params.builder,
+                net,
+                state,
+            )?
         });
-        if let Some(timing) = &mut timing {
-            timing.bookkeeping += start.elapsed();
-        }
+
+        let index_receiver_order = local_phase!(timing, receiver_index, {
+            if state.id == self.params.builder {
+                net.recv_prev()?
+            } else {
+                let receiver_shuffle = self
+                    .receiver_shuffle
+                    .as_mut()
+                    .expect("OHTable must be built before querying");
+                let index_receiver_order = receiver_shuffle.evaluate_at(lookup_result.index);
+
+                if state.id == self.params.builder.prev() {
+                    net.send_next(index_receiver_order)
+                        .expect("should send index to receiver");
+                }
+                index_receiver_order
+            }
+        });
+
+        local_phase!(timing, bookkeeping, {
+            let was_touched_before = self.touched[index_receiver_order];
+            assert!(!was_touched_before);
+            self.touched[index_receiver_order] = true;
+            self.query_count += 1;
+            self.last_query_trace = Some(OhTableQueryTrace {
+                old_query_count,
+                selected_receiver_index: index_receiver_order,
+                was_touched_before,
+            });
+        });
 
         Ok((
             self.ys_receiver_order[index_receiver_order],
@@ -498,14 +507,15 @@ impl<V: DoramValue> OhTable<V> {
     ) -> eyre::Result<Option<Vec<Block>>> {
         if state.id == self.params.builder {
             let prev_b = net.recv_from::<Vec<RingElement<Block>>>(self.params.builder.prev())?;
-            Ok(Some(
+            return Ok(Some(
                 self.qs_builder_order
                     .iter()
                     .zip(prev_b.iter())
                     .map(|(own, prev_b)| (own.a ^ own.b ^ *prev_b).0)
                     .collect(),
-            ))
-        } else if state.id == self.params.builder.prev() {
+            ));
+        }
+        if state.id == self.params.builder.prev() {
             net.send_to(
                 self.params.builder,
                 self.qs_builder_order
@@ -513,10 +523,8 @@ impl<V: DoramValue> OhTable<V> {
                     .map(|q| q.b)
                     .collect::<Vec<_>>(),
             )?;
-            Ok(None)
-        } else {
-            Ok(None)
         }
+        Ok(None)
     }
 }
 

@@ -22,13 +22,16 @@ struct Cli {
 
     #[arg(long)]
     network: PathBuf,
+
+    #[arg(long, default_value_t = false)]
+    progress: bool,
 }
 
 fn main() -> Result<()> {
     common::install_tracing();
 
     let cli = Cli::parse();
-    let doram_config = doram_config(&cli.doram)?;
+    let doram_config = doram_config(&cli.doram);
     let network_config = read_network_config(&cli.network)?;
     print_startup_config(
         &cli.doram,
@@ -39,7 +42,7 @@ fn main() -> Result<()> {
 
     let queries = generate_queries(&cli.doram);
     let net = TcpNetwork::new(network_config)?;
-    let report = run_party(&cli.doram, doram_config, &queries, net)?;
+    let report = run_party(&cli.doram, doram_config, &queries, net, cli.progress)?;
     print_report(&cli.doram, &report);
 
     Ok(())

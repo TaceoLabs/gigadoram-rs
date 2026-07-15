@@ -2,6 +2,7 @@ pub mod array_shuffle;
 pub mod bigintshare;
 pub mod cast;
 pub mod permutation;
+pub mod timed_network;
 pub mod types;
 pub mod utils;
 pub mod value;
@@ -12,6 +13,7 @@ pub use cast::{
     alibi_from_blocks, alibi_to_blocks, downcast_many, upcast_x_to_block, upcast_x_to_block_many,
 };
 pub use permutation::LocalPermutation;
+pub use timed_network::{CommunicationTimer, TimedNetwork, TimingBreakdown};
 pub use types::{
     AlibiShare, BitShare, Block, BlockShare, X, XShare, Y, Y_BITS, YField, YRecord, YShare,
     bit_to_binary_mask, dummy_x, from_2_shares, input, open_many, open_many_y, open_y,
