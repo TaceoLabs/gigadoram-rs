@@ -12,7 +12,10 @@
 use std::time::{Duration, Instant};
 
 use circuits::{
-    lowmc::{self, ROUND_KEYS, packed_u8_lanes_with_speed_cache::SpeedCachePrecomputeData},
+    lowmc::{
+        self, ROUND_KEYS,
+        packed_u8_lanes::{CombinedRoundKeys, combine_round_keys},
+    },
     oblivious_sort::ObliviousSort,
     replace_if_dummy::replace_if_dummy_circuit,
 };
@@ -24,8 +27,9 @@ use mpc_core::protocols::{
 };
 use mpc_net::Network;
 use primitives::{
-    AlibiShare, ArrayShuffler, Block, BlockShare, DoramValue, Record, X, XShare, alibi_from_blocks,
-    alibi_to_blocks, dummy_x, open_many, promote_public, upcast_x_to_block,
+    AlibiShare, ArrayShuffler, Block, CommunicationTimer, DoramValue, Record, TimingBreakdown, X,
+    XShare, alibi_from_blocks, alibi_to_blocks, dummy_x, network_phase, open_many, promote_public,
+    upcast_x_to_block,
 };
 
 /// `GigaDoram` storing `u32` values.
@@ -195,23 +199,32 @@ pub struct GigaDoram<V: DoramValue> {
     pub speed_cache: SpeedCache<V>,
     pub levels: Vec<Option<OhTable<V>>>,
     pub base_b_state_vec: Vec<usize>,
+    packed_query_key: Option<CombinedRoundKeys>,
     had_initial_bottom_level: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct GigaDoramTiming {
     pub time_total_builds: Vec<Duration>,
-    pub time_total_build_prf: Duration,
+    pub time_total_build_prf: TimingBreakdown,
     pub time_total_batcher: Duration,
-    pub time_total_queries: Duration,
-    pub time_total_query_prf: Duration,
-    pub time_total_query_speed_cache: Duration,
+    pub time_total_queries: TimingBreakdown,
+    pub time_total_query_prf: TimingBreakdown,
+    pub time_total_query_speed_cache: TimingBreakdown,
     pub time_total_query_ohtable: Duration,
     pub time_total_query_ohtable_details: OhTableQueryTiming,
     pub time_total_query_writeback: Duration,
+    pub communication_timer: CommunicationTimer,
 }
 
 impl GigaDoramTiming {
+    pub fn with_communication_timer(communication_timer: CommunicationTimer) -> Self {
+        Self {
+            communication_timer,
+            ..Self::default()
+        }
+    }
+
     fn record_build(&mut self, level: usize, elapsed: Duration) {
         if self.time_total_builds.len() <= level {
             self.time_total_builds.resize(level + 1, Duration::ZERO);
@@ -233,6 +246,7 @@ impl<V: DoramValue> GigaDoram<V> {
             speed_cache,
             levels: vec![None; config.num_levels],
             base_b_state_vec: vec![0; config.num_levels],
+            packed_query_key: None,
             had_initial_bottom_level: false,
         }
     }
@@ -261,6 +275,7 @@ impl<V: DoramValue> GigaDoram<V> {
             ),
             levels: vec![None; config.num_levels],
             base_b_state_vec: vec![0; config.num_levels],
+            packed_query_key: None,
             had_initial_bottom_level: true,
         };
 
@@ -273,7 +288,7 @@ impl<V: DoramValue> GigaDoram<V> {
             .map(Record::<V>::from_value)
             .collect::<Vec<_>>();
 
-        doram.new_ohtable_of_level(bottom_level, xs, ys, net, state, timing)?;
+        doram.new_ohtable_of_level(bottom_level, xs, ys, net, state, timing);
         doram.insert_stash(bottom_level, state.id);
 
         Ok(doram)
@@ -324,6 +339,10 @@ impl<V: DoramValue> GigaDoram<V> {
         }
 
         let query_start = Instant::now();
+        let query_communication = timing
+            .as_ref()
+            .map(|timing| timing.communication_timer.elapsed())
+            .unwrap_or_default();
 
         // Compute PRFs for each live level
         let live_levels = self
@@ -332,27 +351,30 @@ impl<V: DoramValue> GigaDoram<V> {
             .enumerate()
             .filter_map(|(level, table)| table.as_ref().map(|_| level))
             .collect::<Vec<_>>();
-        let mut speed_cache_precompute_data = self.speed_cache.precompute_query(query_x);
-        let start = Instant::now();
-        let qs = self.evaluate_prf_tags(
-            &live_levels,
-            query_x,
-            speed_cache_precompute_data.as_mut(),
-            net,
-            state,
-        )?;
-        if let Some(timing) = &mut timing {
-            timing.time_total_query_prf += start.elapsed();
+        if self.packed_query_key.is_none() {
+            let keys = live_levels
+                .iter()
+                .map(|&level| &self.levels[level].as_ref().unwrap().packed_key)
+                .collect::<Vec<_>>();
+            self.packed_query_key = Some(combine_round_keys(&keys));
         }
+        let mut speed_cache_precompute_data = self.speed_cache.precompute_query(query_x);
+        let qs = network_phase!(timing, time_total_query_prf, {
+            lowmc::packed_u8_lanes_with_speed_cache::encrypt_with_combined_round_keys(
+                self.packed_query_key.as_ref().unwrap(),
+                live_levels.len(),
+                upcast_x_to_block(query_x),
+                speed_cache_precompute_data.as_mut(),
+                net,
+                state,
+            )?
+        });
 
         // Query the SpeedCache and extract alibi bits
-        let start = Instant::now();
-        let (mut y_accum, mut found) =
+        let (mut y_accum, mut found) = network_phase!(timing, time_total_query_speed_cache, {
             self.speed_cache
-                .query(query_x, speed_cache_precompute_data, net, state)?;
-        if let Some(timing) = &mut timing {
-            timing.time_total_query_speed_cache += start.elapsed();
-        }
+                .query(query_x, speed_cache_precompute_data, net, state)?
+        });
         let mut alibi_mask = y_accum.get_alibi_bits(self.config.num_levels);
 
         // Traverse each live level and query the corresponding table
@@ -362,7 +384,8 @@ impl<V: DoramValue> GigaDoram<V> {
             let table = self.levels[level]
                 .as_mut()
                 .expect("live level should still exist during query");
-            let mut ohtable_timing = OhTableQueryTiming::default();
+            let mut ohtable_timing =
+                OhTableQueryTiming::with_communication_timer(Self::timer(&timing));
             let table_timing = timing.is_some().then_some(&mut ohtable_timing);
             let (y_returned, found_returned) =
                 table.query(q, use_dummy, net, state, table_timing)?;
@@ -385,7 +408,11 @@ impl<V: DoramValue> GigaDoram<V> {
         self.speed_cache.write(vec![query_x], vec![value_to_write]);
         if let Some(timing) = &mut timing {
             timing.time_total_query_writeback += start.elapsed();
-            timing.time_total_queries += query_start.elapsed();
+            timing.time_total_queries.total += query_start.elapsed();
+            timing.time_total_queries.communication += timing
+                .communication_timer
+                .elapsed()
+                .saturating_sub(query_communication);
         }
 
         // Return the full-field value (alibi bits live separately now).
@@ -436,7 +463,7 @@ impl<V: DoramValue> GigaDoram<V> {
             "rebuild extracted mismatched x/y lengths"
         );
 
-        for y in extracted_ys.iter_mut() {
+        for y in &mut extracted_ys {
             *y = y.clear_alibi();
         }
 
@@ -448,7 +475,7 @@ impl<V: DoramValue> GigaDoram<V> {
                 let mut value_blocks = V::to_blocks(&values);
                 let mut y_alibi = alibi_to_blocks(&alibis);
                 shuffler.forward(&mut extracted_xs, net, state)?;
-                for col in value_blocks.iter_mut() {
+                for col in &mut value_blocks {
                     shuffler.forward(col, net, state)?;
                 }
                 shuffler.forward(&mut y_alibi, net, state)?;
@@ -479,7 +506,7 @@ impl<V: DoramValue> GigaDoram<V> {
             self.delete_level(rebuild_to);
         }
 
-        self.new_ohtable_of_level(rebuild_to, extracted_xs, extracted_ys, net, state, timing)?;
+        self.new_ohtable_of_level(rebuild_to, extracted_xs, extracted_ys, net, state, timing);
         self.insert_stash(rebuild_to, state.id);
 
         Ok(())
@@ -514,7 +541,7 @@ impl<V: DoramValue> GigaDoram<V> {
         net: &N,
         state: &mut Rep3State,
         mut timing: Option<&mut GigaDoramTiming>,
-    ) -> Result<()> {
+    ) {
         assert!(level < self.config.num_levels);
         assert_eq!(xs.len(), ys.len());
         assert!(xs.len() >= self.config.stash_size);
@@ -544,22 +571,25 @@ impl<V: DoramValue> GigaDoram<V> {
             log_single_col_len as u32,
             self.config.log_address_space_size,
         );
-        let key = Self::generate_prf_key(state);
+        let key = (0..ROUND_KEYS)
+            .map(|_| arithmetic::rand::<Block>(state))
+            .collect();
         let start = Instant::now();
-        let mut ohtable_timing = OhTableTiming::default();
+        let mut ohtable_timing = OhTableTiming::with_communication_timer(Self::timer(&timing));
         let table_timing = timing.is_some().then_some(&mut ohtable_timing);
         let table = OhTable::new(params, xs, ys, key, net, state, table_timing);
         if let Some(timing) = &mut timing {
-            timing.time_total_build_prf += ohtable_timing.build_prf;
+            timing.time_total_build_prf.total += ohtable_timing.build_prf.total;
+            timing.time_total_build_prf.communication += ohtable_timing.build_prf.communication;
             timing.record_build(level, start.elapsed());
         }
         self.levels[level] = Some(table);
-
-        Ok(())
+        self.packed_query_key = None;
     }
 
     fn delete_level(&mut self, level: usize) {
         self.levels[level] = None;
+        self.packed_query_key = None;
         if level < self.config.num_levels - 1
             && self.base_b_state_vec[level] == self.config.amp_factor() - 1
         {
@@ -708,36 +738,10 @@ impl<V: DoramValue> GigaDoram<V> {
         Ok((xs, ys))
     }
 
-    fn generate_prf_key(state: &mut Rep3State) -> Vec<BlockShare> {
-        (0..ROUND_KEYS)
-            .map(|_| arithmetic::rand::<Block>(state))
-            .collect()
-    }
-
-    fn evaluate_prf_tags<N: Network>(
-        &self,
-        levels: &[usize],
-        input: XShare,
-        speed_cache_precompute_data: Option<&mut SpeedCachePrecomputeData<V>>,
-        net: &N,
-        state: &mut Rep3State,
-    ) -> Result<Vec<BlockShare>> {
-        let keys = levels
-            .iter()
-            .map(|&level| {
-                let table = self.levels[level]
-                    .as_ref()
-                    .expect("live level should have an OHTable");
-                assert_eq!(table.key.len(), ROUND_KEYS);
-                table.key.as_slice()
-            })
-            .collect::<Vec<_>>();
-        lowmc::packed_u8_lanes_with_speed_cache::encrypt_many_with_repeated_input(
-            &keys,
-            upcast_x_to_block(input),
-            speed_cache_precompute_data,
-            net,
-            state,
-        )
+    fn timer(timing: &Option<&mut GigaDoramTiming>) -> CommunicationTimer {
+        timing
+            .as_ref()
+            .map(|timing| timing.communication_timer.clone())
+            .unwrap_or_default()
     }
 }

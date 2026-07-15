@@ -337,6 +337,7 @@ fn shuffle_reveal_perm<N: Network>(
     })
 }
 
+#[inline]
 fn pack_row(dummy_flag: BitShare, x: XShare) -> BlockShare {
     BlockShare::new_ring(
         RingElement(Block::from(dummy_flag.a.0.convert()) | (Block::from(x.a.0) << 32)),
@@ -344,6 +345,7 @@ fn pack_row(dummy_flag: BitShare, x: XShare) -> BlockShare {
     )
 }
 
+#[inline]
 fn unpack_row(row: BlockShare) -> (BitShare, XShare) {
     (
         BitShare::new_ring(

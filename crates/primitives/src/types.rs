@@ -25,6 +25,7 @@ pub type AlibiShare = Rep3RingShare<u8>;
 
 pub type YRecord = crate::value::Record<crate::value::FieldValue<YField>>;
 
+#[inline]
 pub fn promote_public<T: IntRing2k>(id: PartyID, value: T) -> Rep3RingShare<T> {
     binary::promote_to_trivial_share(id, &RingElement(value))
 }
@@ -99,6 +100,7 @@ pub fn open_y<N: Network>(share: &YShare, net: &N) -> Y {
     open_many_y(&[*share], net).remove(0)
 }
 
+#[inline]
 pub fn bit_to_binary_mask<T: IntRing2k>(bit: &BitShare) -> Rep3RingShare<T> {
     let all_ones = !T::zero();
     Rep3RingShare::new_ring(
@@ -169,11 +171,10 @@ where
         .collect::<Vec<_>>();
 
     let next_components = net.reshare_many(&local_components)?;
-    Ok(local_components
-        .into_iter()
-        .zip(next_components)
-        .map(|(local, next)| Rep3RingShare::new_ring(local, next))
-        .collect())
+    Ok(crate::utils::ring_recombine(
+        local_components,
+        next_components,
+    ))
 }
 
 pub fn input<T, N>(

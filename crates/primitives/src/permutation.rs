@@ -10,10 +10,7 @@ pub struct LocalPermutation {
 
 impl LocalPermutation {
     pub fn new(n: usize, seed: Option<u64>) -> Self {
-        let mut rng = match seed {
-            Some(s) => ChaCha12Rng::seed_from_u64(s),
-            None => ChaCha12Rng::from_entropy(),
-        };
+        let mut rng = seed.map_or_else(ChaCha12Rng::from_entropy, ChaCha12Rng::seed_from_u64);
         Self::sample_from_rng(n, &mut rng)
     }
 

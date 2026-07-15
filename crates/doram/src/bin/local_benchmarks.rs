@@ -21,12 +21,12 @@ fn main() -> Result<()> {
     common::install_tracing();
 
     let cli = Cli::parse();
-    let doram_config = doram_config(&cli.doram)?;
+    let doram_config = doram_config(&cli.doram);
     print_startup_config(&cli.doram, doram_config, "local", None);
 
     let queries = generate_queries(&cli.doram);
     let reports = run_parties(|net| {
-        run_party(&cli.doram, doram_config, &queries, net).wrap_err("party failed")
+        run_party(&cli.doram, doram_config, &queries, net, true).wrap_err("party failed")
     })
     .map_err(|_| eyre!("party panicked"))?
     .into_iter()

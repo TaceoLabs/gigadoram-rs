@@ -13,11 +13,7 @@ pub struct Rep3BigIntShare<F: PrimeField> {
 
 impl<F: PrimeField> Rep3BigIntShare<F> {
     pub fn zero_share() -> Self {
-        Self {
-            a: F::BigInt::default(),
-            b: F::BigInt::default(),
-            phantom: PhantomData,
-        }
+        Self::default()
     }
 
     pub fn new(a: F::BigInt, b: F::BigInt) -> Self {
@@ -34,7 +30,7 @@ impl<F: PrimeField> Rep3BigIntShare<F> {
 }
 
 impl<F: PrimeField> std::ops::BitXor for Rep3BigIntShare<F> {
-    type Output = Rep3BigIntShare<F>;
+    type Output = Self;
 
     fn bitxor(self, rhs: Self) -> Self::Output {
         Self::Output {
@@ -45,8 +41,8 @@ impl<F: PrimeField> std::ops::BitXor for Rep3BigIntShare<F> {
     }
 }
 
-impl<F: PrimeField> std::ops::BitXorAssign<Rep3BigIntShare<F>> for Rep3BigIntShare<F> {
-    fn bitxor_assign(&mut self, rhs: Rep3BigIntShare<F>) {
+impl<F: PrimeField> std::ops::BitXorAssign for Rep3BigIntShare<F> {
+    fn bitxor_assign(&mut self, rhs: Self) {
         self.a ^= rhs.a;
         self.b ^= rhs.b;
     }
@@ -77,13 +73,9 @@ fn sample_bigint<F: PrimeField>(mut sample_limb: impl FnMut() -> u64) -> F::BigI
     for limb in res_mut.iter_mut().take(limbsize) {
         *limb = sample_limb();
     }
-    res_mut[limbsize - 1] &= last_limb_mask::<F>();
-    result
-}
-
-fn last_limb_mask<F: PrimeField>() -> u64 {
-    match F::MODULUS_BIT_SIZE % 64 {
+    res_mut[limbsize - 1] &= match F::MODULUS_BIT_SIZE % 64 {
         0 => u64::MAX,
         bits => (1u64 << bits) - 1,
-    }
+    };
+    result
 }
