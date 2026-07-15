@@ -5,7 +5,7 @@
 use std::ops::BitXor;
 
 use circuits::{
-    lowmc::packed_u8_lanes_with_speed_cache::SpeedCachePrecomputeData,
+    lowmc::packed_u8_lanes_with_speed_cache::{SpeedCachePrecomputeData, SpeedCacheQueryResult},
     xy_if_xs_equal::xy_if_xs_equal_circuit,
 };
 use mpc_core::protocols::{
@@ -14,7 +14,8 @@ use mpc_core::protocols::{
 };
 use mpc_net::Network;
 use primitives::{
-    DoramValue, Record, X, XShare, bit_to_binary_mask, dummy_x, promote_public, types::BitShare,
+    DoramValue, Record, X, XShare, bit_to_binary_mask, cmux_many_custom, dummy_x, is_zero_many,
+    promote_public, types::BitShare,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,6 +101,84 @@ impl<V: DoramValue> SpeedCache<V> {
             .expect("circuit output should be non-empty");
 
         Ok((y_xor, found_xor))
+    }
+
+    pub fn query_many(
+        &mut self,
+        query_addrs: &[XShare],
+        precomputed: Option<Vec<SpeedCacheQueryResult<V>>>,
+        net: &impl Network,
+        state: &mut Rep3State,
+    ) -> eyre::Result<Vec<(Record<V>, BitShare)>> {
+        let count = query_addrs.len();
+        if self.num_stored == 0 {
+            return Ok(vec![
+                (
+                    Record::default(),
+                    promote_public(state.id, Bit::new(false))
+                );
+                count
+            ]);
+        }
+        let length = self.num_stored;
+        let (x, y, found) = match precomputed {
+            Some(results) => {
+                assert_eq!(results.len(), count);
+                results
+                    .into_iter()
+                    .fold((Vec::new(), Vec::new(), Vec::new()), |mut all, result| {
+                        all.0.extend(result.x_if_found);
+                        all.1.extend(result.y_if_found);
+                        all.2.extend(result.found);
+                        all
+                    })
+            }
+            None => {
+                let ys = Record::<V>::get_y_values(&self.data[..length]);
+                let alibis = Record::<V>::get_alibis(&self.data[..length]);
+                let mut addrs = Vec::with_capacity(count * length);
+                let mut queries = Vec::with_capacity(count * length);
+                let mut values = Vec::with_capacity(count * length);
+                let mut all_alibis = Vec::with_capacity(count * length);
+                for &query in query_addrs {
+                    addrs.extend_from_slice(&self.addrs[..length]);
+                    queries.extend(std::iter::repeat_n(query, length));
+                    values.extend_from_slice(&ys);
+                    all_alibis.extend_from_slice(&alibis);
+                }
+                let xor = addrs
+                    .iter()
+                    .zip(&queries)
+                    .map(|(x, query)| x ^ query)
+                    .collect::<Vec<_>>();
+                let found = is_zero_many(&xor, net, state)?;
+                let (x, y, alibi) =
+                    cmux_many_custom::<V, _>(&found, &addrs, &values, &all_alibis, net, state)?;
+                (x, Record::<V>::from_columns(y, alibi), found)
+            }
+        };
+
+        let sentinel = RingElement((1 as X) << self.log_address_space_size);
+        Ok((0..count)
+            .map(|query| {
+                let range = query * length..(query + 1) * length;
+                for ((addr, mask), found) in self.addrs[..length]
+                    .iter_mut()
+                    .zip(&x[range.clone()])
+                    .zip(&found[range.clone()])
+                {
+                    *addr ^= *mask ^ (bit_to_binary_mask::<X>(found) & sentinel);
+                }
+                (
+                    y[range.clone()]
+                        .iter()
+                        .copied()
+                        .reduce(BitXor::bitxor)
+                        .unwrap(),
+                    found[range].iter().copied().reduce(BitXor::bitxor).unwrap(),
+                )
+            })
+            .collect())
     }
 
     pub fn precompute_query(&self, query_addr: XShare) -> Option<SpeedCachePrecomputeData<V>> {

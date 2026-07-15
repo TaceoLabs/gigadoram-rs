@@ -10,7 +10,11 @@ use mpc_core::protocols::{
         network::Rep3NetworkExt,
         yao::{evaluator::Rep3Evaluator, garbler::Rep3Garbler},
     },
-    rep3_ring::{casts::downcast, conversion::y2b, ring::ring_impl::RingElement},
+    rep3_ring::{
+        casts::downcast,
+        conversion::{y2b, y2b_many},
+        ring::ring_impl::RingElement,
+    },
 };
 use mpc_net::Network;
 use primitives::{BlockShare, XShare, types::BitShare};
@@ -68,18 +72,98 @@ fn garble<N: Network>(
     y2b(output, net, state)
 }
 
-fn garble_lookup_inputs<N: Network>(
-    inputs: &[BlockShare; 3],
+pub fn compute_many(
+    values: &[[BlockShare; 3]],
+    dummy_indices: &[XShare],
+    net: &impl Network,
+    state: &mut Rep3State,
+) -> eyre::Result<Vec<(XShare, BitShare)>> {
+    assert_eq!(values.len(), dummy_indices.len());
+    if values.is_empty() {
+        return Ok(Vec::new());
+    }
+    let inputs = values
+        .iter()
+        .zip(dummy_indices)
+        .map(|(values, &dummy)| pack_lookup_inputs(values[0], values[1], values[2], dummy))
+        .collect::<Vec<_>>();
+    let outputs = match state.id {
+        PartyID::ID0 => eval_many(inputs.len(), net, state)?,
+        PartyID::ID1 | PartyID::ID2 => garble_many(&inputs, net, state)?,
+    };
+    Ok(outputs
+        .into_iter()
+        .map(|output| (downcast(output), output.get_bit(INDEX_BITS)))
+        .collect())
+}
+
+fn eval_many<N: Network>(
+    num_lookups: usize,
     net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<Vec<BlockShare>> {
+    let bundles = receive_input_bundles_many(num_lookups, net)?;
+    let mut evaluator = Rep3Evaluator::new(net);
+    evaluator.receive_circuit()?;
+    let mut outputs = Vec::with_capacity(num_lookups);
+    for [x01, x2] in &bundles {
+        outputs.push(
+            evaluate_lookup_circuit_padded(&mut evaluator, x01, x2)
+                .map_err(|err| eyre::eyre!("CHT lookup garbled evaluation failed: {err:?}"))?,
+        );
+    }
+    y2b_lookup_many(outputs, net, state)
+}
+
+fn garble_many<N: Network>(
+    inputs: &[[BlockShare; 3]],
+    net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<Vec<BlockShare>> {
+    let delta = state
+        .rngs
+        .generate_random_garbler_delta(state.id)
+        .expect("delta should be present");
+    let mut garbler = Rep3Garbler::new_with_delta(net, state, delta);
+    let mut evaluator_inputs = Vec::with_capacity(inputs.len() * LOOKUP_INPUT_BITS);
+    let bundles = inputs
+        .iter()
+        .map(|input| encode_lookup_inputs(input, state.id, &mut garbler, &mut evaluator_inputs))
+        .collect::<Vec<_>>();
+    net.send_many(PartyID::ID0, &evaluator_inputs)?;
+    let mut outputs = Vec::with_capacity(inputs.len());
+    for [x01, x2] in &bundles {
+        outputs.push(
+            evaluate_lookup_circuit_padded(&mut garbler, x01, x2)
+                .map_err(|err| eyre::eyre!("CHT lookup garbling failed: {err:?}"))?,
+        );
+    }
+    garbler.send_circuit()?;
+    y2b_lookup_many(outputs, net, state)
+}
+
+fn y2b_lookup_many<N: Network>(
+    outputs: Vec<BinaryBundle<WireMod2>>,
+    net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<Vec<BlockShare>> {
+    let wires = outputs
+        .into_iter()
+        .flat_map(|output| output.extract().wires().to_vec())
+        .collect();
+    y2b_many(BinaryBundle::new(wires), net, state)
+}
+
+fn encode_lookup_inputs<N: Network>(
+    inputs: &[BlockShare; 3],
     id: PartyID,
     garbler: &mut Rep3Garbler<N>,
-) -> eyre::Result<[BinaryBundle<WireMod2>; 2]> {
+    evaluator_inputs: &mut Vec<[u8; 16]>,
+) -> [BinaryBundle<WireMod2>; 2] {
     let mut x01 = Vec::with_capacity(LOOKUP_INPUT_BITS);
     let mut x2 = Vec::with_capacity(LOOKUP_INPUT_BITS);
-    let mut evaluator_inputs = Vec::with_capacity(LOOKUP_INPUT_BITS);
-
     for party in [PartyID::ID1, PartyID::ID2] {
-        let garbler_wires = if party == PartyID::ID1 {
+        let wires = if party == PartyID::ID1 {
             &mut x01
         } else {
             &mut x2
@@ -91,18 +175,22 @@ fn garble_lookup_inputs<N: Network>(
                 PartyID::ID2 if owns_input => input.a.0,
                 _ => 0,
             };
-            encode_input(
-                value,
-                owns_input,
-                garbler,
-                garbler_wires,
-                &mut evaluator_inputs,
-            );
+            encode_input(value, owns_input, garbler, wires, evaluator_inputs);
         }
     }
+    [BinaryBundle::new(x01), BinaryBundle::new(x2)]
+}
 
+fn garble_lookup_inputs<N: Network>(
+    inputs: &[BlockShare; 3],
+    net: &N,
+    id: PartyID,
+    garbler: &mut Rep3Garbler<N>,
+) -> eyre::Result<[BinaryBundle<WireMod2>; 2]> {
+    let mut evaluator_inputs = Vec::with_capacity(LOOKUP_INPUT_BITS);
+    let bundles = encode_lookup_inputs(inputs, id, garbler, &mut evaluator_inputs);
     net.send_many(PartyID::ID0, &evaluator_inputs)?;
-    Ok([BinaryBundle::new(x01), BinaryBundle::new(x2)])
+    Ok(bundles)
 }
 
 fn encode_input<N: Network>(
@@ -150,6 +238,20 @@ fn evaluate_lookup_circuit<G: FancyBinary>(
     output.reserve(1);
     output.push(g.xor(&key_equals_b0, &key_equals_b1)?);
     Ok(BinaryBundle::new(output))
+}
+
+fn evaluate_lookup_circuit_padded<G: FancyBinary>(
+    g: &mut G,
+    x01: &BinaryBundle<G::Item>,
+    x2: &BinaryBundle<G::Item>,
+) -> Result<BinaryBundle<G::Item>, G::Error> {
+    let mut wires = evaluate_lookup_circuit(g, x01, x2)?
+        .extract()
+        .wires()
+        .to_vec();
+    let zero = g.constant(0, 2)?;
+    wires.resize(u128::BITS as usize, zero);
+    Ok(BinaryBundle::new(wires))
 }
 
 fn tags_equal<G: FancyBinary>(
@@ -219,6 +321,27 @@ fn receive_input_bundles<N: Network>(net: &N) -> eyre::Result<[BinaryBundle<Wire
     ])
 }
 
+fn receive_input_bundles_many<N: Network>(
+    num_lookups: usize,
+    net: &N,
+) -> eyre::Result<Vec<[BinaryBundle<WireMod2>; 2]>> {
+    let receive = |from| -> eyre::Result<Vec<[u8; 16]>> {
+        let labels = net.recv_many(from)?;
+        eyre::ensure!(
+            labels.len() == num_lookups * LOOKUP_INPUT_BITS,
+            "invalid CHT lookup input label count"
+        );
+        Ok(labels)
+    };
+    let x01 = receive(PartyID::ID1)?;
+    let x2 = receive(PartyID::ID2)?;
+    Ok(x01
+        .chunks_exact(LOOKUP_INPUT_BITS)
+        .zip(x2.chunks_exact(LOOKUP_INPUT_BITS))
+        .map(|(x01, x2)| [x01, x2].map(|labels| decode_bundle(labels.iter().copied())))
+        .collect())
+}
+
 fn receive_input_bundle<N: Network>(
     net: &N,
     from: PartyID,
@@ -227,10 +350,14 @@ fn receive_input_bundle<N: Network>(
     if labels.len() != LOOKUP_INPUT_BITS {
         eyre::bail!("invalid CHT lookup input label count");
     }
-    Ok(BinaryBundle::new(
+    Ok(decode_bundle(labels))
+}
+
+fn decode_bundle(labels: impl IntoIterator<Item = [u8; 16]>) -> BinaryBundle<WireMod2> {
+    BinaryBundle::new(
         labels
             .into_iter()
             .map(|bytes| WireMod2::from_block(Block::from(bytes), 2))
             .collect(),
-    ))
+    )
 }

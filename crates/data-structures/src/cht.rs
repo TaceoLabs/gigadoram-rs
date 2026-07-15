@@ -183,6 +183,47 @@ pub fn lookup_from_2shares<N: Network>(
     Ok(ChtLookupResult { index, found })
 }
 
+pub fn lookup_from_2shares_many<N: Network>(
+    log_single_col_len: u32,
+    table: &[Block],
+    keys: &[Block],
+    dummy_indices: &[XShare],
+    builder: PartyID,
+    net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<Vec<ChtLookupResult>> {
+    assert_eq!(keys.len(), dummy_indices.len());
+    let mut values = vec![RingElement(0); 3 * keys.len()];
+    if state.id != builder {
+        for (i, &key) in keys.iter().enumerate() {
+            if state.id == builder.next() {
+                values[3 * i] = RingElement(key);
+            }
+            values[3 * i + 1] = RingElement(table[h0(key, log_single_col_len)]);
+            values[3 * i + 2] = RingElement(table[h1(key, log_single_col_len)]);
+        }
+    }
+    let shares = from_2_shares(values, builder.prev(), builder.next(), net, state)?
+        .chunks_exact(3)
+        .map(|values| [values[0], values[1], values[2]])
+        .collect::<Vec<_>>();
+    let looked_up = cht_lookup::compute_many(&shares, dummy_indices, net, state)?;
+    let indices = reveal_indices_to_receivers(
+        &looked_up
+            .iter()
+            .map(|(index, _)| *index)
+            .collect::<Vec<_>>(),
+        builder,
+        net,
+        state,
+    )?;
+    Ok(indices
+        .into_iter()
+        .zip(looked_up)
+        .map(|(index, (_, found))| ChtLookupResult { index, found })
+        .collect())
+}
+
 #[inline]
 pub fn h0(block: Block, log_single_col_len: u32) -> usize {
     let hash_mask = (1usize << log_single_col_len) - 1;
@@ -214,4 +255,29 @@ fn reveal_index_to_receivers<N: Network>(
 
     let c = net.recv_from::<RingElement<u32>>(builder.next())?;
     Ok((index.a ^ index.b ^ c).0 as usize)
+}
+
+fn reveal_indices_to_receivers<N: Network>(
+    indices: &[XShare],
+    builder: PartyID,
+    net: &N,
+    state: &Rep3State,
+) -> eyre::Result<Vec<usize>> {
+    let bs = indices.iter().map(|index| index.b).collect::<Vec<_>>();
+    if state.id == builder {
+        net.send_many(builder.next(), &bs)?;
+        return Ok(vec![0; indices.len()]);
+    }
+    let reconstruct = |cs: Vec<RingElement<u32>>| {
+        indices
+            .iter()
+            .zip(cs)
+            .map(|(index, c)| (index.a ^ index.b ^ c).0 as usize)
+            .collect()
+    };
+    if state.id == builder.next() {
+        net.send_many(builder.prev(), &bs)?;
+        return Ok(reconstruct(net.recv_many(builder)?));
+    }
+    Ok(reconstruct(net.recv_many(builder.next())?))
 }

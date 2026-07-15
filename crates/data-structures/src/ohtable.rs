@@ -14,7 +14,8 @@ use mpc_net::Network;
 use primitives::{
     ArrayShuffler, Block, BlockShare, CommunicationTimer, DoramValue, LocalPermutation, Record,
     TimingBreakdown, XShare, alibi_from_blocks, alibi_to_blocks, bit_to_binary_mask, downcast_many,
-    dummy_x, local_phase, network_phase, reshare_3_to_2, reveal_to_party, set_low_u32,
+    dummy_x, local_phase, network_phase, reshare_3_to_2, reveal_to_party, reveal_to_party_many,
+    set_low_u32,
     types::{BitShare, input},
     upcast_x_to_block_many,
 };
@@ -290,6 +291,96 @@ impl<V: DoramValue> OhTable<V> {
         ))
     }
 
+    pub fn query_many<N: Network>(
+        &mut self,
+        qs: &[BlockShare],
+        use_dummies: &[BitShare],
+        net: &N,
+        state: &mut Rep3State,
+        mut timing: Option<&mut OhTableQueryTiming>,
+    ) -> eyre::Result<Vec<(Record<V>, BitShare)>> {
+        let count = qs.len();
+        assert_eq!(count, use_dummies.len());
+        assert!(self.query_count + count <= self.params.num_dummies);
+
+        let qs: Vec<BlockShare> = local_phase!(timing, dummy_cmux, {
+            let masks = use_dummies
+                .iter()
+                .map(bit_to_binary_mask::<Block>)
+                .collect::<Vec<_>>();
+            let diffs = qs
+                .iter()
+                .map(|q| binary::xor(&arithmetic::rand(state), q))
+                .collect::<Vec<_>>();
+            let selected = binary::and_vec(&masks, &diffs, net, state)?;
+            qs.iter()
+                .zip(&selected)
+                .map(|(q, sel)| binary::xor(q, sel))
+                .collect()
+        });
+
+        let clear = local_phase!(
+            timing,
+            tag_reveal,
+            reveal_to_receivers_many(&qs, self.params.builder, net, state)?
+        );
+        let old_query_count = self.query_count;
+        let dummy_indices = (0..count)
+            .map(|i| downcast(self.dummy_indices[old_query_count + i]))
+            .collect::<Vec<_>>();
+        let keys = clear.iter().map(|key| key.0).collect::<Vec<_>>();
+        let lookup = network_phase!(timing, cht_lookup, {
+            cht::lookup_from_2shares_many(
+                self.params.log_single_col_len,
+                self.cht_2shares.as_ref().unwrap(),
+                &keys,
+                &dummy_indices,
+                self.params.builder,
+                net,
+                state,
+            )?
+        });
+
+        let indices = local_phase!(timing, receiver_index, {
+            if state.id == self.params.builder {
+                net.recv_prev_many()?
+            } else {
+                let shuffle = self
+                    .receiver_shuffle
+                    .as_mut()
+                    .expect("OHTable must be built before querying");
+                let indices = lookup
+                    .iter()
+                    .map(|result| shuffle.evaluate_at(result.index))
+                    .collect::<Vec<_>>();
+                if state.id == self.params.builder.prev() {
+                    net.send_next_many(&indices)?;
+                }
+                indices
+            }
+        });
+
+        let results = local_phase!(timing, bookkeeping, {
+            let results = (0..count)
+                .map(|offset| {
+                    let index = indices[offset];
+                    let was_touched_before = self.touched[index];
+                    assert!(!was_touched_before);
+                    self.touched[index] = true;
+                    self.last_query_trace = Some(OhTableQueryTrace {
+                        old_query_count: old_query_count + offset,
+                        selected_receiver_index: index,
+                        was_touched_before,
+                    });
+                    (self.ys_receiver_order[index], lookup[offset].found)
+                })
+                .collect::<Vec<_>>();
+            self.query_count += count;
+            results
+        });
+        Ok(results)
+    }
+
     pub fn extract(&self, extract_xs: &mut Vec<XShare>, extract_ys: &mut Vec<Record<V>>) {
         assert_eq!(self.query_count, self.params.num_dummies);
 
@@ -543,5 +634,22 @@ fn reveal_to_receivers<N: Network>(
         Ok(next_open.expect("next receiver should reconstruct the query tag"))
     } else {
         Ok(RingElement(0))
+    }
+}
+
+fn reveal_to_receivers_many<N: Network>(
+    shares: &[BlockShare],
+    builder: PartyID,
+    net: &N,
+    state: &Rep3State,
+) -> eyre::Result<Vec<RingElement<Block>>> {
+    let prev = reveal_to_party_many(shares, builder.prev(), net, state)?;
+    let next = reveal_to_party_many(shares, builder.next(), net, state)?;
+    if state.id == builder.prev() {
+        Ok(prev.expect("previous receiver should reconstruct query tags"))
+    } else if state.id == builder.next() {
+        Ok(next.expect("next receiver should reconstruct query tags"))
+    } else {
+        Ok(vec![RingElement(0); shares.len()])
     }
 }
