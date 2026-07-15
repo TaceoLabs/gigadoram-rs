@@ -19,7 +19,7 @@ publish = false
 readme = "./README.md"
 
 [workspace.dependencies]
-ark-bn254 = "0.5"
+ark-bn254 = "0.6"
 ark-ff = "0.5"
 ark-serialize = "0.5"
 bytes = "1"
