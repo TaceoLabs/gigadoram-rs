@@ -37,21 +37,28 @@ pub fn encrypt_many_with_repeated_input<N: Network>(
     net: &N,
     state: &mut Rep3State,
 ) -> eyre::Result<Vec<BlockShare>> {
-    let mut outputs = Vec::with_capacity(expanded_keys.len());
-    for keys in expanded_keys.chunks(8) {
-        let round_keys = keys
-            .iter()
-            .map(|key| precompute_round_keys(key))
-            .collect::<Vec<_>>();
-        let round_key_refs = round_keys.iter().collect::<Vec<_>>();
-        outputs.extend(encrypt_few_with_repeated_input(
-            &round_key_refs,
-            input,
-            net,
-            state,
-        )?);
+    if expanded_keys.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(outputs)
+    let round_keys = expanded_keys
+        .iter()
+        .map(|key| precompute_round_keys(key))
+        .collect::<Vec<_>>();
+    let num_groups = round_keys.len().div_ceil(8);
+    let mut key_groups = Vec::with_capacity(num_groups);
+    let mut group_states = Vec::with_capacity(num_groups);
+    let mut lens = Vec::with_capacity(num_groups);
+    for keys in round_keys.chunks(8) {
+        key_groups.push(combine_round_keys(&keys.iter().collect::<Vec<_>>()));
+        group_states.push(bit_slice([(input, lane_mask(keys.len()))]));
+        lens.push(keys.len());
+    }
+    Ok(
+        encrypt_lane_groups(&key_groups, group_states, &lens, net, state)?
+            .into_iter()
+            .flatten()
+            .collect(),
+    )
 }
 
 pub fn encrypt_few_with_repeated_input<N: Network>(
@@ -66,30 +73,106 @@ pub fn encrypt_few_with_repeated_input<N: Network>(
     assert!(round_keys.len() <= 8);
 
     let num_lanes = round_keys.len();
-    let active_mask = lane_mask(num_lanes);
     let round_keys = combine_round_keys(round_keys);
-    let mut state_bits = bit_slice([(input, active_mask)]);
+    let state_bits = bit_slice([(input, lane_mask(num_lanes))]);
+    Ok(encrypt_lane_groups(
+        std::slice::from_ref(&round_keys),
+        vec![state_bits],
+        &[num_lanes],
+        net,
+        state,
+    )?
+    .pop()
+    .unwrap())
+}
+
+pub fn encrypt_many_inputs_with_combined_keys<N: Network>(
+    key_groups: &[CombinedRoundKeys],
+    num_levels: usize,
+    inputs: &[BlockShare],
+    net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<Vec<Vec<BlockShare>>> {
+    if num_levels == 0 || inputs.is_empty() {
+        return Ok(vec![Vec::new(); inputs.len()]);
+    }
+    let total = num_levels * inputs.len();
+    assert_eq!(key_groups.len(), total.div_ceil(8));
+    let (group_states, lens) = slice_input_groups(key_groups.len(), num_levels, inputs);
+    let outputs = encrypt_lane_groups(key_groups, group_states, &lens, net, state)?;
+    Ok(regroup_tags_by_input(outputs, num_levels, inputs.len()))
+}
+
+pub(crate) fn slice_input_groups(
+    num_groups: usize,
+    num_levels: usize,
+    inputs: &[BlockShare],
+) -> (Vec<Vec<Share>>, Vec<usize>) {
+    let total = num_levels * inputs.len();
+    (0..num_groups)
+        .map(|group| {
+            let start = group * 8;
+            let len = (total - start).min(8);
+            let states = bit_slice(
+                (start..start + len).map(|lane| (inputs[lane / num_levels], 1 << (lane - start))),
+            );
+            (states, len)
+        })
+        .unzip()
+}
+
+pub(crate) fn regroup_tags_by_input(
+    outputs: Vec<Vec<BlockShare>>,
+    num_levels: usize,
+    num_inputs: usize,
+) -> Vec<Vec<BlockShare>> {
+    let mut tags = vec![Vec::with_capacity(num_levels); num_inputs];
+    for (lane, tag) in outputs.into_iter().flatten().enumerate() {
+        tags[lane / num_levels].push(tag);
+    }
+    tags
+}
+
+fn encrypt_lane_groups<N: Network>(
+    key_groups: &[CombinedRoundKeys],
+    mut group_states: Vec<Vec<Share>>,
+    lens: &[usize],
+    net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<Vec<Vec<BlockShare>>> {
+    assert_eq!(key_groups.len(), group_states.len());
+    assert_eq!(key_groups.len(), lens.len());
+    assert!(lens.iter().all(|len| (1..=8).contains(len)));
+
+    let ands_per_group = 3 * N_SBOXES;
     let mut sboxed = vec![Share::zero_share(); BLOCK_SIZE];
     let mut linear = vec![Share::zero_share(); BLOCK_SIZE];
-    let mut and_lhs = Vec::new();
-    let mut and_rhs = Vec::new();
+    let mut and_lhs = Vec::with_capacity(ands_per_group * key_groups.len());
+    let mut and_rhs = Vec::with_capacity(ands_per_group * key_groups.len());
 
-    add_round_key(&mut state_bits, &round_keys[0]);
+    for (states, keys) in group_states.iter_mut().zip(key_groups) {
+        add_round_key(states, &keys[0]);
+    }
     for round in 0..N_ROUNDS {
         and_lhs.clear();
         and_rhs.clear();
-        and_lhs.reserve(3 * N_SBOXES);
-        and_rhs.reserve(3 * N_SBOXES);
-        collect_sbox_ands(&state_bits, &mut and_lhs, &mut and_rhs);
+        for states in &group_states {
+            collect_sbox_ands(states, &mut and_lhs, &mut and_rhs);
+        }
         and_vec_u8(&mut and_lhs, &and_rhs, net, state)?;
-        apply_sbox_ands(&state_bits, &and_lhs, &mut sboxed);
-        four_russians_into(round, &sboxed, &mut linear, num_lanes);
-        std::mem::swap(&mut state_bits, &mut linear);
-        xor_constants(round, &mut state_bits, active_mask, state.id);
-        add_round_key(&mut state_bits, &round_keys[round + 1]);
+        for (group, (states, keys)) in group_states.iter_mut().zip(key_groups).enumerate() {
+            apply_sbox_ands(states, &and_lhs[group * ands_per_group..], &mut sboxed);
+            four_russians_into(round, &sboxed, &mut linear, lens[group]);
+            std::mem::swap(states, &mut linear);
+            xor_constants(round, states, lane_mask(lens[group]), state.id);
+            add_round_key(states, &keys[round + 1]);
+        }
     }
-
-    Ok(pack_lanes(&state_bits, num_lanes))
+    Ok(group_states
+        .iter()
+        .zip(lens)
+        .map(|(states, &len)| pack_lanes(states, len))
+        .collect())
 }
 
 pub fn combine_round_keys(keys: &[&PackedU8RoundKeys]) -> CombinedRoundKeys {

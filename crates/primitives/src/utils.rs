@@ -114,6 +114,36 @@ where
     }
 }
 
+pub fn reveal_to_party_many<T, N>(
+    shares: &[Rep3RingShare<T>],
+    target: PartyID,
+    net: &N,
+    state: &Rep3State,
+) -> eyre::Result<Option<Vec<RingElement<T>>>>
+where
+    T: IntRing2k,
+    N: Network,
+{
+    if state.id == target {
+        let missing = net.recv_from::<Vec<RingElement<T>>>(target.prev())?;
+        eyre::ensure!(missing.len() == shares.len(), "invalid reveal length");
+        return Ok(Some(
+            shares
+                .iter()
+                .zip(missing)
+                .map(|(share, missing)| share.a ^ share.b ^ missing)
+                .collect(),
+        ));
+    }
+    if state.id == target.prev() {
+        net.send_to(
+            target,
+            shares.iter().map(|share| share.b).collect::<Vec<_>>(),
+        )?;
+    }
+    Ok(None)
+}
+
 pub fn is_zero_many<T, N>(
     inputs: &[RingShare<T>],
     net: &N,

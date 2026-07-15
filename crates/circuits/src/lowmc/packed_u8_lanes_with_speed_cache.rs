@@ -16,6 +16,7 @@ use crate::lowmc::{
     },
     packed_u8_lanes::{
         CombinedRoundKeys, Share, and_vec_u8, bit_slice, four_russians_into, lane_mask, pack_lanes,
+        regroup_tags_by_input, slice_input_groups,
     },
 };
 const ZERO_CHECK_ROUNDS: usize = X::BITS.ilog2() as usize;
@@ -71,16 +72,8 @@ pub fn encrypt_with_combined_round_keys<V: DoramValue, N: Network>(
         return Ok(Vec::new());
     }
     assert!(num_lanes <= 8);
-
     let active_mask = lane_mask(num_lanes);
-    let mut state_bits = bit_slice([(input, active_mask)]);
-    let mut sboxed = vec![Share::zero_share(); BLOCK_SIZE];
-    let mut linear = vec![Share::zero_share(); BLOCK_SIZE];
-    let mut and_lhs = Vec::new();
-    let mut and_rhs = Vec::new();
-    let mut extra_lhs = Vec::new();
-    let mut extra_rhs = Vec::new();
-    let mut speed_cache = speed_cache.map(|target| {
+    let speed_cache = speed_cache.map(|target| {
         let zero_inputs = target
             .addrs
             .iter()
@@ -91,26 +84,86 @@ pub fn encrypt_with_combined_round_keys<V: DoramValue, N: Network>(
             target,
         }
     });
+    Ok(encrypt_lane_groups(
+        std::slice::from_ref(round_keys),
+        vec![bit_slice([(input, active_mask)])],
+        &[num_lanes],
+        speed_cache,
+        net,
+        state,
+    )?
+    .pop()
+    .unwrap())
+}
 
-    add_round_key(&mut state_bits, &round_keys[0]);
+pub fn encrypt_many_inputs_with_combined_keys<V: DoramValue, N: Network>(
+    key_groups: &[CombinedRoundKeys],
+    num_levels: usize,
+    inputs: &[BlockShare],
+    speed_caches: Option<&mut [SpeedCachePrecomputeData<V>]>,
+    net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<Vec<Vec<BlockShare>>> {
+    if num_levels == 0 || inputs.is_empty() {
+        return Ok(vec![Vec::new(); inputs.len()]);
+    }
+    let total = num_levels * inputs.len();
+    assert_eq!(key_groups.len(), total.div_ceil(8));
+    let (group_states, lens) = slice_input_groups(key_groups.len(), num_levels, inputs);
+    let (mut merged, zero_inputs) = speed_caches.as_deref().map(merge_speed_caches).unzip();
+    let speed_cache = merged
+        .as_mut()
+        .zip(zero_inputs.as_deref())
+        .map(|(target, zero_inputs)| SpeedCacheRoundData {
+            target,
+            zero_values: ZeroU8Values::new(zero_inputs),
+        });
+    let outputs = encrypt_lane_groups(key_groups, group_states, &lens, speed_cache, net, state)?;
+    if let (Some(targets), Some(mut merged)) = (speed_caches, merged) {
+        split_speed_cache_result(targets, merged.take_result().unwrap());
+    }
+    Ok(regroup_tags_by_input(outputs, num_levels, inputs.len()))
+}
+
+fn encrypt_lane_groups<V: DoramValue, N: Network>(
+    key_groups: &[CombinedRoundKeys],
+    mut group_states: Vec<Vec<Share>>,
+    lens: &[usize],
+    mut speed_cache: Option<SpeedCacheRoundData<'_, V>>,
+    net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<Vec<Vec<BlockShare>>> {
+    assert_eq!(key_groups.len(), group_states.len());
+    assert_eq!(key_groups.len(), lens.len());
+    assert!(lens.iter().all(|len| (1..=8).contains(len)));
+
+    let ands_per_group = 3 * N_SBOXES;
+    let mut sboxed = vec![Share::zero_share(); BLOCK_SIZE];
+    let mut linear = vec![Share::zero_share(); BLOCK_SIZE];
+    let mut and_lhs = Vec::with_capacity(ands_per_group * key_groups.len());
+    let mut and_rhs = Vec::with_capacity(ands_per_group * key_groups.len());
+    let mut extra_lhs = Vec::new();
+    let mut extra_rhs = Vec::new();
+
+    for (states, keys) in group_states.iter_mut().zip(key_groups) {
+        add_round_key(states, &keys[0]);
+    }
     for round in 0..N_ROUNDS {
+        and_lhs.clear();
+        and_rhs.clear();
+        for states in &group_states {
+            collect_sbox_ands(states, &mut and_lhs, &mut and_rhs);
+        }
+        let sbox_ands = and_lhs.len();
         match speed_cache.as_mut() {
             Some(speed_cache) if round < ZERO_CHECK_ROUNDS => {
                 speed_cache
                     .zero_values
                     .pairs_into(round, &mut extra_lhs, &mut extra_rhs);
-                let zero_ands = sbox_layer_one_with_extra_into(
-                    &state_bits,
-                    &extra_lhs,
-                    &extra_rhs,
-                    net,
-                    state,
-                    SboxScratch {
-                        and_lhs: &mut and_lhs,
-                        and_rhs: &mut and_rhs,
-                        output: &mut sboxed,
-                    },
-                )?;
+                and_lhs.extend_from_slice(&extra_lhs);
+                and_rhs.extend_from_slice(&extra_rhs);
+                and_vec_u8(&mut and_lhs, &and_rhs, net, state)?;
+                let zero_ands = and_lhs.split_off(sbox_ands);
                 speed_cache.zero_values.apply(zero_ands, round);
             }
             Some(speed_cache) if round == ZERO_CHECK_ROUNDS && !speed_cache.target.is_empty() => {
@@ -125,58 +178,85 @@ pub fn encrypt_with_combined_round_keys<V: DoramValue, N: Network>(
                     .collect::<Vec<_>>();
                 let values = Record::<V>::get_y_values(&speed_cache.target.data);
                 let alibis = Record::<V>::get_alibis(&speed_cache.target.data);
-                let value_blocks = V::to_blocks(&values);
-                let alibis = alibi_to_blocks(&alibis);
-                let selected = sbox_layer_one_with_cmux_into(
-                    &state_bits,
+                let (ands, selected) = cmux_and_round(
+                    &and_lhs,
+                    &and_rhs,
                     CmuxAnds {
                         masks_x: &masks_x,
                         x: &speed_cache.target.addrs,
                         masks_y: &masks_y,
-                        value_blocks: &value_blocks,
-                        alibi: &alibis,
+                        value_blocks: &V::to_blocks(&values),
+                        alibi: &alibi_to_blocks(&alibis),
                     },
                     net,
                     state,
-                    SboxScratch {
-                        and_lhs: &mut and_lhs,
-                        and_rhs: &mut and_rhs,
-                        output: &mut sboxed,
-                    },
                 )?;
-                let x_if_found = selected.x_if_found;
+                and_lhs = ands;
                 let y_if_found = Record::<V>::from_columns(
                     V::from_blocks(selected.value_blocks),
                     alibi_from_blocks(selected.alibi),
                 );
                 speed_cache.target.result = Some(SpeedCacheQueryResult {
-                    x_if_found,
+                    x_if_found: selected.x_if_found,
                     y_if_found,
                     found,
                 });
             }
             _ => {
-                sbox_layer_one_with_extra_into(
-                    &state_bits,
-                    &[],
-                    &[],
-                    net,
-                    state,
-                    SboxScratch {
-                        and_lhs: &mut and_lhs,
-                        and_rhs: &mut and_rhs,
-                        output: &mut sboxed,
-                    },
-                )?;
+                and_vec_u8(&mut and_lhs, &and_rhs, net, state)?;
             }
         }
-        four_russians_into(round, &sboxed, &mut linear, num_lanes);
-        std::mem::swap(&mut state_bits, &mut linear);
-        xor_constants(round, &mut state_bits, active_mask, state.id);
-        add_round_key(&mut state_bits, &round_keys[round + 1]);
+        for (group, (states, keys)) in group_states.iter_mut().zip(key_groups).enumerate() {
+            apply_sbox_ands(states, &and_lhs[group * ands_per_group..], &mut sboxed);
+            four_russians_into(round, &sboxed, &mut linear, lens[group]);
+            std::mem::swap(states, &mut linear);
+            xor_constants(round, states, lane_mask(lens[group]), state.id);
+            add_round_key(states, &keys[round + 1]);
+        }
     }
+    Ok(group_states
+        .iter()
+        .zip(lens)
+        .map(|(states, &len)| pack_lanes(states, len))
+        .collect())
+}
 
-    Ok(pack_lanes(&state_bits, num_lanes))
+fn merge_speed_caches<V: DoramValue>(
+    targets: &[SpeedCachePrecomputeData<V>],
+) -> (SpeedCachePrecomputeData<V>, Vec<XShare>) {
+    let addrs = targets
+        .iter()
+        .flat_map(|target| target.addrs.iter().copied());
+    let data = targets
+        .iter()
+        .flat_map(|target| target.data.iter().copied());
+    let zero_inputs = targets
+        .iter()
+        .flat_map(|target| target.addrs.iter().map(|&x| x ^ target.query_addr))
+        .collect();
+    (
+        SpeedCachePrecomputeData::new(XShare::zero_share(), addrs.collect(), data.collect()),
+        zero_inputs,
+    )
+}
+
+fn split_speed_cache_result<V: DoramValue>(
+    targets: &mut [SpeedCachePrecomputeData<V>],
+    mut result: SpeedCacheQueryResult<V>,
+) {
+    for target in targets {
+        let len = target.len();
+        target.result = Some(SpeedCacheQueryResult {
+            x_if_found: take_prefix(&mut result.x_if_found, len),
+            y_if_found: take_prefix(&mut result.y_if_found, len),
+            found: take_prefix(&mut result.found, len),
+        });
+    }
+}
+
+fn take_prefix<T>(values: &mut Vec<T>, len: usize) -> Vec<T> {
+    let tail = values.split_off(len);
+    std::mem::replace(values, tail)
 }
 
 struct SpeedCacheRoundData<'a, V: DoramValue> {
@@ -260,12 +340,6 @@ impl ZeroU8Values {
     }
 }
 
-struct SboxScratch<'a> {
-    and_lhs: &'a mut Vec<Share>,
-    and_rhs: &'a mut Vec<Share>,
-    output: &'a mut [Share],
-}
-
 struct AndBatch<'a, T> {
     lhs: &'a [T],
     rhs: &'a [T],
@@ -285,48 +359,18 @@ struct SelectedCacheChunks {
     alibi: Vec<BlockShare>,
 }
 
-fn sbox_layer_one_with_extra_into<N: Network>(
-    input: &[Share],
-    extra_lhs: &[Share],
-    extra_rhs: &[Share],
-    net: &N,
-    state: &mut Rep3State,
-    scratch: SboxScratch<'_>,
-) -> eyre::Result<Vec<Share>> {
-    let ands_per_block = 3 * N_SBOXES;
-    scratch.and_lhs.clear();
-    scratch.and_rhs.clear();
-    scratch.and_lhs.reserve(ands_per_block + extra_lhs.len());
-    scratch.and_rhs.reserve(ands_per_block + extra_rhs.len());
-    collect_sbox_ands(input, scratch.and_lhs, scratch.and_rhs);
-    scratch.and_lhs.extend_from_slice(extra_lhs);
-    scratch.and_rhs.extend_from_slice(extra_rhs);
-
-    and_vec_u8(scratch.and_lhs, scratch.and_rhs, net, state)?;
-    let extra_ands = scratch.and_lhs.split_off(ands_per_block);
-    apply_sbox_ands(input, scratch.and_lhs, scratch.output);
-    Ok(extra_ands)
-}
-
-fn sbox_layer_one_with_cmux_into<N: Network>(
-    input: &[Share],
+fn cmux_and_round<N: Network>(
+    sbox_lhs: &[Share],
+    sbox_rhs: &[Share],
     cmux: CmuxAnds<'_>,
     net: &N,
     state: &mut Rep3State,
-    scratch: SboxScratch<'_>,
-) -> eyre::Result<SelectedCacheChunks> {
+) -> eyre::Result<(Vec<Share>, SelectedCacheChunks)> {
     let num_values = cmux.x.len();
     for col in cmux.value_blocks {
         assert_eq!(num_values, col.len());
     }
     assert_eq!(num_values, cmux.alibi.len());
-
-    let ands_per_block = 3 * N_SBOXES;
-    scratch.and_lhs.clear();
-    scratch.and_rhs.clear();
-    scratch.and_lhs.reserve(ands_per_block);
-    scratch.and_rhs.reserve(ands_per_block);
-    collect_sbox_ands(input, scratch.and_lhs, scratch.and_rhs);
 
     // One masked AND per value block-column plus the alibi column.
     let num_block_cols = cmux.value_blocks.len() + 1;
@@ -341,8 +385,8 @@ fn sbox_layer_one_with_cmux_into<N: Network>(
 
     let (ands, x_if_found, block_outputs) = and_vec_mixed_u8_x_block(
         AndBatch {
-            lhs: scratch.and_lhs,
-            rhs: scratch.and_rhs,
+            lhs: sbox_lhs,
+            rhs: sbox_rhs,
         },
         AndBatch {
             lhs: cmux.masks_x,
@@ -355,7 +399,6 @@ fn sbox_layer_one_with_cmux_into<N: Network>(
         net,
         state,
     )?;
-    apply_sbox_ands(input, &ands, scratch.output);
 
     let mut outputs = block_outputs.chunks_exact(num_values);
     let selected_value_blocks = outputs
@@ -364,11 +407,14 @@ fn sbox_layer_one_with_cmux_into<N: Network>(
         .map(<[BlockShare]>::to_vec)
         .collect();
     let selected_alibi = outputs.next().unwrap().to_vec();
-    Ok(SelectedCacheChunks {
-        x_if_found,
-        value_blocks: selected_value_blocks,
-        alibi: selected_alibi,
-    })
+    Ok((
+        ands,
+        SelectedCacheChunks {
+            x_if_found,
+            value_blocks: selected_value_blocks,
+            alibi: selected_alibi,
+        },
+    ))
 }
 
 fn and_vec_mixed_u8_x_block<N: Network>(

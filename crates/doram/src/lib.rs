@@ -14,7 +14,11 @@ use std::time::{Duration, Instant};
 use circuits::{
     lowmc::{
         self, ROUND_KEYS,
-        packed_u8_lanes::{CombinedRoundKeys, combine_round_keys},
+        packed_u8_lanes::{
+            CombinedRoundKeys, combine_round_keys,
+            encrypt_many_inputs_with_combined_keys as encrypt_many,
+        },
+        packed_u8_lanes_with_speed_cache::encrypt_many_inputs_with_combined_keys as encrypt_many_with_cache,
     },
     oblivious_sort::ObliviousSort,
     replace_if_dummy::replace_if_dummy_circuit,
@@ -200,6 +204,7 @@ pub struct GigaDoram<V: DoramValue> {
     pub levels: Vec<Option<OhTable<V>>>,
     pub base_b_state_vec: Vec<usize>,
     packed_query_key: Option<CombinedRoundKeys>,
+    packed_batch_query_keys: Option<(usize, Vec<CombinedRoundKeys>)>,
     had_initial_bottom_level: bool,
 }
 
@@ -247,6 +252,7 @@ impl<V: DoramValue> GigaDoram<V> {
             levels: vec![None; config.num_levels],
             base_b_state_vec: vec![0; config.num_levels],
             packed_query_key: None,
+            packed_batch_query_keys: None,
             had_initial_bottom_level: false,
         }
     }
@@ -276,6 +282,7 @@ impl<V: DoramValue> GigaDoram<V> {
             levels: vec![None; config.num_levels],
             base_b_state_vec: vec![0; config.num_levels],
             packed_query_key: None,
+            packed_batch_query_keys: None,
             had_initial_bottom_level: true,
         };
 
@@ -315,6 +322,171 @@ impl<V: DoramValue> GigaDoram<V> {
         timing: Option<&mut GigaDoramTiming>,
     ) -> Result<V::Share> {
         self.read_and_maybe_write(query_x, Some(query_y), net, state, timing)
+    }
+
+    pub fn batch_read<N: Network>(
+        &mut self,
+        xs: &[XShare],
+        net: &N,
+        state: &mut Rep3State,
+        timing: Option<&mut GigaDoramTiming>,
+    ) -> Result<Vec<V::Share>> {
+        let ops = xs.iter().map(|&x| (x, None)).collect::<Vec<_>>();
+        self.batch_access(&ops, net, state, timing)
+    }
+
+    pub fn batch_write<N: Network>(
+        &mut self,
+        writes: &[(XShare, V::Share)],
+        net: &N,
+        state: &mut Rep3State,
+        timing: Option<&mut GigaDoramTiming>,
+    ) -> Result<Vec<V::Share>> {
+        let ops = writes
+            .iter()
+            .map(|&(x, y)| (x, Some(y)))
+            .collect::<Vec<_>>();
+        self.batch_access(&ops, net, state, timing)
+    }
+
+    pub fn batch_access<N: Network>(
+        &mut self,
+        ops: &[(XShare, Option<V::Share>)],
+        net: &N,
+        state: &mut Rep3State,
+        mut timing: Option<&mut GigaDoramTiming>,
+    ) -> Result<Vec<V::Share>> {
+        ensure!(
+            !ops.is_empty(),
+            "batch access requires at least one operation"
+        );
+        // Split the batch at speed cache capacity so a rebuild only ever runs
+        // on an exactly full cache
+        let mut outputs = Vec::with_capacity(ops.len());
+        let mut remaining = ops;
+        while !remaining.is_empty() {
+            let free = self.speed_cache.length - self.speed_cache.num_stored;
+            if free == 0 {
+                self.rebuild(net, state, timing.as_deref_mut())?;
+                continue;
+            }
+            let (chunk, rest) = remaining.split_at(remaining.len().min(free));
+            outputs.extend(self.batch_access_chunk(chunk, net, state, timing.as_deref_mut())?);
+            remaining = rest;
+        }
+        Ok(outputs)
+    }
+
+    fn batch_access_chunk<N: Network>(
+        &mut self,
+        ops: &[(XShare, Option<V::Share>)],
+        net: &N,
+        state: &mut Rep3State,
+        mut timing: Option<&mut GigaDoramTiming>,
+    ) -> Result<Vec<V::Share>> {
+        let count = ops.len();
+        let query_start = Instant::now();
+        let query_communication = Self::timer(&timing).elapsed();
+        let queries = ops.iter().map(|op| op.0).collect::<Vec<_>>();
+        let live_levels = self
+            .levels
+            .iter()
+            .enumerate()
+            .filter_map(|(level, table)| table.as_ref().map(|_| level))
+            .collect::<Vec<_>>();
+        let keys_cached = matches!(&self.packed_batch_query_keys, Some((k, _)) if *k == count);
+        if !keys_cached {
+            let keys = (0..count)
+                .flat_map(|_| live_levels.iter().copied())
+                .map(|level| &self.levels[level].as_ref().unwrap().packed_key)
+                .collect::<Vec<_>>();
+            self.packed_batch_query_keys =
+                Some((count, keys.chunks(8).map(combine_round_keys).collect()));
+        }
+        let keys = &self.packed_batch_query_keys.as_ref().unwrap().1;
+        let inputs = queries
+            .iter()
+            .copied()
+            .map(upcast_x_to_block)
+            .collect::<Vec<_>>();
+        let (qs, precomputed) = network_phase!(timing, time_total_query_prf, {
+            let mut data = queries
+                .iter()
+                .map(|&query| self.speed_cache.precompute_query(query))
+                .collect::<Option<Vec<_>>>();
+            let qs = match data.as_deref_mut() {
+                Some(data) => encrypt_many_with_cache(
+                    keys,
+                    live_levels.len(),
+                    &inputs,
+                    Some(data),
+                    net,
+                    state,
+                )?,
+                None => encrypt_many(keys, live_levels.len(), &inputs, net, state)?,
+            };
+            let results = data.and_then(|mut data| {
+                data.iter_mut()
+                    .map(|query| query.take_result())
+                    .collect::<Option<Vec<_>>>()
+            });
+            (qs, results)
+        });
+        let results = network_phase!(timing, time_total_query_speed_cache, {
+            self.speed_cache
+                .query_many(&queries, precomputed, net, state)?
+        });
+        let mut y_accum = results.iter().map(|result| result.0).collect::<Vec<_>>();
+        let mut found = results.iter().map(|result| result.1).collect::<Vec<_>>();
+        let mut alibi = y_accum
+            .iter()
+            .map(|value| value.get_alibi_bits(self.config.num_levels))
+            .collect::<Vec<_>>();
+
+        for (position, &level) in live_levels.iter().enumerate() {
+            let start = Instant::now();
+            let use_dummies = (0..count)
+                .map(|query| binary::xor(&alibi[query][level], &found[query]))
+                .collect::<Vec<_>>();
+            let table = self.levels[level].as_mut().unwrap();
+            let mut table_timing =
+                OhTableQueryTiming::with_communication_timer(Self::timer(&timing));
+            let collect_timing = timing.is_some().then_some(&mut table_timing);
+            let level_qs = qs.iter().map(|tags| tags[position]).collect::<Vec<_>>();
+            let results = table.query_many(&level_qs, &use_dummies, net, state, collect_timing)?;
+            for (query, (value, is_found)) in results.into_iter().enumerate() {
+                y_accum[query] ^= value;
+                found[query] ^= is_found;
+                alibi[query] = y_accum[query].get_alibi_bits(self.config.num_levels);
+            }
+            if let Some(timing) = &mut timing {
+                timing.time_total_query_ohtable += start.elapsed();
+                timing
+                    .time_total_query_ohtable_details
+                    .add_assign(&table_timing);
+            }
+        }
+
+        let writeback = Instant::now();
+        let outputs = y_accum
+            .iter()
+            .map(|record| record.value)
+            .collect::<Vec<_>>();
+        let values = ops
+            .iter()
+            .zip(&outputs)
+            .map(|(op, &output)| Record::<V>::from_value(op.1.unwrap_or(output)))
+            .collect::<Vec<_>>();
+        self.speed_cache.write(queries, values);
+        if let Some(timing) = &mut timing {
+            timing.time_total_query_writeback += writeback.elapsed();
+            timing.time_total_queries.total += query_start.elapsed();
+            timing.time_total_queries.communication += timing
+                .communication_timer
+                .elapsed()
+                .saturating_sub(query_communication);
+        }
+        Ok(outputs)
     }
 
     pub fn num_levels(&self) -> usize {
@@ -585,11 +757,13 @@ impl<V: DoramValue> GigaDoram<V> {
         }
         self.levels[level] = Some(table);
         self.packed_query_key = None;
+        self.packed_batch_query_keys = None;
     }
 
     fn delete_level(&mut self, level: usize) {
         self.levels[level] = None;
         self.packed_query_key = None;
+        self.packed_batch_query_keys = None;
         if level < self.config.num_levels - 1
             && self.base_b_state_vec[level] == self.config.amp_factor() - 1
         {
