@@ -497,6 +497,158 @@ impl<V: DoramValue> GigaDoram<V> {
         self.speed_cache.num_stored
     }
 
+    /// Whether [`Self::grow_naturally`] can currently be called.
+    pub fn ready_to_grow_naturally(&self) -> bool {
+        !self.speed_cache.is_writeable() && self.rebuild_target().0 == self.config.num_levels - 1
+    }
+
+    /// Migrate all live data into `new_config`, whose address space must be
+    /// exactly one bit larger than the current one, and adopt it.
+    ///
+    /// Existing entries keep their addresses and values,
+    /// the freshly exposed addresses `[2^old_n, 2^new_n)` start at the default value.
+    pub fn grow_naturally<Net: Network>(
+        &mut self,
+        new_config: GigaDoramConfig,
+        net: &Net,
+        state: &mut Rep3State,
+        mut timing: Option<&mut GigaDoramTiming>,
+    ) -> Result<()> {
+        let old_log_n = self.config.log_address_space_size;
+        let new_log_n = new_config.log_address_space_size;
+        ensure!(
+            new_log_n == old_log_n + 1,
+            "grow must increase the address space by exactly one bit"
+        );
+        new_config.validate();
+        ensure!(
+            self.ready_to_grow_naturally(),
+            "grow is only valid at a full-collapse boundary (see `ready_to_grow_naturally`)"
+        );
+
+        let (rebuild_to, need_to_extract_from_rebuild_to) = self.rebuild_target();
+        debug_assert_eq!(rebuild_to, self.config.num_levels - 1);
+
+        let (mut xs, mut ys) = self.speed_cache.extract();
+        let last_level_to_extract = rebuild_to + usize::from(need_to_extract_from_rebuild_to);
+        for level in 0..last_level_to_extract {
+            let Some(table) = self.levels[level].as_ref() else {
+                continue;
+            };
+            let mut level_xs = Vec::new();
+            let mut level_ys = Vec::new();
+            table.extract(&mut level_xs, &mut level_ys);
+            let offset = xs.len();
+            let end = offset + self.num_elements_at(level, self.base_b_state_vec[level]);
+            xs.resize(end, dummy_x(state.id, old_log_n));
+            ys.resize(end, Record::<V>::default());
+            xs[offset..offset + level_xs.len()].clone_from_slice(&level_xs);
+            ys[offset..offset + level_ys.len()].clone_from_slice(&level_ys);
+        }
+
+        ensure!(!xs.is_empty(), "grow needs at least one extracted item");
+        for y in &mut ys {
+            *y = y.clear_alibi();
+        }
+
+        let (xs, ys) = self.finalize_bottom_level(xs, ys, net, state, timing.as_deref_mut())?;
+        self.finish_grow(new_config, xs, ys, net, state, timing)
+    }
+
+    /// Grow immediately, without waiting for a full-collapse boundary.
+    ///
+    /// Collapses the speed cache and every level's untouched slots into the
+    /// bottom level, regardless of how full the hierarchy is. Levels
+    /// whose dummy budget is not spent carry their unconsumed
+    /// dummies (they are indistinguishable from real entries
+    /// until the oblivious bottom cleanse processes them).
+    pub fn grow_on_demand<Net: Network>(
+        &mut self,
+        new_config: GigaDoramConfig,
+        net: &Net,
+        state: &mut Rep3State,
+        mut timing: Option<&mut GigaDoramTiming>,
+    ) -> Result<()> {
+        let old_log_n = self.config.log_address_space_size;
+        ensure!(
+            new_config.log_address_space_size == old_log_n + 1,
+            "grow must increase the address space by exactly one bit"
+        );
+        new_config.validate();
+
+        let (mut xs, mut ys) = self.speed_cache.extract_stored();
+        for level in 0..self.config.num_levels {
+            let Some(table) = self.levels[level].as_ref() else {
+                continue;
+            };
+            let mut level_xs = Vec::new();
+            let mut level_ys = Vec::new();
+            table.extract_untouched(&mut level_xs, &mut level_ys);
+            xs.extend_from_slice(&level_xs);
+            ys.extend_from_slice(&level_ys);
+        }
+
+        ensure!(!xs.is_empty(), "grow needs at least one extracted item");
+        for y in &mut ys {
+            *y = y.clear_alibi();
+        }
+
+        let (xs, ys) = self.finalize_bottom_level(xs, ys, net, state, timing.as_deref_mut())?;
+        self.finish_grow(new_config, xs, ys, net, state, timing)
+    }
+
+    /// Pad the cleansed data to the new address space and set the new config.
+    fn finish_grow<Net: Network>(
+        &mut self,
+        new_config: GigaDoramConfig,
+        mut xs: Vec<XShare>,
+        mut ys: Vec<Record<V>>,
+        net: &Net,
+        state: &mut Rep3State,
+        timing: Option<&mut GigaDoramTiming>,
+    ) -> Result<()> {
+        let old_log_n = self.config.log_address_space_size;
+        let new_log_n = new_config.log_address_space_size;
+        let new_bottom_elems = 1usize << new_log_n;
+        ensure!(
+            xs.len() <= new_bottom_elems,
+            "widened bottom level cannot hold the collapsed data"
+        );
+
+        if self.had_initial_bottom_level {
+            xs.reserve(new_bottom_elems - xs.len());
+            ys.resize(new_bottom_elems, Record::<V>::default());
+            for addr in (1u64 << old_log_n)..(1u64 << new_log_n) {
+                assert!(addr <= X::MAX as u64, "new address must fit X");
+                xs.push(promote_public(state.id, addr as X));
+            }
+        } else {
+            xs.resize(new_bottom_elems, dummy_x(state.id, old_log_n));
+            ys.resize(new_bottom_elems, Record::<V>::default());
+            let replacements = (0..new_bottom_elems)
+                .map(|i| {
+                    let label = (1u64 << new_log_n) + i as u64;
+                    assert!(label <= X::MAX as u64, "new dummy label must fit X");
+                    promote_public(state.id, label as X)
+                })
+                .collect::<Vec<_>>();
+            xs = replace_if_dummy_circuit(&xs, &replacements, old_log_n, net, state)?;
+        }
+
+        self.config = new_config;
+        self.levels = vec![None; new_config.num_levels];
+        self.base_b_state_vec = vec![0; new_config.num_levels];
+        self.speed_cache = SpeedCache::new(new_config.speed_cache_size(), new_log_n, state.id);
+        self.packed_query_key = None;
+        self.packed_batch_query_keys = None;
+
+        let bottom = self.config.num_levels - 1;
+        self.new_ohtable_of_level(bottom, xs, ys, net, state, timing);
+        self.insert_stash(bottom, state.id);
+
+        Ok(())
+    }
+
     fn read_and_maybe_write<N: Network>(
         &mut self,
         query_x: XShare,
@@ -640,24 +792,7 @@ impl<V: DoramValue> GigaDoram<V> {
         }
 
         if rebuild_to == self.config.num_levels - 1 {
-            if self.had_initial_bottom_level {
-                let shuffler = ArrayShuffler::new(extracted_xs.len(), state);
-                let values = Record::<V>::get_y_values(&extracted_ys);
-                let alibis = Record::<V>::get_alibis(&extracted_ys);
-                let mut value_blocks = V::to_blocks(&values);
-                let mut y_alibi = alibi_to_blocks(&alibis);
-                shuffler.forward(&mut extracted_xs, net, state)?;
-                for col in &mut value_blocks {
-                    shuffler.forward(col, net, state)?;
-                }
-                shuffler.forward(&mut y_alibi, net, state)?;
-                extracted_ys = Record::<V>::from_columns(
-                    V::from_blocks(value_blocks),
-                    alibi_from_blocks(y_alibi),
-                );
-            }
-
-            (extracted_xs, extracted_ys) = self.cleanse_bottom_level(
+            (extracted_xs, extracted_ys) = self.finalize_bottom_level(
                 extracted_xs,
                 extracted_ys,
                 net,
@@ -834,6 +969,31 @@ impl<V: DoramValue> GigaDoram<V> {
         xs.clone_from_slice(&relabeled);
 
         Ok(())
+    }
+
+    fn finalize_bottom_level<N: Network>(
+        &self,
+        mut xs: Vec<XShare>,
+        mut ys: Vec<Record<V>>,
+        net: &N,
+        state: &mut Rep3State,
+        timing: Option<&mut GigaDoramTiming>,
+    ) -> Result<(Vec<XShare>, Vec<Record<V>>)> {
+        if self.had_initial_bottom_level {
+            let shuffler = ArrayShuffler::new(xs.len(), state);
+            let values = Record::<V>::get_y_values(&ys);
+            let alibis = Record::<V>::get_alibis(&ys);
+            let mut value_blocks = V::to_blocks(&values);
+            let mut y_alibi = alibi_to_blocks(&alibis);
+            shuffler.forward(&mut xs, net, state)?;
+            for col in &mut value_blocks {
+                shuffler.forward(col, net, state)?;
+            }
+            shuffler.forward(&mut y_alibi, net, state)?;
+            ys =
+                Record::<V>::from_columns(V::from_blocks(value_blocks), alibi_from_blocks(y_alibi));
+        }
+        self.cleanse_bottom_level(xs, ys, net, state, timing)
     }
 
     fn cleanse_bottom_level<N: Network>(

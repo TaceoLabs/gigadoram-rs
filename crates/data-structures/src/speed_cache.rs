@@ -198,6 +198,15 @@ impl<V: DoramValue> SpeedCache<V> {
         (self.addrs.clone(), self.data.clone())
     }
 
+    /// Extract only the entries currently stored, which may be fewer than
+    /// `length`.
+    pub fn extract_stored(&self) -> (Vec<XShare>, Vec<Record<V>>) {
+        (
+            self.addrs[..self.num_stored].to_vec(),
+            self.data[..self.num_stored].to_vec(),
+        )
+    }
+
     pub fn write(&mut self, write_addrs: Vec<XShare>, write_data: Vec<Record<V>>) {
         assert_eq!(write_addrs.len(), write_data.len());
         assert!(
