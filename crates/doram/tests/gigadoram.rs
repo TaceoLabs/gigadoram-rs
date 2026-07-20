@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use data_structures::cht;
-use doram::{GigaDoramBn254 as GigaDoram, GigaDoramConfig};
+use doram::{ChtBounds, GigaDoramBn254 as GigaDoram, GigaDoramConfig};
 
 type OhTable = data_structures::OhTable<primitives::FieldValue<primitives::YField>>;
 use mpc_core::protocols::rep3::{
@@ -349,6 +349,204 @@ struct ClearOhTable {
 
 fn get_standard_config() -> GigaDoramConfig {
     GigaDoramConfig::new(LOG_ADDRESS_SPACE_SIZE, NUM_LEVELS, LOG_AMP_FACTOR)
+}
+
+#[test]
+fn test_grow_at_boundary() {
+    run_parties(|net| {
+        let mut state = Rep3State::new(&net, A2BType::Direct).unwrap();
+        let id = state.id;
+
+        let old_config =
+            GigaDoramConfig::with_stash_size(12, 2, 1, (1 << 11) - 1, ChtBounds::Empirical);
+        let new_config = GigaDoramConfig::new(13, 3, 2);
+
+        let old_space = 1u64 << 12;
+        let new_space = 1u64 << 13;
+
+        let mut oracle: BTreeMap<X, u64> = (0..old_space as X).map(|a| (a, a as u64 + 1)).collect();
+        let initial_ys = (0..old_space as X)
+            .map(|a| promote_public_y(id, random_y(oracle[&a])))
+            .collect::<Vec<_>>();
+        let mut doram = GigaDoram::new_with_initial_bottom_level(
+            old_config, initial_ys, &net, &mut state, None,
+        )
+        .unwrap();
+
+        let mut grew = false;
+        for step in 0..old_space {
+            if doram.ready_to_grow_naturally() && doram.levels.last().unwrap().is_some() {
+                doram
+                    .grow_naturally(new_config, &net, &mut state, None)
+                    .unwrap();
+                grew = true;
+                break;
+            }
+            let addr = (step % old_space) as X;
+            let val = step + 1000;
+            doram
+                .write(
+                    promote_public(id, addr),
+                    promote_public_y(id, random_y(val)),
+                    &net,
+                    &mut state,
+                    None,
+                )
+                .unwrap();
+            oracle.insert(addr, val);
+        }
+        assert!(grew, "doram never reached a grow boundary");
+        assert_eq!(doram.config, new_config);
+        assert!(
+            doram.levels[..new_config.num_levels - 1]
+                .iter()
+                .all(Option::is_none)
+        );
+        assert!(doram.levels.last().unwrap().is_some());
+
+        // Check values across both halves without turning this large-scale
+        // migration test into thousands of individual MPC queries.
+        let addresses = [
+            0,
+            1,
+            old_space as X / 4,
+            old_space as X / 2,
+            old_space as X - 2,
+            old_space as X - 1,
+            old_space as X,
+            old_space as X + 1,
+            new_space as X - 2,
+            new_space as X - 1,
+        ];
+        let query_xs = addresses.map(|addr| promote_public(id, addr));
+        let outputs = doram.batch_read(&query_xs, &net, &mut state, None).unwrap();
+        for (addr, output) in addresses.into_iter().zip(open_many_y(&outputs, &net)) {
+            let expected = if addr < old_space as X {
+                random_y(oracle[&addr])
+            } else {
+                Y::default()
+            };
+            assert_eq!(output, expected, "addr {addr}");
+        }
+        let new_addr = (new_space - 1) as X;
+        doram
+            .write(
+                promote_public(id, new_addr),
+                promote_public_y(id, random_y(4242)),
+                &net,
+                &mut state,
+                None,
+            )
+            .unwrap();
+        let out = doram
+            .read(promote_public(id, new_addr), &net, &mut state, None)
+            .unwrap();
+        assert_eq!(open_y(&out, &net), random_y(4242));
+    })
+    .unwrap();
+}
+
+#[test]
+fn test_grow_on_demand() {
+    run_parties(|net| {
+        let mut state = Rep3State::new(&net, A2BType::Direct).unwrap();
+        let id = state.id;
+
+        let old_config = GigaDoramConfig::with_stash_size(12, 2, 1, 8, ChtBounds::Empirical);
+        let new_config = GigaDoramConfig::new(13, 3, 2);
+
+        let old_space = 1u64 << 12;
+        let new_space = 1u64 << 13;
+
+        let mut oracle: BTreeMap<X, u64> = (0..old_space as X).map(|a| (a, a as u64 + 1)).collect();
+        let initial_ys = (0..old_space as X)
+            .map(|a| promote_public_y(id, random_y(oracle[&a])))
+            .collect::<Vec<_>>();
+        let mut doram = GigaDoram::new_with_initial_bottom_level(
+            old_config, initial_ys, &net, &mut state, None,
+        )
+        .unwrap();
+
+        let writes = (0..2100u64)
+            .map(|a| {
+                (
+                    promote_public(id, a as X),
+                    promote_public_y(id, random_y(a + 10_000)),
+                )
+            })
+            .collect::<Vec<_>>();
+        doram.batch_write(&writes, &net, &mut state, None).unwrap();
+        for a in 0..2100u64 {
+            oracle.insert(a as X, a + 10_000);
+        }
+
+        let rewrites = (0..10u64)
+            .map(|a| {
+                (
+                    promote_public(id, a as X),
+                    promote_public_y(id, random_y(a + 20_000)),
+                )
+            })
+            .collect::<Vec<_>>();
+        doram
+            .batch_write(&rewrites, &net, &mut state, None)
+            .unwrap();
+        for a in 0..10u64 {
+            oracle.insert(a as X, a + 20_000);
+        }
+
+        assert!(
+            !doram.ready_to_grow_naturally(),
+            "this test must grow away from the boundary"
+        );
+        doram
+            .grow_on_demand(new_config, &net, &mut state, None)
+            .unwrap();
+
+        assert_eq!(doram.config, new_config);
+        assert!(
+            doram.levels[..new_config.num_levels - 1]
+                .iter()
+                .all(Option::is_none)
+        );
+        assert!(doram.levels.last().unwrap().is_some());
+
+        let addresses = [
+            0,
+            9,
+            10,
+            2099,
+            2100,
+            old_space as X - 1,
+            old_space as X,
+            new_space as X - 1,
+        ];
+        let query_xs = addresses.map(|addr| promote_public(id, addr));
+        let outputs = doram.batch_read(&query_xs, &net, &mut state, None).unwrap();
+        for (addr, output) in addresses.into_iter().zip(open_many_y(&outputs, &net)) {
+            let expected = if addr < old_space as X {
+                random_y(oracle[&addr])
+            } else {
+                Y::default()
+            };
+            assert_eq!(output, expected, "addr {addr}");
+        }
+        let new_addr = (new_space - 1) as X;
+        doram
+            .write(
+                promote_public(id, new_addr),
+                promote_public_y(id, random_y(4242)),
+                &net,
+                &mut state,
+                None,
+            )
+            .unwrap();
+        let out = doram
+            .read(promote_public(id, new_addr), &net, &mut state, None)
+            .unwrap();
+        assert_eq!(open_y(&out, &net), random_y(4242));
+    })
+    .unwrap();
 }
 
 fn assert_trace(config: GigaDoramConfig, trace: &[Op], expected: &[u64]) {

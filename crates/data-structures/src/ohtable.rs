@@ -384,18 +384,7 @@ impl<V: DoramValue> OhTable<V> {
     pub fn extract(&self, extract_xs: &mut Vec<XShare>, extract_ys: &mut Vec<Record<V>>) {
         assert_eq!(self.query_count, self.params.num_dummies);
 
-        extract_xs.clear();
-        extract_ys.clear();
-        extract_xs.reserve(self.params.num_elements - self.params.stash_size);
-        extract_ys.reserve(self.params.num_elements - self.params.stash_size);
-
-        for (i, touched) in self.touched.iter().copied().enumerate() {
-            if touched {
-                continue;
-            }
-            extract_xs.push(self.xs_receiver_order[i]);
-            extract_ys.push(self.ys_receiver_order[i]);
-        }
+        self.extract_untouched(extract_xs, extract_ys);
 
         assert_eq!(
             extract_xs.len(),
@@ -405,6 +394,29 @@ impl<V: DoramValue> OhTable<V> {
             extract_ys.len(),
             self.params.num_elements - self.params.stash_size
         );
+    }
+
+    /// Collect every untouched slot, regardless of how much of the dummies
+    /// have been consumed.
+    ///
+    /// The result may still contain unconsumed dummy entries: they are shared
+    /// and shuffled like everything else, so they cannot be filtered here and
+    /// must be taken and processed downstream by an oblivious cleanse. The number
+    /// of entries returned is a function of the public query count only.
+    pub fn extract_untouched(&self, extract_xs: &mut Vec<XShare>, extract_ys: &mut Vec<Record<V>>) {
+        extract_xs.clear();
+        extract_ys.clear();
+        let untouched = self.params.total_size() - self.params.stash_size - self.query_count;
+        extract_xs.reserve(untouched);
+        extract_ys.reserve(untouched);
+
+        for (i, touched) in self.touched.iter().copied().enumerate() {
+            if touched {
+                continue;
+            }
+            extract_xs.push(self.xs_receiver_order[i]);
+            extract_ys.push(self.ys_receiver_order[i]);
+        }
     }
 
     fn fill_prf_tags<N: Network>(
