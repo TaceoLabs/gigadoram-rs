@@ -22,6 +22,7 @@ pub use types::{
 };
 pub use utils::{
     cmux_many_custom, is_zero_many, low_u32, random_indexed_block, random_indexed_blocks,
-    reveal_to_party, reveal_to_party_many, run_parties, run_parties_may_panic, set_low_u32,
+    reveal_to_party, reveal_to_party_many, run_parties, run_parties_may_panic, select_values,
+    set_low_u32,
 };
 pub use value::{DoramValue, FieldValue, Record};

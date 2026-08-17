@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use data_structures::cht;
-use doram::{ChtBounds, GigaDoramBn254 as GigaDoram, GigaDoramConfig};
+use doram::{Aliasing, ChtBounds, GigaDoramBn254 as GigaDoram, GigaDoramConfig};
 
 type OhTable = data_structures::OhTable<primitives::FieldValue<primitives::YField>>;
 use mpc_core::protocols::rep3::{
@@ -12,7 +12,7 @@ use primitives::{
     Block, X, Y, Y_BITS, YField, YRecord, open_many, open_many_y, open_y, promote_public,
     promote_public_y, random_bigint, run_parties, y_low_mask,
 };
-use rand::{SeedableRng, rngs::StdRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 const NUM_LEVELS: usize = 4;
 const LOG_SPEED_CACHE_SIZE: usize = 4;
@@ -66,6 +66,7 @@ fn test_batched_double_accesses() {
                             promote_public_y(state.id, random_y(x as u64 * 10)),
                         )
                     }),
+                    Aliasing::Distinct,
                     &net,
                     &mut state,
                     None,
@@ -78,6 +79,7 @@ fn test_batched_double_accesses() {
             let values = doram
                 .batch_read(
                     &addresses.map(|x| promote_public(state.id, x)),
+                    Aliasing::Distinct,
                     &net,
                     &mut state,
                     None,
@@ -104,6 +106,7 @@ fn test_batch_accesses() {
         let old = doram
             .batch_write(
                 &[(x(1), y(10)), (x(2), y(20)), (x(3), y(30))],
+                Aliasing::Distinct,
                 &net,
                 &mut state,
                 None,
@@ -113,6 +116,7 @@ fn test_batch_accesses() {
         let old = doram
             .batch_write(
                 &[(x(2), y(21)), (x(4), y(40)), (x(5), y(50))],
+                Aliasing::Distinct,
                 &net,
                 &mut state,
                 None,
@@ -127,6 +131,7 @@ fn test_batch_accesses() {
         let outputs = doram
             .batch_access(
                 &[(x(2), Some(y(22))), (x(4), None), (x(7), Some(y(100)))],
+                Aliasing::Distinct,
                 &net,
                 &mut state,
                 None,
@@ -143,6 +148,7 @@ fn test_batch_accesses() {
             doram
                 .batch_write(
                     &[(x(base), y(base as u64)), (x(base + 1), y(base as u64 + 1))],
+                    Aliasing::Distinct,
                     &net,
                     &mut state,
                     None,
@@ -150,12 +156,205 @@ fn test_batch_accesses() {
                 .unwrap();
         }
         let values = doram
-            .batch_read(&[x(1), x(2), x(3), x(7)], &net, &mut state, None)
+            .batch_read(
+                &[x(1), x(2), x(3), x(7)],
+                Aliasing::Distinct,
+                &net,
+                &mut state,
+                None,
+            )
             .unwrap();
         assert_eq!(
             open_many_y(&values, &net),
             [random_y(10), random_y(22), random_y(30), random_y(100)]
         );
+    })
+    .unwrap();
+}
+
+// Later operations of a batch must see the earlier ones.
+#[test]
+fn test_aliased_batch_read_after_write() {
+    let batch = vec![
+        Op::write(1, 10),
+        Op::read(1),
+        Op::write(1, 11),
+        Op::read(1),
+        Op::read(2),
+    ];
+
+    assert_aliased_batches(get_standard_config(), &[batch]);
+}
+
+// Every operation of the batch hitting the same address.
+#[test]
+fn test_aliased_batch_single_address() {
+    let batch = vec![
+        Op::read(5),
+        Op::write(5, 1),
+        Op::read(5),
+        Op::write(5, 2),
+        Op::read(5),
+    ];
+
+    assert_aliased_batches(get_standard_config(), &[batch]);
+}
+
+// Aliasing entries already in the speed cache and pushed into the levels.
+#[test]
+fn test_aliased_batch_over_existing_entries() {
+    let config = get_standard_config();
+    let setup = (1..=config.fill_time())
+        .map(|x| Op::write(x as X, (x * 10) as u64))
+        .collect::<Vec<_>>();
+    let batch = vec![
+        Op::read(1),
+        Op::read(1),
+        Op::write(2, 99),
+        Op::read(2),
+        Op::write(1, 98),
+        Op::read(1),
+    ];
+
+    assert_aliased_batches(config, &[setup, batch]);
+}
+
+// A transfer: read both endpoints, write both back, endpoints secretly equal.
+#[test]
+fn test_aliased_batch_self_transfer() {
+    for (sender, receiver) in [(3, 4), (3, 3)] {
+        let batch = vec![
+            Op::read(sender),
+            Op::read(receiver),
+            Op::write(sender, 70),
+            Op::write(receiver, 30),
+        ];
+
+        assert_aliased_batches(
+            get_standard_config(),
+            &[vec![Op::write(3, 100), Op::write(4, 100)], batch],
+        );
+    }
+}
+
+// Arity-4 patterns: three-way aliases, disjoint pairs, and all distinct.
+#[test]
+fn test_aliased_batch_arity_four_patterns() {
+    for addresses in [[1, 1, 1, 2], [1, 2, 1, 2], [1, 1, 2, 2], [1, 2, 3, 4]] {
+        let batch = vec![
+            Op::read(addresses[0]),
+            Op::write(addresses[1], 11),
+            Op::read(addresses[2]),
+            Op::write(addresses[3], 22),
+        ];
+
+        assert_aliased_batches(get_standard_config(), &[batch]);
+    }
+}
+
+// Batches longer than the free cache capacity chunk, and rebuild mid-batch.
+#[test]
+fn test_aliased_batch_across_chunks_and_rebuilds() {
+    let batch = (0..40)
+        .map(|i| {
+            if i % 3 == 0 {
+                Op::write(1 + i % 5, 100 + i as u64)
+            } else {
+                Op::read(1 + i % 5)
+            }
+        })
+        .collect::<Vec<_>>();
+    let readback = (1..=5).map(Op::read).collect::<Vec<_>>();
+
+    assert_aliased_batches(get_standard_config(), &[batch, readback]);
+}
+
+// Random aliasing patterns over a small address range.
+#[test]
+fn test_aliased_batch_random_traces() {
+    let mut rng = StdRng::seed_from_u64(0xa11a5);
+    let batches = (0..4)
+        .map(|_| {
+            (0..7)
+                .map(|_| {
+                    let x = rng.gen_range(1..5) as X;
+                    if rng.r#gen::<bool>() {
+                        Op::write(x, rng.r#gen::<u32>() as u64 + 1)
+                    } else {
+                        Op::read(x)
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    assert_aliased_batches(get_standard_config(), &batches);
+}
+
+// However often an address repeats, the cache keeps one live entry for it.
+#[test]
+fn test_aliased_batch_leaves_one_live_entry_per_address() {
+    let config = get_standard_config();
+    let batch = [1, 1, 2, 1, 2, 3].map(|x| Op::write(x as X, x as u64 * 10));
+
+    run_parties(|net| {
+        let mut state = Rep3State::new(&net, A2BType::Direct).unwrap();
+        let id = state.id;
+        let mut doram = GigaDoram::new(config, id);
+        let ops = batch
+            .iter()
+            .map(|op| match *op {
+                Op::Read(x) => (promote_public(id, x), None),
+                Op::Write(x, y) => (promote_public(id, x), Some(promote_public_y(id, y))),
+            })
+            .collect::<Vec<_>>();
+        doram
+            .batch_access(&ops, Aliasing::MayAlias, &net, &mut state, None)
+            .unwrap();
+
+        let stored = doram.speed_cache.num_stored;
+        let addrs = open_many(&doram.speed_cache.addrs[..stored], &net);
+        let dummy_sentinel = 1 << LOG_ADDRESS_SPACE_SIZE;
+        let live = addrs
+            .iter()
+            .filter(|&&addr| addr < dummy_sentinel)
+            .collect::<Vec<_>>();
+
+        assert_eq!(stored, config.stash_size + batch.len());
+        assert_eq!(live, [&1, &2, &3]);
+    })
+    .unwrap();
+}
+
+// The rest of the file is field-valued; check a ring-valued DORAM too.
+#[test]
+fn test_aliased_batch_ring_values() {
+    run_parties(|net| {
+        let mut state = Rep3State::new(&net, A2BType::Direct).unwrap();
+        let id = state.id;
+        let mut doram = doram::GigaDoramU64::new(get_standard_config(), id);
+        let ops = [(7, Some(11)), (7, None), (8, Some(22)), (7, Some(33))].map(|(x, y)| {
+            (
+                promote_public(id, x as X),
+                y.map(|y: u64| promote_public(id, y)),
+            )
+        });
+
+        let outputs = doram
+            .batch_access(&ops, Aliasing::MayAlias, &net, &mut state, None)
+            .unwrap();
+        assert_eq!(open_many(&outputs, &net), [0, 11, 0, 11]);
+
+        let after = doram
+            .batch_read(
+                &[promote_public(id, 7), promote_public(id, 8)],
+                Aliasing::Distinct,
+                &net,
+                &mut state,
+                None,
+            )
+            .unwrap();
+        assert_eq!(open_many(&after, &net), [33, 22]);
     })
     .unwrap();
 }
@@ -419,7 +618,9 @@ fn test_grow_at_boundary() {
             new_space as X - 1,
         ];
         let query_xs = addresses.map(|addr| promote_public(id, addr));
-        let outputs = doram.batch_read(&query_xs, &net, &mut state, None).unwrap();
+        let outputs = doram
+            .batch_read(&query_xs, Aliasing::Distinct, &net, &mut state, None)
+            .unwrap();
         for (addr, output) in addresses.into_iter().zip(open_many_y(&outputs, &net)) {
             let expected = if addr < old_space as X {
                 random_y(oracle[&addr])
@@ -475,7 +676,9 @@ fn test_grow_on_demand() {
                 )
             })
             .collect::<Vec<_>>();
-        doram.batch_write(&writes, &net, &mut state, None).unwrap();
+        doram
+            .batch_write(&writes, Aliasing::Distinct, &net, &mut state, None)
+            .unwrap();
         for a in 0..2100u64 {
             oracle.insert(a as X, a + 10_000);
         }
@@ -489,7 +692,7 @@ fn test_grow_on_demand() {
             })
             .collect::<Vec<_>>();
         doram
-            .batch_write(&rewrites, &net, &mut state, None)
+            .batch_write(&rewrites, Aliasing::Distinct, &net, &mut state, None)
             .unwrap();
         for a in 0..10u64 {
             oracle.insert(a as X, a + 20_000);
@@ -522,7 +725,9 @@ fn test_grow_on_demand() {
             new_space as X - 1,
         ];
         let query_xs = addresses.map(|addr| promote_public(id, addr));
-        let outputs = doram.batch_read(&query_xs, &net, &mut state, None).unwrap();
+        let outputs = doram
+            .batch_read(&query_xs, Aliasing::Distinct, &net, &mut state, None)
+            .unwrap();
         for (addr, output) in addresses.into_iter().zip(open_many_y(&outputs, &net)) {
             let expected = if addr < old_space as X {
                 random_y(oracle[&addr])
@@ -547,6 +752,40 @@ fn test_grow_on_demand() {
         assert_eq!(open_y(&out, &net), random_y(4242));
     })
     .unwrap();
+}
+
+// Checks batched outputs against the sequential oracle for the flat trace.
+fn assert_aliased_batches(config: GigaDoramConfig, batches: &[Vec<Op>]) {
+    let flat = batches.iter().flatten().copied().collect::<Vec<_>>();
+    let expected = oracle(&flat);
+
+    let outputs = run_parties(|net| {
+        let mut state = Rep3State::new(&net, A2BType::Direct).unwrap();
+        let id = state.id;
+        let mut doram = GigaDoram::new(config, id);
+        let mut outputs = Vec::with_capacity(flat.len());
+
+        for batch in batches {
+            let ops = batch
+                .iter()
+                .map(|op| match *op {
+                    Op::Read(x) => (promote_public(id, x), None),
+                    Op::Write(x, y) => (promote_public(id, x), Some(promote_public_y(id, y))),
+                })
+                .collect::<Vec<_>>();
+            let values = doram
+                .batch_access(&ops, Aliasing::MayAlias, &net, &mut state, None)
+                .unwrap();
+            outputs.extend(open_many_y(&values, &net));
+        }
+
+        outputs
+    })
+    .unwrap();
+
+    for party_output in outputs {
+        assert_eq!(party_output, expected);
+    }
 }
 
 fn assert_trace(config: GigaDoramConfig, trace: &[Op], expected: &[u64]) {

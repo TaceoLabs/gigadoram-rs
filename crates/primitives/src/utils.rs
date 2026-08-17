@@ -251,6 +251,24 @@ pub fn cmux_many_custom<V: DoramValue, N: Network>(
     Ok((x_selected, y_selected, alibi_selected))
 }
 
+/// Masks each value with its bit: `values[i]` if `bits[i]` is set, else zero.
+/// One round for the whole column; XOR-folding a one-hot group then selects.
+pub fn select_values<V: DoramValue, N: Network>(
+    bits: &[BitShare],
+    values: &[V::Share],
+    net: &N,
+    state: &mut Rep3State,
+) -> eyre::Result<Vec<V::Share>> {
+    assert_eq!(bits.len(), values.len());
+    if bits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let masks = bits.iter().map(V::bit_to_mask).collect::<Vec<_>>();
+    let local = V::local_and(&masks, values, state);
+    let next = net.reshare(local.clone())?;
+    Ok(V::recombine_and(local, next))
+}
+
 /// Local (pre-reshare) component of an element-wise binary AND of ring shares,
 /// masked with fresh correlated randomness.
 #[inline]

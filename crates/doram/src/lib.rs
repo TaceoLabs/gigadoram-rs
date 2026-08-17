@@ -9,6 +9,8 @@
 //! oblivious hash table levels ([`OhTable`]); [`GigaDoram::read`] and
 //! [`GigaDoram::write`] are the entry points, rebuilding levels as needed.
 
+mod aliasing;
+
 use std::time::{Duration, Instant};
 
 use circuits::{
@@ -27,13 +29,13 @@ use data_structures::{OHTableParams, OhTable, OhTableQueryTiming, OhTableTiming,
 use eyre::{Result, ensure};
 use mpc_core::protocols::{
     rep3::{Rep3State, id::PartyID},
-    rep3_ring::{arithmetic, binary, ring::bit::Bit},
+    rep3_ring::{arithmetic, binary, ring::bit::Bit, ring::ring_impl::RingElement},
 };
 use mpc_net::Network;
 use primitives::{
-    AlibiShare, ArrayShuffler, Block, CommunicationTimer, DoramValue, Record, TimingBreakdown, X,
-    XShare, alibi_from_blocks, alibi_to_blocks, dummy_x, network_phase, open_many, promote_public,
-    upcast_x_to_block,
+    AlibiShare, ArrayShuffler, BitShare, Block, CommunicationTimer, DoramValue, Record,
+    TimingBreakdown, X, XShare, alibi_from_blocks, alibi_to_blocks, bit_to_binary_mask, dummy_x,
+    network_phase, open_many, promote_public, upcast_x_to_block,
 };
 
 /// `GigaDoram` storing `u32` values.
@@ -74,6 +76,16 @@ impl ChtBounds {
             Self::Proven => 2.0,
         }
     }
+}
+
+/// Whether the addresses inside one batch may repeat. See
+/// [`GigaDoram::batch_access`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Aliasing {
+    /// The caller guarantees pairwise-distinct addresses.
+    Distinct,
+    /// Addresses may repeat; the batch is de-duplicated obliviously.
+    MayAlias,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -324,20 +336,24 @@ impl<V: DoramValue> GigaDoram<V> {
         self.read_and_maybe_write(query_x, Some(query_y), net, state, timing)
     }
 
+    /// Reads a batch of addresses. See [`Self::batch_access`].
     pub fn batch_read<N: Network>(
         &mut self,
         xs: &[XShare],
+        aliasing: Aliasing,
         net: &N,
         state: &mut Rep3State,
         timing: Option<&mut GigaDoramTiming>,
     ) -> Result<Vec<V::Share>> {
         let ops = xs.iter().map(|&x| (x, None)).collect::<Vec<_>>();
-        self.batch_access(&ops, net, state, timing)
+        self.batch_access(&ops, aliasing, net, state, timing)
     }
 
+    /// Writes a batch of addresses. See [`Self::batch_access`].
     pub fn batch_write<N: Network>(
         &mut self,
         writes: &[(XShare, V::Share)],
+        aliasing: Aliasing,
         net: &N,
         state: &mut Rep3State,
         timing: Option<&mut GigaDoramTiming>,
@@ -346,12 +362,21 @@ impl<V: DoramValue> GigaDoram<V> {
             .iter()
             .map(|&(x, y)| (x, Some(y)))
             .collect::<Vec<_>>();
-        self.batch_access(&ops, net, state, timing)
+        self.batch_access(&ops, aliasing, net, state, timing)
     }
 
+    /// Accesses a batch with sequential semantics: operation `i` observes every
+    /// operation `j < i`, as if they had been issued one at a time.
+    ///
+    /// `aliasing` is a promise the caller must keep. One entry is consumed per
+    /// address, so a repeat under [`Aliasing::Distinct`] consumes it twice:
+    /// either an assertion trips in a level, or the speed cache silently keeps
+    /// several live copies that later XOR together. [`Aliasing::MayAlias`]
+    /// resolves repeats obliviously for `O(k^2)` AND gates per chunk.
     pub fn batch_access<N: Network>(
         &mut self,
         ops: &[(XShare, Option<V::Share>)],
+        aliasing: Aliasing,
         net: &N,
         state: &mut Rep3State,
         mut timing: Option<&mut GigaDoramTiming>,
@@ -360,8 +385,14 @@ impl<V: DoramValue> GigaDoram<V> {
             !ops.is_empty(),
             "batch access requires at least one operation"
         );
+        ensure!(
+            aliasing == Aliasing::Distinct
+                || self.config.log_address_space_size + 1 < X::BITS as usize,
+            "aliased batches need a spare address bit above the dummy-label range"
+        );
         // Split the batch at speed cache capacity so a rebuild only ever runs
-        // on an exactly full cache
+        // on an exactly full cache. Aliasing across chunks resolves itself: the
+        // earlier chunk left its live entry in the speed cache.
         let mut outputs = Vec::with_capacity(ops.len());
         let mut remaining = ops;
         while !remaining.is_empty() {
@@ -371,7 +402,13 @@ impl<V: DoramValue> GigaDoram<V> {
                 continue;
             }
             let (chunk, rest) = remaining.split_at(remaining.len().min(free));
-            outputs.extend(self.batch_access_chunk(chunk, net, state, timing.as_deref_mut())?);
+            outputs.extend(self.batch_access_chunk(
+                chunk,
+                aliasing,
+                net,
+                state,
+                timing.as_deref_mut(),
+            )?);
             remaining = rest;
         }
         Ok(outputs)
@@ -380,6 +417,7 @@ impl<V: DoramValue> GigaDoram<V> {
     fn batch_access_chunk<N: Network>(
         &mut self,
         ops: &[(XShare, Option<V::Share>)],
+        aliasing: Aliasing,
         net: &N,
         state: &mut Rep3State,
         mut timing: Option<&mut GigaDoramTiming>,
@@ -387,7 +425,22 @@ impl<V: DoramValue> GigaDoram<V> {
         let count = ops.len();
         let query_start = Instant::now();
         let query_communication = Self::timer(&timing).elapsed();
-        let queries = ops.iter().map(|op| op.0).collect::<Vec<_>>();
+        let addrs = ops.iter().map(|op| op.0).collect::<Vec<_>>();
+        let plan = match aliasing {
+            Aliasing::Distinct => None,
+            Aliasing::MayAlias => {
+                let is_write = ops.iter().map(|op| op.1.is_some()).collect::<Vec<_>>();
+                Some(aliasing::plan(&addrs, &is_write, net, state)?)
+            }
+        };
+        // Repeats query a label nothing can hold, so they consume nothing.
+        let queries = match &plan {
+            None => addrs.clone(),
+            Some(plan) => {
+                let label = self.alias_label();
+                self.replace_addresses(&addrs, &plan.duplicate, label, net, state)?
+            }
+        };
         let live_levels = self
             .levels
             .iter()
@@ -438,6 +491,13 @@ impl<V: DoramValue> GigaDoram<V> {
         });
         let mut y_accum = results.iter().map(|result| result.0).collect::<Vec<_>>();
         let mut found = results.iter().map(|result| result.1).collect::<Vec<_>>();
+        // A duplicate matched nothing, so setting found makes every level a
+        // dummy access, and a dummy lookup never returns found.
+        if let Some(plan) = &plan {
+            for (found, duplicate) in found.iter_mut().zip(&plan.duplicate) {
+                *found = binary::xor(found, duplicate);
+            }
+        }
         let mut alibi = y_accum
             .iter()
             .map(|value| value.get_alibi_bits(self.config.num_levels))
@@ -468,16 +528,31 @@ impl<V: DoramValue> GigaDoram<V> {
         }
 
         let writeback = Instant::now();
-        let outputs = y_accum
+        let fetched = y_accum
             .iter()
             .map(|record| record.value)
             .collect::<Vec<_>>();
+        let outputs = match &plan {
+            None => fetched,
+            Some(plan) => {
+                let written = ops.iter().map(|op| op.1).collect::<Vec<_>>();
+                plan.resolve_outputs::<V, _>(&fetched, &written, net, state)?
+            }
+        };
         let values = ops
             .iter()
             .zip(&outputs)
             .map(|(op, &output)| Record::<V>::from_value(op.1.unwrap_or(output)))
             .collect::<Vec<_>>();
-        self.speed_cache.write(queries, values);
+        // One entry per address stays live; the rest get the dummy sentinel.
+        let stored = match &plan {
+            None => addrs,
+            Some(plan) => {
+                let sentinel = RingElement((1 as X) << self.config.log_address_space_size);
+                self.replace_addresses(&addrs, &plan.superseded, sentinel, net, state)?
+            }
+        };
+        self.speed_cache.write(stored, values);
         if let Some(timing) = &mut timing {
             timing.time_total_query_writeback += writeback.elapsed();
             timing.time_total_queries.total += query_start.elapsed();
@@ -487,6 +562,38 @@ impl<V: DoramValue> GigaDoram<V> {
                 .saturating_sub(query_communication);
         }
         Ok(outputs)
+    }
+
+    /// The label a repeat queries instead of its address. The speed cache only
+    /// ever holds values below `2^(N+1)` (addresses, the `2^N` sentinel, and
+    /// rebuild padding labels), so bit `N + 1` set matches nothing.
+    fn alias_label(&self) -> RingElement<X> {
+        RingElement(3 << self.config.log_address_space_size)
+    }
+
+    /// Replaces `addrs[i]` with the public `label` wherever `replace[i]` is set.
+    fn replace_addresses<N: Network>(
+        &self,
+        addrs: &[XShare],
+        replace: &[BitShare],
+        label: RingElement<X>,
+        net: &N,
+        state: &mut Rep3State,
+    ) -> Result<Vec<XShare>> {
+        let masks = replace
+            .iter()
+            .map(bit_to_binary_mask::<X>)
+            .collect::<Vec<_>>();
+        let deltas = addrs
+            .iter()
+            .map(|x| binary::xor_public(x, &label, state.id))
+            .collect::<Vec<_>>();
+        let selected = binary::and_vec(&masks, &deltas, net, state)?;
+        Ok(addrs
+            .iter()
+            .zip(&selected)
+            .map(|(x, delta)| binary::xor(x, delta))
+            .collect())
     }
 
     pub fn num_levels(&self) -> usize {

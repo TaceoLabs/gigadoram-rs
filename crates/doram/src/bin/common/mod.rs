@@ -5,7 +5,7 @@ use std::{
 };
 
 use clap::{ArgAction, Args};
-use doram::{GigaDoramBn254 as GigaDoram, GigaDoramConfig, GigaDoramTiming};
+use doram::{Aliasing, GigaDoramBn254 as GigaDoram, GigaDoramConfig, GigaDoramTiming};
 use eyre::{Result, ensure};
 use indicatif::{ProgressBar, ProgressStyle};
 use mpc_core::protocols::rep3::{Rep3State, conversion::A2BType, id::PartyID};
@@ -250,9 +250,15 @@ pub fn run_party<N: Network>(
                     .zip(batch)
                     .map(|(&x, query)| (x, promote_public_y(state.id, query.y)))
                     .collect::<Vec<_>>();
-                doram.batch_write(&writes, &net, &mut state, Some(&mut timing))?
+                doram.batch_write(
+                    &writes,
+                    Aliasing::Distinct,
+                    &net,
+                    &mut state,
+                    Some(&mut timing),
+                )?
             } else {
-                doram.batch_read(&xs, &net, &mut state, Some(&mut timing))?
+                doram.batch_read(&xs, Aliasing::Distinct, &net, &mut state, Some(&mut timing))?
             };
             for ((query, result), expected) in batch.iter().zip(results).zip(expected) {
                 let opened = open_y(&result, &net);
